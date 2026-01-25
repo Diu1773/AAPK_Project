@@ -1,0 +1,37 @@
+# python/venv
+__pycache__/
+*.pyc
+.venv/
+
+# local agent/state
+**/.state/
+**/.claude/
+.claude/settings.local.json
+
+# data & outputs (local only)
+data/
+outputs/
+result/
+backup/
+nul/
+
+# local params (keep example, ignore actual)
+**/parameters.toml
+parametertxt.txt
+parametertxt.txt
+
+# big files (adjust as needed)
+*.fits
+*.fit
+*.fts
+*.ser
+*.avi
+*.mp4
+*.gif
+
+# notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

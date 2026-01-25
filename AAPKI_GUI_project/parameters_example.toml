@@ -1,0 +1,178 @@
+# =============================================================================
+# AutoAperturePhot_KNUEMAO - Example Configuration File
+# =============================================================================
+
+[io]
+data_dir = "./data"
+filename_prefix = "pp_"
+result_dir = ""                     # Empty = data_dir/result
+cache_dir = "cache"
+
+[target]
+name = "M67"
+# ra_deg = 82.17
+# dec_deg = 35.83
+
+[parallel]
+mode = "thread"                     # thread | process | auto | none
+max_workers = 0
+resume_mode = true
+force_redetect = false
+force_rephot = false
+detect_cache_strategy = "mtime"
+
+[ui]
+log_tail = 300
+detect_progress_bar = true
+canvas_px = 900
+
+[instrument]
+telescope_focal_mm = 3947.0
+camera_pixel_um = 3.76
+binning = 2
+gain_e_per_adu = 0.1
+rdnoise_e = 1.39                    # REQUIRED
+saturation_adu = 60000.0
+zp_initial = 25.0
+datamin_adu = 0.1
+datamax_adu = 55000.0
+
+[alignment]
+ref_index = 0
+global_align = true
+global_ref_filter = "r"
+global_ref_index = 0
+
+[fwhm]
+guess_arcsec = 2.5
+px_min = 3.5
+px_max = 12.0
+elong_max = 1.3
+iso_min_sep_pix = 18.0
+
+[detection]
+engine = "segm"
+sigma = 3.2
+sigma_g = 3.2
+sigma_r = 3.2
+sigma_i = 3.4
+minarea_pix = 3
+keep_max = 6000
+dilate_radius_px = 4
+
+[detection.deblend]
+enable = true
+nthresh = 64
+contrast = 0.0025
+max_labels = 4000
+label_hard_max = 7000
+
+[background]
+enable = true
+in_detect = true
+box = 64
+filter_size = 3
+edge_method = "pad"
+method = "median"
+downsample = 4
+
+[qc]
+gate_enable = true
+
+[photometry]
+mode = "apcorr"
+recenter = true
+use_segm_mask = true
+min_snr_for_mag = 3.0
+use_qc_pass_only = false
+
+[photometry.scales]
+aperture_scale = 1.0
+annulus_scale = 4.0
+dannulus_scale = 2.0
+center_cbox_scale = 1.5
+annulus_min_gap_px = 6.0
+annulus_min_width_px = 12.0
+
+[photometry.radii]
+min_r_ap_px = 4.0
+min_r_in_px = 12.0
+min_r_out_px = 20.0
+sigma_clip = 3.0
+max_iter = 5
+neighbor_mask_scale = 1.3
+
+[photometry.apcorr]
+apply = true
+small_scale = 1.0
+large_scale = 3.0
+min_n = 20
+scatter_max = 0.05
+min_snr = 40.0
+
+[hud5x]
+aperture_scale = 1.0
+center_cbox_scale = 1.5
+annulus_in_scale = 4.0
+annulus_out_scale = 2.0
+sigma_clip = 3.0
+neighbor_mask_scale = 1.3
+mag_flux = "rate_e"
+use_header_exptime = true
+min_r_ap_px = 12.0
+min_r_in_px = 24.0
+min_r_out_px = 36.0
+
+[wcs]
+do_plate_solve = true
+astap_exe = "C:/Program Files/astap/astap_cli.exe"
+astap_timeout_s = 120.0
+astap_search_radius_deg = 8.0
+astap_database = "D50"
+astap_fov_fudge = 1.0
+astap_downsample = 2
+astap_max_stars = 500
+require_qc_pass = true
+refine_enable = true
+
+[match]
+tol_px = 1.0
+wcs_radius_arcsec = 1.0
+min_gaia_matches = 10
+
+[cmd]
+snr_calib_min = 20.0
+max_sources = 5000
+
+[cmd.zp]
+clip_sigma = 3.0
+fit_iters = 5
+slope_absmax = 1.0
+
+[cmd.color]
+clip_sigma = 3.0
+fit_iters = 5
+slope_absmax = 2.0
+
+[overlay]
+max_labels = 2000
+
+[tools.qa_report]
+min_n_frames = 3
+min_snr = 5.0
+max_chi2_nu = 5.0
+max_delta_r = 2.0
+exclude_saturated = true
+error_model_source = "raw"
+frame_flag_mode = "absolute"
+frame_snr_min = 10.0
+frame_goodmag_min = 0.9
+frame_fwhm_mode = "scale"
+frame_fwhm_scale = 1.5
+frame_fwhm_abs = 8.0
+enabled_filters_all = true
+enabled_filters = []
+
+[tools.iraf_compare]
+match_tol_px = 1.5
+cutout_scale = 2.5
