@@ -224,6 +224,7 @@ class MainWindowWorkflow(QMainWindow):
             "Aperture Overlay",
             "Light Curve Builder",
             "Detrend & Night Merge",
+            "Period Analysis",
         ]
 
         # Step buttons
@@ -530,6 +531,11 @@ class MainWindowWorkflow(QMainWindow):
         elif step_index == 11:
             from .workflow.step12_detrend_merge import DetrendNightMergeWindow
             self.current_step_window = DetrendNightMergeWindow(
+                self.params, self.file_manager, self.project_state, self
+            )
+        elif step_index == 12:
+            from .workflow.step13_period_analysis import PeriodAnalysisWindow
+            self.current_step_window = PeriodAnalysisWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         else:

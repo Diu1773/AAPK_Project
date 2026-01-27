@@ -15,6 +15,7 @@ STEP8_DIRNAME = "step8_selection"
 STEP9_DIRNAME = "step9_photometry"
 STEP11_DIRNAME = "step11_lightcurve"
 STEP12_DIRNAME = "step12_detrend_merge"
+STEP13_PERIOD_DIRNAME = "step13_period_analysis"
 LEGACY_STEP12_ISOCHRONE_DIRNAME = "step12_isochrone"
 # Legacy directory names (pre-refactor)
 LEGACY_STEP5_REFBUILD_DIRNAME = "step5_refbuild"
@@ -102,6 +103,11 @@ def step11_dir(result_dir: Path) -> Path:
 def step12_dir(result_dir: Path) -> Path:
     """Step 12: Detrend & Night Merge"""
     return step_dir(result_dir, STEP12_DIRNAME)
+
+
+def step13_period_dir(result_dir: Path) -> Path:
+    """Step 13: Period Analysis (Lomb-Scargle)"""
+    return step_dir(result_dir, STEP13_PERIOD_DIRNAME)
 
 
 def legacy_step12_isochrone_dir(result_dir: Path) -> Path:
