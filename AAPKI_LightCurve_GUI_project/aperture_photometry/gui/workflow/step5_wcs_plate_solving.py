@@ -284,6 +284,47 @@ class WcsWorker(QThread):
         except Exception:
             return float("nan")
 
+    def _wcs_rotation_deg(self, w: WCS) -> float:
+        """Extract rotation angle from WCS CD matrix (degrees, E of N)."""
+        try:
+            if not w.has_celestial:
+                return float("nan")
+            # Get CD matrix or compute from PC+CDELT
+            if hasattr(w.wcs, 'cd') and w.wcs.cd is not None:
+                cd = w.wcs.cd
+            elif hasattr(w.wcs, 'pc') and w.wcs.pc is not None:
+                pc = w.wcs.pc
+                cdelt = w.wcs.cdelt
+                cd = pc * cdelt[:, np.newaxis]
+            else:
+                return float("nan")
+            # Rotation from CD matrix: theta = atan2(-CD1_2, CD2_2)
+            rot_rad = np.arctan2(-cd[0, 1], cd[1, 1])
+            return float(np.degrees(rot_rad))
+        except Exception:
+            return float("nan")
+
+    def _wcs_center_coords(self, w: WCS, nx: int, ny: int) -> tuple:
+        """Get center RA/Dec from WCS."""
+        try:
+            if not w.has_celestial:
+                return (float("nan"), float("nan"))
+            cx, cy = nx / 2.0, ny / 2.0
+            sky = w.pixel_to_world(cx, cy)
+            return (float(sky.ra.deg), float(sky.dec.deg))
+        except Exception:
+            return (float("nan"), float("nan"))
+
+    def _wcs_sip_order(self, hdr) -> int:
+        """Get SIP distortion polynomial order (0 if none)."""
+        try:
+            # Check for SIP keywords
+            a_order = hdr.get("A_ORDER", 0)
+            b_order = hdr.get("B_ORDER", 0)
+            return max(int(a_order), int(b_order))
+        except Exception:
+            return 0
+
     def _load_fwhm_for_frame(self, fname: str):
         meta_json = self.cache_dir / f"detect_{fname}.json"
         if meta_json.exists():
@@ -774,6 +815,9 @@ class WcsWorker(QThread):
                                 resid_max = rmax
                                 match_n = nmatch
 
+                        # Use final WCS (refined if available)
+                        w_final = WCS(hdr, relax=True)
+
                         hdr["WCS_OK"] = (True, "WCS solve success")
                         hdr["WCSPIXI"] = (float(pix_arc), "pixscale input (arcsec/pix)")
                         if np.isfinite(pix_fit):
@@ -784,10 +828,32 @@ class WcsWorker(QThread):
                             hdr["WCSRMD"] = (float(resid_med), "ref resid med (arcsec)")
                         if np.isfinite(resid_max):
                             hdr["WCSRMAX"] = (float(resid_max), "ref resid max (arcsec)")
+
+                        # Additional WCS quality stats
+                        wcs_rot_deg = self._wcs_rotation_deg(w_final)
+                        nx = int(hdr.get("NAXIS1", 0))
+                        ny = int(hdr.get("NAXIS2", 0))
+                        center_ra, center_dec = self._wcs_center_coords(w_final, nx, ny)
+                        sip_order = self._wcs_sip_order(hdr)
+
+                        if np.isfinite(wcs_rot_deg):
+                            hdr["WCSROT"] = (float(wcs_rot_deg), "WCS rotation (deg, E of N)")
+                        if np.isfinite(center_ra):
+                            hdr["WCSCRA"] = (float(center_ra), "WCS center RA (deg)")
+                        if np.isfinite(center_dec):
+                            hdr["WCSCDEC"] = (float(center_dec), "WCS center Dec (deg)")
+                        if sip_order > 0:
+                            hdr["WCSSIP"] = (int(sip_order), "SIP distortion order")
+
                         status = "ok_astnet_wsl" if solver == "astnet_wsl" else "ok"
                     else:
                         hdr["WCS_OK"] = (False, "WCS solve failed")
                         status = f"astap_fail rc={rc}" if not ok_astap else "wcs_missing"
+                        # Set defaults for failed WCS
+                        wcs_rot_deg = np.nan
+                        center_ra = np.nan
+                        center_dec = np.nan
+                        sip_order = 0
 
                 # writeto로 확실하게 저장 (Windows 호환)
                 fits.writeto(fits_path, data, hdr, overwrite=True)
@@ -804,6 +870,12 @@ class WcsWorker(QThread):
                     "match_n": int(match_n),
                     "gaia_source": str(gaia_src),
                     "solver": solver,
+                    # New WCS quality stats
+                    "wcs_rot_deg": float(wcs_rot_deg) if np.isfinite(wcs_rot_deg) else None,
+                    "center_ra_deg": float(center_ra) if np.isfinite(center_ra) else None,
+                    "center_dec_deg": float(center_dec) if np.isfinite(center_dec) else None,
+                    "sip_order": int(sip_order) if sip_order > 0 else None,
+                    # Solver details
                     "astap_ok": bool(ok_astap),
                     "astap_rc": int(rc),
                     "astap_elapsed": float(dt_astap),

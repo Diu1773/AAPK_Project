@@ -584,11 +584,13 @@ class IdMatchWorker(QThread):
                     "n_det": int(n_det),
                     "n_match": 0,
                     "n_pairs": 0,
+                    "n_unmatched": int(n_det),  # All detections unmatched
                     "match_rate": 0.0,
                     "match_radius_arcsec": float(match_radius_arcsec) if np.isfinite(match_radius_arcsec) else np.nan,
                     "sep_med_arcsec": np.nan,
                     "sep_p90_arcsec": np.nan,
                     "dup_rate": np.nan,
+                    "dup_count": 0,
                     "dx_med_px": np.nan,
                     "dy_med_px": np.nan,
                     "dx_rms_px": np.nan,
@@ -771,13 +773,19 @@ class IdMatchWorker(QThread):
             sep_p90 = float(np.nanpercentile(sep_vals, 90)) if len(sep_vals) else np.nan
 
             dup_rate = np.nan
+            dup_count = 0
             if det_sky is not None:
                 try:
                     counts = pd.Series(idx[ok]).value_counts()
                     dup = counts[counts > 1].sum()
+                    dup_count = int(dup)
                     dup_rate = float(dup / max(n_match, 1))
                 except Exception:
                     dup_rate = np.nan
+                    dup_count = 0
+
+            # Count unmatched detections
+            n_unmatched = n_det - n_match
 
             stat = {
                 "file": fname,
@@ -786,11 +794,13 @@ class IdMatchWorker(QThread):
                 "n_det": int(n_det),
                 "n_match": int(n_match),
                 "n_pairs": int(n_pairs),
+                "n_unmatched": int(n_unmatched),
                 "match_rate": float(match_rate),
                 "match_radius_arcsec": float(match_r),
                 "sep_med_arcsec": sep_med,
                 "sep_p90_arcsec": sep_p90,
                 "dup_rate": dup_rate,
+                "dup_count": int(dup_count),
                 "dx_med_px": dx_med,
                 "dy_med_px": dy_med,
                 "dx_rms_px": dx_rms,
@@ -850,10 +860,59 @@ class IdMatchWorker(QThread):
         except Exception:
             pass
 
+        # Compute summary statistics
+        miss_ref_count = int(np.sum(match_count == 0))
+        matched_ref_count = int(np.sum(match_count > 0))
+        total_det_count = sum(s.get("n_det", 0) for s in frame_stats)
+        total_match_count = sum(s.get("n_match", 0) for s in frame_stats)
+        total_unmatched_count = sum(s.get("n_unmatched", 0) for s in frame_stats)
+        total_dup_count = sum(s.get("dup_count", 0) for s in frame_stats)
+
+        # Log summary statistics
+        self._log("=" * 60)
+        self._log(f"[IDMATCH][STATS] n_ref={n_ref} matched_refs={matched_ref_count} miss_ref_count={miss_ref_count}")
+        self._log(f"[IDMATCH][STATS] total_det={total_det_count} total_match={total_match_count} total_unmatched={total_unmatched_count}")
+        self._log(f"[IDMATCH][STATS] total_dup_count={total_dup_count}")
+
         summary = {
             "total": len(frame_stats),
             "ok": int(np.sum([1 for s in frame_stats if s.get("n_match", 0) > 0])),
+            "n_ref": n_ref,
+            "matched_ref_count": matched_ref_count,
+            "miss_ref_count": miss_ref_count,
+            "total_det_count": total_det_count,
+            "total_match_count": total_match_count,
+            "total_unmatched_count": total_unmatched_count,
+            "total_dup_count": total_dup_count,
         }
+
+        # Write summary metadata
+        try:
+            meta = {
+                "n_frames": len(frame_stats),
+                "n_frames_with_matches": int(np.sum([1 for s in frame_stats if s.get("n_match", 0) > 0])),
+                "n_ref": n_ref,
+                "matched_ref_count": matched_ref_count,
+                "miss_ref_count": miss_ref_count,
+                "total_det_count": total_det_count,
+                "total_match_count": total_match_count,
+                "total_unmatched_count": total_unmatched_count,
+                "total_dup_count": total_dup_count,
+                "ref_filter": self.ref_filter,
+                "ref_frame": self.ref_frame,
+                "ref_per_date": self.ref_per_date,
+                "two_pass_enable": self.two_pass_enable,
+                "tight_radius_arcsec": self.tight_radius_arcsec,
+                "loose_radius_arcsec": self.loose_radius_arcsec,
+                "match_r_fwhm": self.match_r_fwhm,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            (out_dir / "step7_idmatch_meta.json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
         self.finished.emit(summary)
 
 class StarIdMatchingWindow(StepWindowBase):

@@ -599,6 +599,15 @@ class RefBuildWorker(QThread):
         if not np.isfinite(shape_metric):
             shape_metric = abs(med_round) if np.isfinite(med_round) else np.nan
 
+        # Sky background statistics (from detection metadata)
+        sky_med = _safe_float(meta.get("sky_med"), np.nan)
+        sky_sigma = _safe_float(meta.get("sky_sigma"), np.nan)
+        # Alternative names that might be used
+        if not np.isfinite(sky_med):
+            sky_med = _safe_float(meta.get("bkg_median"), np.nan)
+        if not np.isfinite(sky_sigma):
+            sky_sigma = _safe_float(meta.get("bkg_rms"), np.nan)
+
         return {
             "file": fname,
             "filter": filt,
@@ -607,6 +616,8 @@ class RefBuildWorker(QThread):
             "n_sources": n_sources,
             "sat_star_count": sat_count,
             "shape_metric": shape_metric,
+            "sky_med": sky_med,
+            "sky_sigma": sky_sigma,
         }
 
     def _select_reference(self, metrics: pd.DataFrame, ref_filter: str) -> str:
@@ -750,7 +761,12 @@ class RefBuildWorker(QThread):
             pass
         return str(cand.iloc[0]["file"])
 
-    def _build_master_catalog(self, ref_fname: str) -> pd.DataFrame:
+    def _build_master_catalog(self, ref_fname: str) -> tuple[pd.DataFrame, dict]:
+        """Build master catalog from reference frame detections.
+
+        Returns:
+            Tuple of (catalog DataFrame, stats dict with n_ref_total/after_cuts/used)
+        """
         det_path = self._resolve_detect_csv(ref_fname)
         if det_path is None:
             raise RuntimeError(f"Missing detection file: detect_{ref_fname}.csv")
@@ -778,6 +794,9 @@ class RefBuildWorker(QThread):
         if base_all.empty:
             raise RuntimeError("Reference detection list is empty")
 
+        # Track n_ref_total
+        n_ref_total = len(base_all)
+
         cand = df.dropna(subset=["x", "y"]).copy()
         n_before = len(cand)
 
@@ -792,6 +811,9 @@ class RefBuildWorker(QThread):
                 cand = cand[cand["sharpness"] >= self.ref_cat_sharp_min]
             if np.isfinite(self.ref_cat_sharp_max) and self.ref_cat_sharp_max > 0:
                 cand = cand[cand["sharpness"] <= self.ref_cat_sharp_max]
+
+        # Track n_ref_after_qualitycuts (after shape/quality filters, before brightness)
+        n_ref_after_qualitycuts = len(cand)
 
         brightness = None
         for col in ("dao_flux", "dao_peak", "peak_adu"):
@@ -810,16 +832,21 @@ class RefBuildWorker(QThread):
         base = cand[["x", "y"]].rename(columns={"x": "x_ref", "y": "y_ref"})
         base = base.dropna(subset=["x_ref", "y_ref"]).copy()
 
+        used_full_detections = False
         if base.empty or len(base) < max(10, self.ref_cat_min_sources):
             self._log(
                 f"[REF] Ref catalog filter too strict "
                 f"({len(base)}/{n_before}); using full detections."
             )
             base = base_all.copy()
+            used_full_detections = True
         else:
             self._log(
                 f"[REF] Ref catalog filtered: {len(base)}/{n_before} sources kept."
             )
+
+        # Track n_ref_used (final count)
+        n_ref_used = len(base)
 
         wcs = self._load_wcs_for_frame(ref_fname)
         if wcs is None:
@@ -834,7 +861,21 @@ class RefBuildWorker(QThread):
         base["ID"] = range(1, len(base) + 1)
         base["ra_deg"] = ra
         base["dec_deg"] = dec
-        return base[["ID", "source_id", "ra_deg", "dec_deg", "x_ref", "y_ref"]].copy()
+
+        # Log ref catalog stats
+        self._log(
+            f"[REF][STATS] n_ref_total={n_ref_total} n_ref_after_qualitycuts={n_ref_after_qualitycuts} "
+            f"n_ref_used={n_ref_used} used_full={used_full_detections}"
+        )
+
+        ref_stats = {
+            "n_ref_total": n_ref_total,
+            "n_ref_after_qualitycuts": n_ref_after_qualitycuts,
+            "n_ref_used": n_ref_used,
+            "used_full_detections": used_full_detections,
+        }
+
+        return base[["ID", "source_id", "ra_deg", "dec_deg", "x_ref", "y_ref"]].copy(), ref_stats
 
     def run(self):
         try:
@@ -934,6 +975,7 @@ class RefBuildWorker(QThread):
         ref_filters_by_date: Dict[str, str] = {}
         ref_catalogs_by_date: Dict[str, pd.DataFrame] = {}
         master_df: Optional[pd.DataFrame] = None
+        ref_catalog_stats: dict = {}  # Track ref catalog build stats
 
         match_r = max(0.5, float(self.wcs_match_radius_arcsec))
         if self.ref_per_date:
@@ -949,7 +991,7 @@ class RefBuildWorker(QThread):
                 ref_filters_by_date[str(date_key)] = ref_filter_date
                 self._log(f"[REF][QC] date={date_key} ref={ref_fname_date} (filter={ref_filter_date})")
 
-                date_df = self._build_master_catalog(ref_fname_date)
+                date_df, date_ref_stats = self._build_master_catalog(ref_fname_date)
                 date_df = self._attach_gaia_photometry(date_df, gaia_df)
                 if ref_catalogs_by_date:
                     master_df, date_df = self._merge_ref_catalogs(
@@ -968,7 +1010,7 @@ class RefBuildWorker(QThread):
         self._log(f"[REF] Selected reference frame: {ref_fname} (filter={ref_filter})")
 
         if not self.ref_per_date:
-            master_df = self._build_master_catalog(ref_fname)
+            master_df, ref_catalog_stats = self._build_master_catalog(ref_fname)
             master_df = self._attach_gaia_photometry(master_df, gaia_df)
 
         # Apply hybrid source_id assignment if mode is "hybrid"
@@ -1032,6 +1074,18 @@ class RefBuildWorker(QThread):
         metrics_path = out_dir / "ref_frame_stats.csv"
         metrics.to_csv(metrics_path, index=False, encoding="utf-8-sig")
 
+        # Compute sky statistics summary from frame metrics
+        sky_med_median = np.nan
+        sky_sigma_median = np.nan
+        if "sky_med" in metrics.columns:
+            sky_med_vals = pd.to_numeric(metrics["sky_med"], errors="coerce")
+            if sky_med_vals.notna().any():
+                sky_med_median = float(sky_med_vals.median())
+        if "sky_sigma" in metrics.columns:
+            sky_sigma_vals = pd.to_numeric(metrics["sky_sigma"], errors="coerce")
+            if sky_sigma_vals.notna().any():
+                sky_sigma_median = float(sky_sigma_vals.median())
+
         meta = {
             "ref_frame": ref_fname,
             "ref_filter": ref_filter,
@@ -1054,6 +1108,14 @@ class RefBuildWorker(QThread):
             "wcs_max_sep_p90_arcsec": float(self.wcs_max_sep_p90_arcsec),
             "wcs_max_dup_rate": float(self.wcs_max_dup_rate),
             "filters": filters,
+            # Reference catalog statistics
+            "n_ref_total": ref_catalog_stats.get("n_ref_total"),
+            "n_ref_after_qualitycuts": ref_catalog_stats.get("n_ref_after_qualitycuts"),
+            "n_ref_used": ref_catalog_stats.get("n_ref_used"),
+            "used_full_detections": ref_catalog_stats.get("used_full_detections"),
+            # Sky statistics (median across frames)
+            "sky_med_median": sky_med_median if np.isfinite(sky_med_median) else None,
+            "sky_sigma_median": sky_sigma_median if np.isfinite(sky_sigma_median) else None,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         (out_dir / "ref_build_meta.json").write_text(
