@@ -356,7 +356,12 @@ class PeriodAnalysisWindow(StepWindowBase):
         self._scan_available_data()
 
     def _scan_available_data(self):
-        """Scan for available light curve data."""
+        """Scan for available light curve data.
+
+        Step 11 outputs: lightcurve_ID{id}_raw.csv, lightcurve_combined_ID{id}_raw.csv
+        Step 12 outputs: lightcurve_ID{id}_{mode}.csv (mode=offset/color/global)
+        Filters are stored as a column inside the CSV, not in the filename.
+        """
         self.filter_combo.clear()
 
         result_dir = Path(self.params.P.result_dir)
@@ -364,27 +369,68 @@ class PeriodAnalysisWindow(StepWindowBase):
         step12_out = step12_dir(result_dir)
 
         filters_found = set()
+        lc_file = self._find_best_lc_file(step11_out, step12_out, None)
 
-        # Look for light curve CSV files
-        for d in [step11_out, step12_out]:
-            if not d.exists():
-                continue
-            for f in d.glob("lightcurve_*.csv"):
-                # Extract filter from filename
-                parts = f.stem.split("_")
-                if len(parts) >= 2:
-                    flt = parts[1]
-                    filters_found.add(flt)
-            for f in d.glob("*_lc_*.csv"):
-                parts = f.stem.split("_")
-                for p in parts:
-                    if p in ["g", "r", "i", "b", "v", "u"]:
-                        filters_found.add(p)
+        if lc_file is not None:
+            try:
+                df = pd.read_csv(lc_file, nrows=5000)
+                if "filter" in df.columns:
+                    for flt in df["filter"].dropna().astype(str).str.strip().str.lower().unique():
+                        if flt and flt != "nan":
+                            filters_found.add(flt)
+            except Exception:
+                pass
+
+        # Fallback: scan all lightcurve CSVs for filter column
+        if not filters_found:
+            for d in [step12_out, step11_out]:
+                if not d.exists():
+                    continue
+                for f in d.glob("lightcurve_*.csv"):
+                    try:
+                        df_head = pd.read_csv(f, nrows=200)
+                        if "filter" in df_head.columns:
+                            for flt in df_head["filter"].dropna().astype(str).str.strip().str.lower().unique():
+                                if flt and flt != "nan":
+                                    filters_found.add(flt)
+                    except Exception:
+                        continue
+                if filters_found:
+                    break
 
         if filters_found:
             self.filter_combo.addItems(sorted(filters_found))
         else:
             self.filter_combo.addItem("(no data)")
+
+    def _find_best_lc_file(
+        self,
+        step11_out: Path,
+        step12_out: Path,
+        target_id: Optional[int],
+    ) -> Optional[Path]:
+        """Find the best available light curve CSV, preferring Step 12 (detrended)."""
+        candidates: List[Path] = []
+
+        if target_id is not None:
+            # Step 12 outputs (detrended) - prefer global > color > offset
+            for mode in ["global", "color", "offset"]:
+                candidates.append(step12_out / f"lightcurve_ID{target_id}_{mode}.csv")
+            # Step 11 outputs (raw)
+            candidates.append(step11_out / f"lightcurve_combined_ID{target_id}_raw.csv")
+            candidates.append(step11_out / f"lightcurve_ID{target_id}_raw.csv")
+
+        # Glob fallbacks (any target ID)
+        for d in [step12_out, step11_out]:
+            if d.exists():
+                for f in sorted(d.glob("lightcurve_*.csv"), reverse=True):
+                    if f not in candidates:
+                        candidates.append(f)
+
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return None
 
     def _on_filter_changed(self, index: int):
         self.current_filter = self.filter_combo.currentText()
@@ -399,37 +445,15 @@ class PeriodAnalysisWindow(StepWindowBase):
             QMessageBox.warning(self, "No Data", "No light curve data available.")
             return
 
-        # Search for light curve files
         step11_out = step11_dir(result_dir)
         step12_out = step12_dir(result_dir)
 
-        lc_file = None
-        candidates = [
-            step12_out / f"merged_lc_{flt}.csv",
-            step12_out / f"detrended_lc_{flt}.csv",
-            step11_out / f"lightcurve_{flt}.csv",
-            step11_out / f"lightcurve_{flt}_ID{target_id}.csv",
-        ]
-
-        for cand in candidates:
-            if cand.exists():
-                lc_file = cand
-                break
-
-        # Also search with glob
-        if lc_file is None:
-            for d in [step12_out, step11_out]:
-                if not d.exists():
-                    continue
-                matches = list(d.glob(f"*{flt}*.csv"))
-                if matches:
-                    lc_file = matches[0]
-                    break
+        lc_file = self._find_best_lc_file(step11_out, step12_out, target_id)
 
         if lc_file is None:
             QMessageBox.warning(
                 self, "Not Found",
-                f"Could not find light curve data for filter '{flt}'.\n"
+                f"Could not find light curve data for ID {target_id}.\n"
                 "Run Step 11 (Light Curve Builder) first."
             )
             return
@@ -442,7 +466,7 @@ class PeriodAnalysisWindow(StepWindowBase):
 
             # Find time column
             time_col = None
-            for col in ["JD", "jd", "HJD", "hjd", "BJD", "bjd", "time"]:
+            for col in ["JD", "jd", "HJD", "hjd", "BJD", "bjd", "time", "rel_time_hr"]:
                 if col in df.columns:
                     time_col = col
                     break
@@ -451,26 +475,35 @@ class PeriodAnalysisWindow(StepWindowBase):
                 QMessageBox.warning(self, "Error", "No time column (JD/HJD/BJD) found.")
                 return
 
-            # Filter by target ID if ID column exists
-            if "ID" in df.columns:
-                df_target = df[df["ID"] == target_id].copy()
-                if df_target.empty:
-                    self.log(f"[WARN] ID {target_id} not found, using all data")
-                    df_target = df
+            # Filter by filter column
+            if "filter" in df.columns:
+                df_flt = df[df["filter"].astype(str).str.strip().str.lower() == flt.lower()].copy()
+                if df_flt.empty:
+                    self.log(f"[WARN] Filter '{flt}' not found in data, using all rows")
+                    df_flt = df
             else:
-                df_target = df
+                df_flt = df
+
+            # Filter by target ID if ID column exists
+            df_target = df_flt
+            if "ID" in df_target.columns:
+                df_id = df_target[df_target["ID"] == target_id].copy()
+                if df_id.empty:
+                    self.log(f"[WARN] ID {target_id} not found, using all data")
+                else:
+                    df_target = df_id
 
             # Find magnitude columns
             mag_raw_col = None
             mag_corr_col = None
             mag_err_col = None
 
-            for col in ["diff_mag_raw", "mag_raw", "raw_mag", "inst_mag"]:
+            for col in ["diff_mag_raw", "mag_raw", "raw_mag", "inst_mag", "mag"]:
                 if col in df_target.columns:
                     mag_raw_col = col
                     break
 
-            for col in ["diff_mag", "mag_corr", "corr_mag", "calibrated_mag"]:
+            for col in ["diff_mag_corr", "diff_mag", "mag_corr", "corr_mag", "calibrated_mag"]:
                 if col in df_target.columns:
                     mag_corr_col = col
                     break
@@ -480,13 +513,17 @@ class PeriodAnalysisWindow(StepWindowBase):
                 mag_raw_col = mag_corr_col
                 mag_corr_col = None
 
-            for col in ["mag_err", "err", "sigma", "diff_mag_err"]:
+            for col in ["diff_err", "diff_err_corr", "mag_err", "err", "sigma", "diff_mag_err", "comp_err"]:
                 if col in df_target.columns:
                     mag_err_col = col
                     break
 
             if mag_raw_col is None:
-                QMessageBox.warning(self, "Error", "No magnitude column found.")
+                QMessageBox.warning(
+                    self, "Error",
+                    f"No magnitude column found.\n"
+                    f"Available columns: {list(df_target.columns)}"
+                )
                 return
 
             self.lc_data = {
@@ -500,12 +537,12 @@ class PeriodAnalysisWindow(StepWindowBase):
             }
 
             n_valid = np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag_raw"]))
-            self.data_status.setText(f"Loaded: {n_valid} points")
+            self.data_status.setText(f"Loaded: {n_valid} points ({lc_file.name})")
             self.data_status.setStyleSheet("color: green;")
             self.btn_run.setEnabled(True)
 
             self.log(f"Time: {time_col}, Raw: {mag_raw_col}, Corr: {mag_corr_col}, Err: {mag_err_col}")
-            self.log(f"Valid points: {n_valid}")
+            self.log(f"Filter: {flt}, Target ID: {target_id}, Valid points: {n_valid}")
 
         except Exception as e:
             QMessageBox.warning(self, "Load Error", str(e))
