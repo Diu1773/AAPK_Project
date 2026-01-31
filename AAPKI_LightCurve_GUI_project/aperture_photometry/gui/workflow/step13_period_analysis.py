@@ -47,13 +47,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import step11_dir, step12_dir, step13_period_dir
-
-
-def _safe_float(value, default: float = np.nan) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+from ...utils.common_helpers import safe_float as _safe_float
 
 
 class PeriodAnalysisWorker(QThread):
@@ -233,7 +227,6 @@ class PeriodAnalysisWorker(QThread):
         trial_periods = np.linspace(self.min_period, self.max_period, n_trials)
 
         n_bins = self.pdm_n_bins
-        theta = np.empty(n_trials, dtype=float)
 
         # Weights (1/sigma^2) or uniform
         if dy is not None and np.any(dy > 0):
@@ -242,27 +235,51 @@ class PeriodAnalysisWorker(QThread):
             w = np.ones(len(t), dtype=float)
 
         t0 = t.min()
-        for ip, p in enumerate(trial_periods):
-            phase = ((t - t0) / p) % 1.0
-            bin_idx = np.clip((phase * n_bins).astype(int), 0, n_bins - 1)
 
-            s2_bins = 0.0
-            n_bins_used = 0
+        # --- Vectorized PDM: process periods in chunks ---
+        # Memory budget: ~100 MB per chunk → chunk_size = 100M / (N_obs * 8)
+        n_obs = len(t)
+        chunk_size = max(1, min(5000, 100_000_000 // max(n_obs * 8, 1)))
+        theta = np.ones(n_trials, dtype=float)
+
+        for start in range(0, n_trials, chunk_size):
+            end = min(start + chunk_size, n_trials)
+            periods_chunk = trial_periods[start:end]
+
+            # phases: (N_obs, n_chunk)
+            phases = ((t[:, None] - t0) / periods_chunk[None, :]) % 1.0
+            bin_idx = np.clip((phases * n_bins).astype(int), 0, n_bins - 1)
+
+            s2_accum = np.zeros(end - start, dtype=float)
+            n_bins_used = np.zeros(end - start, dtype=int)
+
             for b in range(n_bins):
-                mask_b = bin_idx == b
-                nb = np.sum(mask_b)
-                if nb < 2:
-                    continue
-                yb = y[mask_b]
-                wb = w[mask_b]
-                wmean = np.average(yb, weights=wb)
-                s2_bins += np.sum(wb * (yb - wmean) ** 2) / np.sum(wb)
-                n_bins_used += 1
+                mask_b = bin_idx == b            # (N_obs, n_chunk)
+                nb = mask_b.sum(axis=0)          # (n_chunk,)
+                valid = nb >= 2
 
-            if n_bins_used > 0:
-                theta[ip] = (s2_bins / n_bins_used) / total_var
-            else:
-                theta[ip] = 1.0
+                if not np.any(valid):
+                    continue
+
+                # Weighted sums for mean and variance
+                w_col = w[:, None]               # (N_obs, 1)
+                w_masked = w_col * mask_b        # (N_obs, n_chunk)
+                w_sum = w_masked.sum(axis=0)     # (n_chunk,)
+
+                wy_sum = (w_col * y[:, None] * mask_b).sum(axis=0)
+                wmean = np.where(w_sum > 0, wy_sum / w_sum, 0.0)
+
+                dev = (y[:, None] - wmean[None, :]) * mask_b
+                wdev2_sum = (w_col * dev * dev).sum(axis=0)
+                s2_bin = np.where(w_sum > 0, wdev2_sum / w_sum, 0.0)
+
+                s2_accum += np.where(valid, s2_bin, 0.0)
+                n_bins_used += valid.astype(int)
+
+            good = n_bins_used > 0
+            theta[start:end] = np.where(
+                good, (s2_accum / n_bins_used) / total_var, 1.0
+            )
 
         # PDM: best period = minimum theta
         # Convert to "power" = 1 - theta for consistent peak-finding

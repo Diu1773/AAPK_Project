@@ -896,8 +896,9 @@ class WcsWorker(QThread):
                 return filename, meta
 
             completed = 0
-            max_workers = int(getattr(self.params.P, "wcs_max_workers", 1))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            _default_workers = get_parallel_workers(self.params)
+            max_workers = int(getattr(self.params.P, "wcs_max_workers", _default_workers))
+            with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
                 futures = {ex.submit(solve_one, f): f for f in files}
                 for fut in as_completed(futures):
                     if self._stop_requested:

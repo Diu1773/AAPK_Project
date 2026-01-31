@@ -46,6 +46,7 @@ from ...utils.step_paths import (
     legacy_step7_refbuild_dir,
     legacy_step6_idmatch_dir,
 )
+from ...utils.common_helpers import safe_float as _safe_float
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -138,13 +139,7 @@ def _extract_date_key(filename: str, params=None) -> str:
     return date_key or "unknown_date"
 
 
-def _safe_float(val, default=np.nan):
-    try:
-        if val is None:
-            return default
-        return float(val)
-    except Exception:
-        return default
+# _safe_float imported from utils.common_helpers
 
 
 def _apply_transform(xy: np.ndarray, mat: np.ndarray) -> np.ndarray:

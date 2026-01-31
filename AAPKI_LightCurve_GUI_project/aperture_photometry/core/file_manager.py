@@ -5,6 +5,7 @@ Extracted from AAPKI_GUI.ipynb Cell 2-3
 
 from __future__ import annotations
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 import numpy as np
@@ -151,21 +152,19 @@ class FileManager:
         if not self.filenames:
             self.scan_files()
 
-        rows = []
         lat = float(getattr(self.params.P, "site_lat_deg", 0.0))
         lon = float(getattr(self.params.P, "site_lon_deg", 0.0))
         alt = float(getattr(self.params.P, "site_alt_m", 0.0))
         tz = float(getattr(self.params.P, "site_tz_offset_hours", 0.0))
-        for fn in self.filenames:
+
+        def _read_single_header(fn):
             try:
                 file_path = self.get_file_path(fn)
                 with fits.open(file_path) as hdul:
                     h = hdul[0].header
 
-                # Get EXPTIME with proper numeric handling
                 exptime_val = h.get("EXPTIME", None)
                 if exptime_val is None:
-                    # Try alternative keywords
                     for key in ("EXPOSURE", "ITIME", "ELAPTIME"):
                         if key in h:
                             exptime_val = h[key]
@@ -175,14 +174,12 @@ class FileManager:
                 except (TypeError, ValueError):
                     exptime = np.nan
 
-                # Get AIRMASS with proper numeric handling
                 airmass_val = h.get("AIRMASS", None)
                 try:
                     airmass = float(airmass_val) if airmass_val is not None else np.nan
                 except (TypeError, ValueError):
                     airmass = np.nan
 
-                # JD + RA/Dec (best-effort)
                 jd_val = h.get("JD", None)
                 try:
                     jd = float(jd_val) if jd_val is not None else np.nan
@@ -205,7 +202,7 @@ class FileManager:
                 ra_deg = float(info.get("ra_deg", np.nan))
                 dec_deg = float(info.get("dec_deg", np.nan))
 
-                rows.append({
+                return {
                     "Filename": fn,
                     "DATE-OBS": h.get("DATE-OBS", "N/A"),
                     "FILTER": h.get("FILTER", "UNKNOWN"),
@@ -215,10 +212,16 @@ class FileManager:
                     "JD": jd,
                     "RA_DEG": ra_deg,
                     "DEC_DEG": dec_deg,
-                })
+                }
             except Exception as e:
                 log.warning(f"{fn}: Header read failed - {e}")
+                return None
 
+        n_workers = min(8, len(self.filenames))
+        with ThreadPoolExecutor(max_workers=max(1, n_workers)) as pool:
+            results = list(pool.map(_read_single_header, self.filenames))
+
+        rows = [r for r in results if r is not None]
         self.df_headers = pd.DataFrame(rows)
 
         # Save headers CSV

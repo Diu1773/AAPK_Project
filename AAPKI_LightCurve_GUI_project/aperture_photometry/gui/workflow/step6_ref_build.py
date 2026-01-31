@@ -44,6 +44,7 @@ from ...utils.step_paths import (
     legacy_step7_refbuild_dir,
     legacy_step7_wcs_dir,
 )
+from ...utils.common_helpers import safe_float as _safe_float
 
 
 _FILTER_RE = re.compile(r"[-_]([ugrizbvUGRIZBV])[-_.]", re.IGNORECASE)
@@ -142,13 +143,7 @@ def _extract_date_key(filename: str, params=None) -> str:
     return date_key or "unknown_date"
 
 
-def _safe_float(val, default=np.nan) -> float:
-    try:
-        if val is None:
-            return default
-        return float(val)
-    except Exception:
-        return default
+# _safe_float imported from utils.common_helpers
 
 
 class RefBuildWorker(QThread):

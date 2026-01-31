@@ -48,13 +48,7 @@ from PyQt5.QtCore import Qt
 from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
 from ...utils.step_paths import step1_dir, step9_dir, step11_dir, step12_dir, step11_zeropoint_dir
-
-
-def _safe_float(value, default: float = np.nan) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
 
 
 def _fmt_float(value, default: str = "") -> str:
@@ -67,15 +61,6 @@ def _fmt_float(value, default: str = "") -> str:
         return f"{v:.5f}"
     except Exception:
         return default
-
-
-def _normalize_filter_key(value: str | None) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip().lower()
-    if text in ("", "nan", "none"):
-        return ""
-    return text
 
 
 def _parse_color_expr(expr: str | None) -> tuple[str, str] | None:
@@ -91,15 +76,6 @@ def _parse_color_expr(expr: str | None) -> tuple[str, str] | None:
     if len(parts) != 2:
         return None
     return parts[0], parts[1]
-
-
-def _parse_jd(date_obs: str | None) -> float:
-    if not date_obs:
-        return np.nan
-    try:
-        return float(Time(str(date_obs).strip()).jd)
-    except Exception:
-        return np.nan
 
 
 def _load_headers_table(result_dir: Path) -> pd.DataFrame:

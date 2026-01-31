@@ -47,6 +47,7 @@ from ...utils.step_paths import (
 )
 from ...utils.constants import get_parallel_workers
 from ...utils.header_cache import HeaderCache
+from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -98,13 +99,6 @@ def _as_bool(x, default=False):
     return default
 
 
-def _safe_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
 def _is_up_to_date(out_path, deps):
     try:
         t_out = Path(out_path).stat().st_mtime
@@ -133,12 +127,6 @@ def _get_filter_lower(fits_path: Path, header_cache: HeaderCache = None, filenam
         return str(f).strip().lower()
     except Exception:
         return "unknown"
-
-
-def _normalize_filter_key(value: str | None) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().lower()
 
 
 def _get_exptime_fallback(fits_path: Path, default=1.0, header_cache: HeaderCache = None, filename: str = None):
@@ -493,20 +481,24 @@ class ForcedPhotometryWorker(QThread):
                     _sky_df = pd.read_csv(fq_path)
                 _sky_src = "frame_quality.csv"
 
+            # Pre-index sky_df by filename to avoid repeated filtering
+            _sky_index = {}
+            if _sky_df is not None and not _sky_df.empty and "file" in _sky_df.columns:
+                for _, _row in _sky_df.iterrows():
+                    _sky_index[str(_row["file"])] = _row
+
             def _sky_sigma_for(fname):
                 try:
-                    if _sky_df is None or _sky_df.empty or "file" not in _sky_df.columns:
-                        return np.nan
-                    row = _sky_df[_sky_df["file"] == fname]
-                    if row.empty:
+                    row = _sky_index.get(fname)
+                    if row is None:
                         return np.nan
                     for col in ("sky_sigma_med_e", "sky_sigma_e"):
-                        if col in row.columns:
-                            v = float(row[col].values[0])
+                        if col in row.index:
+                            v = float(row[col])
                             return v if np.isfinite(v) else np.nan
                     for col in ("sky_sigma_med_adu", "sky_sigma_adu"):
-                        if col in row.columns:
-                            v = float(row[col].values[0])
+                        if col in row.index:
+                            v = float(row[col])
                             return (v * GAIN) if np.isfinite(v) else np.nan
                 except Exception:
                     return np.nan
@@ -518,34 +510,41 @@ class ForcedPhotometryWorker(QThread):
                         return c
                 return None
 
+            # Pre-index df_frame_map by filename (avoid repeated .astype(str) per frame)
+            _frame_map_index = {}
+            _fm_c_file = _fm_c_id = _fm_c_sid = _fm_c_x = _fm_c_y = _fm_c_sep = None
+            if df_frame_map is not None and not df_frame_map.empty:
+                _fm_cols = df_frame_map.columns
+                _fm_c_file = _pick_col(_fm_cols, ["file", "fname", "frame"])
+                _fm_c_id = _pick_col(_fm_cols, ["ID", "id"])
+                _fm_c_sid = _pick_col(_fm_cols, ["source_id", "sourceid", "sid"])
+                _fm_c_x = _pick_col(_fm_cols, ["x", "x_det", "x_pix", "x0"])
+                _fm_c_y = _pick_col(_fm_cols, ["y", "y_det", "y_pix", "y0"])
+                _fm_c_sep = _pick_col(_fm_cols, ["sep_arcsec", "sep", "dist_arcsec"])
+                if _fm_c_file and _fm_c_x and _fm_c_y:
+                    for fn, grp in df_frame_map.groupby(df_frame_map[_fm_c_file].astype(str)):
+                        _frame_map_index[str(fn)] = grp
+
             def _load_frame_targets(fname, filt_key: str):
                 sid2id_map = sid2id_by_filter.get(filt_key, {})
-                if df_frame_map is not None and (not df_frame_map.empty):
-                    cols = df_frame_map.columns
-                    c_file = _pick_col(cols, ["file", "fname", "frame"])
-                    c_id = _pick_col(cols, ["ID", "id"])
-                    c_sid = _pick_col(cols, ["source_id", "sourceid", "sid"])
-                    c_x = _pick_col(cols, ["x", "x_det", "x_pix", "x0"])
-                    c_y = _pick_col(cols, ["y", "y_det", "y_pix", "y0"])
-                    c_sep = _pick_col(cols, ["sep_arcsec", "sep", "dist_arcsec"])
-                    if c_file and c_x and c_y:
-                        sub = df_frame_map[df_frame_map[c_file].astype(str) == str(fname)].copy()
-                        if len(sub):
-                            if not c_sid:
-                                return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
-                            out = pd.DataFrame({
-                                "x": pd.to_numeric(sub[c_x], errors="coerce"),
-                                "y": pd.to_numeric(sub[c_y], errors="coerce"),
-                            })
-                            out["source_id"] = pd.to_numeric(sub[c_sid], errors="coerce").astype("Int64")
-                            if sid2id_map:
-                                out["ID"] = out["source_id"].map(sid2id_map).astype("Int64")
-                            if "ID" not in out.columns and c_id and not sid2id_map:
-                                out["ID"] = pd.to_numeric(sub[c_id], errors="coerce").astype("Int64")
-                            if c_sep:
-                                out["sep_arcsec"] = pd.to_numeric(sub[c_sep], errors="coerce")
-                            out = out.dropna(subset=["ID", "x", "y"])
-                            return out[["ID", "x", "y", "source_id"]]
+                if _frame_map_index:
+                    sub = _frame_map_index.get(fname)
+                    if sub is not None and len(sub):
+                        if not _fm_c_sid:
+                            return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
+                        out = pd.DataFrame({
+                            "x": pd.to_numeric(sub[_fm_c_x], errors="coerce"),
+                            "y": pd.to_numeric(sub[_fm_c_y], errors="coerce"),
+                        })
+                        out["source_id"] = pd.to_numeric(sub[_fm_c_sid], errors="coerce").astype("Int64")
+                        if sid2id_map:
+                            out["ID"] = out["source_id"].map(sid2id_map).astype("Int64")
+                        if "ID" not in out.columns and _fm_c_id and not sid2id_map:
+                            out["ID"] = pd.to_numeric(sub[_fm_c_id], errors="coerce").astype("Int64")
+                        if _fm_c_sep:
+                            out["sep_arcsec"] = pd.to_numeric(sub[_fm_c_sep], errors="coerce")
+                        out = out.dropna(subset=["ID", "x", "y"])
+                        return out[["ID", "x", "y", "source_id"]]
 
                 # fallback: idmatch CSV + master map
                 p = _resolve_idmatch_path(result_dir, cache_dir, fname)

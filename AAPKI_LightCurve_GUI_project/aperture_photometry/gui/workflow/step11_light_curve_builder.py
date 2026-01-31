@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
 from astropy.time import Time
@@ -45,6 +47,7 @@ from PyQt5.QtGui import QKeySequence, QColor
 from PyQt5.QtWidgets import QShortcut, QStyle, QStyleOptionSlider
 
 from .step_window_base import StepWindowBase
+from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
 
 
 class ClickableSlider(QSlider):
@@ -112,13 +115,6 @@ def _safe_int_list(text: str) -> list[int]:
     return items
 
 
-def _safe_float(value, default: float = np.nan) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
 def _fmt_float(value, default: str = "") -> str:
     try:
         if value is None:
@@ -141,15 +137,6 @@ def _fmt_percent(value, default: str = "") -> str:
         return f"{v * 100:.1f}%"
     except Exception:
         return default
-
-
-def _parse_jd(date_obs: str | None) -> float:
-    if not date_obs:
-        return np.nan
-    try:
-        return float(Time(str(date_obs).strip()).jd)
-    except Exception:
-        return np.nan
 
 
 def _date_from_dateobs(date_obs: str | None) -> str:
@@ -181,12 +168,6 @@ def _load_headers_map(result_dir: Path) -> dict:
     if "Filename" in df.columns and "DATE-OBS" in df.columns:
         return dict(zip(df["Filename"].astype(str), df["DATE-OBS"].astype(str)))
     return {}
-
-
-def _normalize_filter_key(value: str | None) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().lower()
 
 
 def _parse_color_index(expr: str | None) -> tuple[str, str] | None:
@@ -267,6 +248,8 @@ def _compute_star_median_mags(
         int(sid): {f: [] for f in filters_normalized} for sid in star_ids
     }
 
+    # --- Resolve TSV paths & filter for each frame upfront ---
+    frame_info = []
     for _, idx_row in idx_df.iterrows():
         fname = str(idx_row["file"])
         phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
@@ -275,15 +258,6 @@ def _compute_star_median_mags(
         if not phot_path.exists():
             continue
 
-        try:
-            df = pd.read_csv(phot_path, sep="\t")
-        except Exception:
-            try:
-                df = pd.read_csv(phot_path)
-            except Exception:
-                continue
-
-        # Get filter for this frame
         filt = ""
         if "filter" in idx_df.columns:
             filt = _normalize_filter_key(str(idx_row.get("filter", "")))
@@ -292,17 +266,34 @@ def _compute_star_median_mags(
 
         if not filt or filt not in filters_normalized:
             continue
+        frame_info.append((phot_path, filt))
 
+    # --- Parallel TSV loading ---
+    def _load_tsv(path):
+        try:
+            return pd.read_csv(path, sep="\t")
+        except Exception:
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                return None
+
+    n_workers = min(8, len(frame_info)) if frame_info else 1
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        tsv_dfs = list(pool.map(lambda fi: _load_tsv(fi[0]), frame_info))
+
+    # --- Process loaded DataFrames ---
+    for (phot_path, filt), df in zip(frame_info, tsv_dfs):
+        if df is None or df.empty:
+            continue
         if "ID" not in df.columns:
             continue
 
-        # Convert ID column to int for matching
         try:
             df_ids = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
         except Exception:
             continue
 
-        # Extract magnitudes for each star
         for sid in star_ids:
             sid_int = int(sid)
             mask = df_ids == sid_int
@@ -1665,6 +1656,37 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._photometry_cache[fname] = df
         return df
 
+    def _preload_photometry_cache(self, result_dir: Path, filenames: list[str]):
+        """Bulk-preload photometry TSVs using ThreadPoolExecutor."""
+        if self._photometry_cache_dir != result_dir:
+            self._photometry_cache.clear()
+            self._photometry_cache_dir = result_dir
+
+        # Only load files not yet cached
+        to_load = [fn for fn in filenames if fn not in self._photometry_cache]
+        if not to_load:
+            return
+
+        def _load_one(fname):
+            phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
+            if not phot_path.exists():
+                phot_path = result_dir / f"{fname}_photometry.tsv"
+            if not phot_path.exists():
+                return fname, None
+            try:
+                df = pd.read_csv(phot_path, sep="\t")
+            except Exception:
+                try:
+                    df = pd.read_csv(phot_path)
+                except Exception:
+                    df = None
+            return fname, df
+
+        n_workers = min(8, len(to_load))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for fname, df in pool.map(_load_one, to_load):
+                self._photometry_cache[fname] = df
+
     def _build_star_mag_series(self, result_dir: Path, star_id: int, verbose: bool = True) -> pd.DataFrame:
         idx_path = step9_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
@@ -1679,6 +1701,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.log(f"[DEBUG] photometry_index.csv missing 'file' column")
             return pd.DataFrame()
         files = idx["file"].astype(str).tolist()
+        self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
         headers_df = _load_headers_table(result_dir)
 
@@ -1800,6 +1823,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.log(f"[DEBUG] photometry_index.csv missing 'file' column")
             return pd.DataFrame()
         files = idx["file"].astype(str).tolist()
+        self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
         headers_df = _load_headers_table(result_dir)
 
@@ -1875,10 +1899,8 @@ class LightCurveBuilderWindow(StepWindowBase):
             filters.append(filt_key)
             airmasses.append(am if np.isfinite(am) else np.nan)
 
-            phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
-                phot_path = result_dir / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
+            df = self._get_photometry_df(result_dir, fname)
+            if df is None or df.empty:
                 mags.append(np.nan)
                 mag_errs.append(np.nan)
                 comp_avgs.append(np.nan)
@@ -1886,10 +1908,6 @@ class LightCurveBuilderWindow(StepWindowBase):
                 diffs.append(np.nan)
                 diff_errs.append(np.nan)
                 continue
-            try:
-                df = pd.read_csv(phot_path, sep="\t")
-            except Exception:
-                df = pd.read_csv(phot_path)
 
             use_source_id = False
             target_source_id = None
@@ -2002,6 +2020,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.log(f"[DEBUG] photometry_index.csv missing 'file' column")
             return pd.DataFrame()
         files = idx["file"].astype(str).tolist()
+        self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
         headers_df = _load_headers_table(result_dir)
 
@@ -2082,19 +2101,11 @@ class LightCurveBuilderWindow(StepWindowBase):
             filters.append(filt_key)
             airmasses.append(float(am) if np.isfinite(am) else np.nan)
 
-            phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
-                phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-                if not phot_path.exists():
-                    phot_path = result_dir / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
+            df = self._get_photometry_df(result_dir, fname)
+            if df is None or df.empty:
                 diffs.append(np.nan)
                 n_phot_missing += 1
                 continue
-            try:
-                df = pd.read_csv(phot_path, sep="\t")
-            except Exception:
-                df = pd.read_csv(phot_path)
 
             # 필터별 selection 또는 legacy selection 사용
             use_source_id = False
