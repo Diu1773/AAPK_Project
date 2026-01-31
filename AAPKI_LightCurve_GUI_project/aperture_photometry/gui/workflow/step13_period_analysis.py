@@ -319,8 +319,11 @@ class PeriodAnalysisWorker(QThread):
             bls = BoxLeastSquares(t, y)
 
         baseline = t.max() - t.min()
-        min_dur = max(0.01, self.min_period * 0.01)
-        max_dur = min(self.max_period * 0.25, baseline * 0.25)
+        # Duration must be strictly less than min_period
+        max_dur = min(self.min_period * 0.5, self.max_period * 0.25, baseline * 0.25)
+        min_dur = max(self.min_period * 0.01, max_dur * 0.05)
+        if min_dur >= max_dur:
+            min_dur = max_dur * 0.1
         durations = np.linspace(min_dur, max_dur, 10)
 
         try:
