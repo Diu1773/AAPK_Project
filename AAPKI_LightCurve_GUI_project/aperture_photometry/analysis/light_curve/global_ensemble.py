@@ -41,6 +41,7 @@ def solve_global_ensemble(
     interp_missing: bool = False,
     normalize_target: bool = False,
     max_dense_params: int = 2000,
+    rescale_errors: bool = True,
     log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, pd.DataFrame | dict]:
     """Solve global ensemble photometry (method C).
@@ -61,6 +62,7 @@ def solve_global_ensemble(
         interp_missing: Interpolate Z_t for frames with too few comps.
         normalize_target: Subtract median from corrected target curve.
         max_dense_params: Dense covariance threshold.
+        rescale_errors: Inflate per-frame errors based on chi2_red (floor at 1.0).
         log: Optional logger callback.
     """
 
@@ -119,6 +121,7 @@ def solve_global_ensemble(
             interp_missing=interp_missing,
             normalize_target=normalize_target,
             max_dense_params=max_dense_params,
+            rescale_errors=rescale_errors,
             log=_log,
         )
 
@@ -165,6 +168,7 @@ def _solve_one_filter(
     interp_missing: bool,
     normalize_target: bool,
     max_dense_params: int,
+    rescale_errors: bool,
     log: Callable[[str], None],
 ) -> Dict[str, pd.DataFrame | dict]:
     comp_active = [c for c in comp_ids if c != int(target_id)]
@@ -194,6 +198,32 @@ def _solve_one_filter(
         fit = _solve_wls(comp_df, gauge=gauge, max_dense_params=max_dense_params, log=log)
         resid = comp_df["mag_inst"].to_numpy(float) - fit["model"]
         comp_df["resid"] = resid
+
+        # Chi²_red error rescaling (conservative: inflate only, floor at 1.0)
+        if rescale_errors and it < max(1, n_iter) - 1:
+            if "err_orig" not in comp_df.columns:
+                comp_df["err_orig"] = comp_df["err"].copy()
+            err_cur = comp_df["err_orig"].to_numpy(float)
+            _ok = np.isfinite(resid) & np.isfinite(err_cur) & (err_cur > 0)
+            if np.any(_ok):
+                def _chi2_red_frame(g):
+                    r = g["resid"].to_numpy(float)
+                    e = g["err_orig"].to_numpy(float)
+                    v = np.isfinite(r) & np.isfinite(e) & (e > 0)
+                    if np.sum(v) < 2:
+                        return 1.0
+                    return float(np.sum((r[v] / e[v]) ** 2) / max(int(np.sum(v)) - 1, 1))
+                chi2_map = comp_df.groupby("time_id").apply(
+                    _chi2_red_frame, include_groups=False
+                )
+                scale = np.sqrt(np.clip(
+                    comp_df["time_id"].map(chi2_map).to_numpy(float), 1.0, np.inf
+                ))
+                comp_df["err"] = err_cur * scale
+                n_inflated = int(np.sum(scale > 1.0))
+                if n_inflated > 0:
+                    log(f"[RESCALE] Iter {it+1}: {n_inflated}/{len(chi2_map)} frames inflated "
+                        f"(max scale={float(np.nanmax(scale)):.2f})")
 
         # Outlier rejection (measurement-level)
         sigma_global = _robust_sigma(resid) if robust else np.nanstd(resid)
@@ -440,7 +470,15 @@ def _build_target_lc(
     if target_df.empty:
         return pd.DataFrame()
 
-    comp_mean = comp_df.groupby("time_id")["mag_inst"].mean()
+    def _weighted_mean(g):
+        m = g["mag_inst"].to_numpy(float)
+        e = g["err"].to_numpy(float)
+        ok = np.isfinite(m) & np.isfinite(e) & (e > 0)
+        if np.any(ok):
+            w = 1.0 / (e[ok] ** 2)
+            return float(np.sum(m[ok] * w) / np.sum(w))
+        return float(np.nanmean(m))
+    comp_mean = comp_df.groupby("time_id").apply(_weighted_mean, include_groups=False)
     comp_n = comp_df.groupby("time_id")["mag_inst"].count()
 
     lc = target_df.copy()

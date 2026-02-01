@@ -132,6 +132,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.global_robust = True
         self.global_interp_missing = False
         self.global_normalize = False
+        self.global_rescale_errors = True
 
         super().__init__(
             step_index=11,
@@ -514,6 +515,13 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.chk_global_normalize = QCheckBox("Target 중앙값 0으로 정규화")
         self.chk_global_normalize.setChecked(self.global_normalize)
         global_layout.addRow(self.chk_global_normalize)
+
+        self.chk_global_rescale_err = QCheckBox("Chi²_red 기반 오차 보정")
+        self.chk_global_rescale_err.setChecked(self.global_rescale_errors)
+        self.chk_global_rescale_err.setToolTip(
+            "프레임별 chi²_red에 따라 오차를 보정합니다 (1.0 이상일 때만 확대, 축소하지 않음)"
+        )
+        global_layout.addRow(self.chk_global_rescale_err)
 
         options_layout.addWidget(global_group)
 
@@ -1687,6 +1695,23 @@ class DetrendNightMergeWindow(StepWindowBase):
                 rms_before = np.nanstd(y[base_mask])
                 rms_after = np.nanstd((y - y_fit)[used_mask]) if np.any(used_mask) else np.nan
 
+                # Per-night excess variance diagnostic
+                var_excess = np.nan
+                excess_ratio = np.nan
+                if np.any(used_mask) and np.isfinite(rms_after):
+                    err_used = err[used_mask]
+                    good_err = np.isfinite(err_used) & (err_used > 0)
+                    if np.any(good_err):
+                        median_var = float(np.nanmedian(err_used[good_err] ** 2))
+                        var_excess = float(max(0.0, rms_after ** 2 - median_var))
+                        if median_var > 0:
+                            excess_ratio = float(var_excess / median_var)
+                        if excess_ratio > 2.0:
+                            self.log(
+                                f"[WARN] {date_val}/{fkey or 'all'}: "
+                                f"excess variance {excess_ratio:.1f}x photometric noise"
+                            )
+
                 params_rows.append({
                     "date": date_val,
                     "filter": fkey,
@@ -1697,6 +1722,8 @@ class DetrendNightMergeWindow(StepWindowBase):
                     "n_used": int(np.sum(used_mask)),
                     "rms_before": rms_before,
                     "rms_after": rms_after,
+                    "var_excess": var_excess,
+                    "excess_ratio": excess_ratio,
                     "global_k2": use_global_k2 and self.mode == "color",
                 })
 
@@ -1742,6 +1769,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.global_robust = bool(self.chk_global_robust.isChecked())
         self.global_interp_missing = bool(self.chk_global_interp.isChecked())
         self.global_normalize = bool(self.chk_global_normalize.isChecked())
+        self.global_rescale_errors = bool(self.chk_global_rescale_err.isChecked())
 
         self.log(
             "[GLOBAL] min_comps={mc} sigma={sg} iters={it} rms_pct={rp} rms_thr={rt} frame_sigma={fs} gauge={g}".format(
@@ -1771,6 +1799,7 @@ class DetrendNightMergeWindow(StepWindowBase):
                 frame_sigma=self.global_frame_sigma,
                 interp_missing=self.global_interp_missing,
                 normalize_target=self.global_normalize,
+                rescale_errors=self.global_rescale_errors,
                 log=self.log,
             )
         except Exception as e:
@@ -2594,6 +2623,7 @@ class DetrendNightMergeWindow(StepWindowBase):
             "global_robust": self.global_robust,
             "global_interp_missing": self.global_interp_missing,
             "global_normalize": self.global_normalize,
+            "global_rescale_errors": self.global_rescale_errors,
         }
         self.project_state.store_step_data("detrend_merge", state_data)
 
@@ -2626,6 +2656,7 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.global_robust = bool(state_data.get("global_robust", self.global_robust))
             self.global_interp_missing = bool(state_data.get("global_interp_missing", self.global_interp_missing))
             self.global_normalize = bool(state_data.get("global_normalize", self.global_normalize))
+            self.global_rescale_errors = bool(state_data.get("global_rescale_errors", self.global_rescale_errors))
 
         if not self.color_map_by_filter:
             self.color_map_by_filter = self._normalize_color_map(
@@ -2672,3 +2703,5 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.chk_global_interp.setChecked(self.global_interp_missing)
         if hasattr(self, "chk_global_normalize"):
             self.chk_global_normalize.setChecked(self.global_normalize)
+        if hasattr(self, "chk_global_rescale_err"):
+            self.chk_global_rescale_err.setChecked(self.global_rescale_errors)

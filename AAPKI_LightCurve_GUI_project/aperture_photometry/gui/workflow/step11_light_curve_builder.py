@@ -1950,8 +1950,16 @@ class LightCurveBuilderWindow(StepWindowBase):
                     cerrs.append(_safe_float(row_c["mag_err"].values[0]) if "mag_err" in row_c.columns else np.nan)
             if cmags:
                 n_comp_found += 1
-                comp_mean = float(np.nanmean(cmags))
-                comp_err = float(np.nanmean(cerrs)) if cerrs else np.nan
+                cmags_arr = np.array(cmags, dtype=float)
+                cerrs_arr = np.array(cerrs, dtype=float)
+                valid_w = np.isfinite(cerrs_arr) & (cerrs_arr > 0)
+                if np.any(valid_w):
+                    w = 1.0 / (cerrs_arr[valid_w] ** 2)
+                    comp_mean = float(np.sum(cmags_arr[valid_w] * w) / np.sum(w))
+                    comp_err = float(1.0 / np.sqrt(np.sum(w)))
+                else:
+                    comp_mean = float(np.nanmean(cmags_arr))
+                    comp_err = float(np.nanmean(cerrs_arr)) if cerrs else np.nan
             else:
                 comp_mean = np.nan
                 comp_err = np.nan
