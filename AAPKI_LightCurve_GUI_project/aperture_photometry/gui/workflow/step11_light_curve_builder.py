@@ -98,6 +98,7 @@ from ...utils.step_paths import (
     legacy_step5_refbuild_dir,
     legacy_step7_refbuild_dir,
 )
+from ...utils.qc_utils import load_frame_excludes, save_frame_excludes as save_frame_excludes_file
 
 
 def _safe_int_list(text: str) -> list[int]:
@@ -772,6 +773,14 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.qc_scale_fixed_value = 0.2
         self.qc_date_last = None
 
+        # Frame QC (manual exclude)
+        self._frame_exclude_cache: dict[str, dict[str, set[str]]] = {}
+        self._frame_exclude_dirty: set[str] = set()
+        self._frame_qc_selected: str | None = None
+        self._frame_qc_selected_dir: Path | None = None
+        self._frame_qc_total = 0
+        self._plot_point_map: dict[object, dict[str, object]] = {}
+
         # 필터별 플롯 표시/색상 설정
         self.filter_visibility: dict[str, bool] = {}
         self.filter_colors: dict[str, str] = {}
@@ -924,6 +933,8 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.plot_canvas.setFocusPolicy(Qt.ClickFocus)
         self.plot_canvas.setMinimumHeight(480)
         self.plot_canvas.setStyleSheet("background-color: #FFFFFF; border: 1px solid #ECEFF1;")
+        self.plot_canvas.mpl_connect("pick_event", self._on_plot_pick)
+        self.plot_canvas.mpl_connect("button_press_event", lambda _evt: self.plot_canvas.setFocus())
         plot_layout.addWidget(self.plot_canvas)
 
         # Phase Folding 슬라이더
@@ -965,6 +976,33 @@ class LightCurveBuilderWindow(StepWindowBase):
         plot_layout.addWidget(phase_box)
 
         self.light_layout.addWidget(plot_group)
+
+        frame_qc_group = QGroupBox("Frame QC (Manual Exclude)")
+        frame_qc_group.setStyleSheet(
+            "QGroupBox { background-color: #F7F9FB; border: 1px solid #CFD8DC; border-radius: 8px; margin-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #37474F; font-weight: bold; }"
+        )
+        frame_qc_layout = QVBoxLayout(frame_qc_group)
+        self.frame_qc_hint = QLabel("Click a point to select. D = exclude, A = include (undo)")
+        self.frame_qc_hint.setStyleSheet("QLabel { color: #455A64; }")
+        frame_qc_layout.addWidget(self.frame_qc_hint)
+        self.frame_qc_selected_label = QLabel("Selected: (none)")
+        self.frame_qc_selected_label.setStyleSheet("QLabel { font-weight: bold; }")
+        frame_qc_layout.addWidget(self.frame_qc_selected_label)
+        self.frame_qc_summary_label = QLabel("Excluded: 0/0")
+        self.frame_qc_summary_label.setStyleSheet("QLabel { color: #546E7A; }")
+        frame_qc_layout.addWidget(self.frame_qc_summary_label)
+
+        frame_btn_row = QHBoxLayout()
+        self.btn_frame_qc_save = QPushButton("Save Exclusions")
+        self.btn_frame_qc_save.clicked.connect(self.save_frame_excludes)
+        frame_btn_row.addWidget(self.btn_frame_qc_save)
+        self.btn_frame_qc_clear = QPushButton("Clear Exclusions")
+        self.btn_frame_qc_clear.clicked.connect(self.clear_frame_excludes)
+        frame_btn_row.addWidget(self.btn_frame_qc_clear)
+        frame_btn_row.addStretch()
+        frame_qc_layout.addLayout(frame_btn_row)
+        self.light_layout.addWidget(frame_qc_group)
 
         qc_group = QGroupBox("Comparison QC")
         qc_group.setStyleSheet(
@@ -1039,6 +1077,10 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.shortcut_prev.activated.connect(lambda: self._step_comp(-1))
         self.shortcut_next = QShortcut(QKeySequence(Qt.Key_Right), self)
         self.shortcut_next.activated.connect(lambda: self._step_comp(1))
+        self.shortcut_exclude = QShortcut(QKeySequence(Qt.Key_D), self)
+        self.shortcut_exclude.activated.connect(self._exclude_selected_frame)
+        self.shortcut_include = QShortcut(QKeySequence(Qt.Key_A), self)
+        self.shortcut_include.activated.connect(self._include_selected_frame)
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -1700,6 +1742,12 @@ class LightCurveBuilderWindow(StepWindowBase):
             if verbose:
                 self.log(f"[DEBUG] photometry_index.csv missing 'file' column")
             return pd.DataFrame()
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        if exclude_map:
+            before = len(idx)
+            idx = idx[~idx["file"].astype(str).isin(exclude_map.keys())]
+            if verbose and before != len(idx):
+                self.log(f"[Frame QC] Excluded frames: {before} → {len(idx)}")
         files = idx["file"].astype(str).tolist()
         self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
@@ -2201,6 +2249,99 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         return result_df
 
+    def _current_result_dir(self) -> Path | None:
+        if not self.datasets:
+            return None
+        return Path(self.datasets[0][1])
+
+    def _get_frame_exclude_map(self, result_dir: Path) -> dict[str, set[str]]:
+        key = str(result_dir)
+        if key not in self._frame_exclude_cache:
+            self._frame_exclude_cache[key] = load_frame_excludes(result_dir)
+        return self._frame_exclude_cache[key]
+
+    def _set_selected_frame(self, fname: str | None, result_dir: Path | None) -> None:
+        self._frame_qc_selected = fname
+        self._frame_qc_selected_dir = result_dir
+        if not fname or result_dir is None:
+            self.frame_qc_selected_label.setText("Selected: (none)")
+            return
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        status = "excluded" if fname in exclude_map else "included"
+        self.frame_qc_selected_label.setText(f"Selected: {fname} ({status})")
+
+    def _update_frame_qc_summary(self) -> None:
+        result_dir = self._current_result_dir()
+        total = int(self._frame_qc_total or 0)
+        if result_dir is None:
+            self.frame_qc_summary_label.setText("Excluded: 0/0")
+            return
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        exc = len(exclude_map)
+        dirty = str(result_dir) in self._frame_exclude_dirty
+        suffix = " (unsaved)" if dirty else ""
+        self.frame_qc_summary_label.setText(f"Excluded: {exc}/{total}{suffix}")
+
+    def _on_plot_pick(self, event) -> None:
+        artist = event.artist
+        meta = self._plot_point_map.get(artist)
+        if not meta:
+            return
+        indices = getattr(event, "ind", None)
+        if not indices:
+            return
+        idx = int(indices[0])
+        files = meta.get("files", [])
+        if idx < 0 or idx >= len(files):
+            return
+        fname = str(files[idx])
+        result_dir = self._current_result_dir()
+        self._set_selected_frame(fname, result_dir)
+
+    def _exclude_selected_frame(self) -> None:
+        if not self._frame_qc_selected or self._frame_qc_selected_dir is None:
+            return
+        exclude_map = self._get_frame_exclude_map(self._frame_qc_selected_dir)
+        exclude_map.setdefault(self._frame_qc_selected, set()).add("manual")
+        self._frame_exclude_dirty.add(str(self._frame_qc_selected_dir))
+        self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
+        self._update_frame_qc_summary()
+        self.plot_current_comparison()
+
+    def _include_selected_frame(self) -> None:
+        if not self._frame_qc_selected or self._frame_qc_selected_dir is None:
+            return
+        exclude_map = self._get_frame_exclude_map(self._frame_qc_selected_dir)
+        if self._frame_qc_selected in exclude_map:
+            del exclude_map[self._frame_qc_selected]
+            self._frame_exclude_dirty.add(str(self._frame_qc_selected_dir))
+        self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
+        self._update_frame_qc_summary()
+        self.plot_current_comparison()
+
+    def clear_frame_excludes(self) -> None:
+        result_dir = self._current_result_dir()
+        if result_dir is None:
+            return
+        self._frame_exclude_cache[str(result_dir)] = {}
+        self._frame_exclude_dirty.add(str(result_dir))
+        self._update_frame_qc_summary()
+        self.plot_current_comparison()
+
+    def save_frame_excludes(self) -> None:
+        result_dir = self._current_result_dir()
+        if result_dir is None:
+            return
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        try:
+            save_frame_excludes_file(result_dir, exclude_map)
+            if str(result_dir) in self._frame_exclude_dirty:
+                self._frame_exclude_dirty.remove(str(result_dir))
+            self._update_frame_qc_summary()
+            self.log("[Frame QC] Saved frame exclusions.")
+        except Exception as e:
+            self.log(f"[Frame QC] Save failed: {e}")
+
     def plot_current_comparison(self):
         if not self.datasets:
             self.use_current_dataset()
@@ -2229,6 +2370,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         y_col = "diff_mag_raw" if "diff_mag_raw" in df.columns else "diff_mag"
         self._ensure_filter_controls(df["filter"].astype(str).tolist())
         self.plot_ax.clear()
+        self._plot_point_map = {}
 
         # X축 선택
         if self.x_axis_mode == "phase":
@@ -2255,6 +2397,12 @@ class LightCurveBuilderWindow(StepWindowBase):
             x_column = "rel_time_hr"
             x_label = "Time (hr)"
 
+        result_dir = self._current_result_dir()
+        exclude_map = self._get_frame_exclude_map(result_dir) if result_dir is not None else {}
+        excluded_files = set(exclude_map.keys())
+        self._frame_qc_total = int(df["file"].nunique()) if "file" in df.columns else 0
+        self._update_frame_qc_summary()
+
         y_label = "dmag (raw)"
         for filt, sub in df.groupby("filter"):
             fkey = self._filter_key_for_ui(filt)
@@ -2265,12 +2413,25 @@ class LightCurveBuilderWindow(StepWindowBase):
 
             x = sub[x_column].to_numpy(float)
             y = sub[y_col].to_numpy(float)
+            files = sub["file"].astype(str).to_numpy() if "file" in sub.columns else np.array([""] * len(sub))
 
             m = np.isfinite(x) & np.isfinite(y)
             if not np.any(m):
                 continue
-            self.plot_ax.plot(x[m], y[m], marker="o", linestyle="None", color=c, label=label,
-                             markersize=3, alpha=0.7)  # 크기 줄이고 투명도 추가
+            excl = np.array([f in excluded_files for f in files], dtype=bool)
+            m_in = m & ~excl
+            m_ex = m & excl
+
+            if np.any(m_in):
+                sc = self.plot_ax.scatter(
+                    x[m_in], y[m_in], s=12, color=c, label=label, alpha=0.7, picker=5
+                )
+                self._plot_point_map[sc] = {"files": files[m_in].tolist()}
+            if np.any(m_ex):
+                scx = self.plot_ax.scatter(
+                    x[m_ex], y[m_ex], s=16, color="#9E9E9E", marker="x", alpha=0.9, picker=5
+                )
+                self._plot_point_map[scx] = {"files": files[m_ex].tolist()}
 
         self.plot_ax.set_xlabel(x_label)
         self.plot_ax.set_ylabel(f"{y_label} (Target - Comparison)")
@@ -2686,6 +2847,17 @@ class LightCurveBuilderWindow(StepWindowBase):
             QMessageBox.information(self, "Light Curve", "비교성 ID가 필요합니다.")
             return
 
+        # Persist frame excludes before build so downstream steps can consume them.
+        for _, path in self.datasets:
+            key = str(path)
+            if key in self._frame_exclude_dirty:
+                try:
+                    save_frame_excludes_file(Path(path), self._get_frame_exclude_map(Path(path)))
+                    self._frame_exclude_dirty.remove(key)
+                    self.log(f"[Frame QC] Saved exclusions for {path}")
+                except Exception as e:
+                    self.log(f"[Frame QC] Save failed for {path}: {e}")
+
         active_comp_ids = list(comp_ids)
 
         self.log("=" * 60)
@@ -2817,6 +2989,12 @@ class LightCurveBuilderWindow(StepWindowBase):
             return
         if event.key() == Qt.Key_Right:
             self._step_comp(1)
+            return
+        if event.key() == Qt.Key_D:
+            self._exclude_selected_frame()
+            return
+        if event.key() == Qt.Key_A:
+            self._include_selected_frame()
             return
         super().keyPressEvent(event)
 

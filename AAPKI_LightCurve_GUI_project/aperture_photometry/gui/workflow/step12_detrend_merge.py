@@ -49,6 +49,7 @@ from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
 from ...utils.step_paths import step1_dir, step9_dir, step11_dir, step12_dir, step11_zeropoint_dir
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
+from ...utils.qc_utils import load_frame_excludes
 
 
 def _fmt_float(value, default: str = "") -> str:
@@ -806,6 +807,19 @@ class DetrendNightMergeWindow(StepWindowBase):
         except Exception:
             return None
 
+    def _apply_frame_excludes(self, df: pd.DataFrame, result_dir: Path, label: str) -> pd.DataFrame:
+        if df.empty or "file" not in df.columns:
+            return df
+        exclude_map = load_frame_excludes(result_dir)
+        if not exclude_map:
+            return df
+        before = len(df)
+        df = df[~df["file"].astype(str).isin(exclude_map.keys())]
+        removed = before - len(df)
+        if removed > 0:
+            self.log(f"[Frame QC] {label}: {before} → {len(df)} (excluded {removed})")
+        return df
+
     def load_raw_data(self):
         if not self.datasets:
             self.use_current_dataset()
@@ -863,6 +877,7 @@ class DetrendNightMergeWindow(StepWindowBase):
                 continue
             df = df.copy()
             df["dataset"] = label
+            df = self._apply_frame_excludes(df, result_dir, str(label))
             raw_frames.append(df)
 
         if not raw_frames:
