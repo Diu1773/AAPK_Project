@@ -47,6 +47,7 @@ from ...utils.step_paths import (
     legacy_step6_idmatch_dir,
 )
 from ...utils.common_helpers import safe_float as _safe_float
+from ...utils.qc_utils import filter_files_by_qc
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -1101,6 +1102,20 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Warning", "No frames found")
             return
 
+        idmatch_cfg = getattr(self.params.P, "idmatch", None)
+        use_qc = bool(getattr(idmatch_cfg, "use_qc_pass_only", getattr(self.params.P, "idmatch_use_qc_pass_only", True)))
+        files, qc_info = filter_files_by_qc(Path(self.params.P.result_dir), files, require_qc=use_qc)
+        if use_qc:
+            if qc_info.get("applied"):
+                self.log(f"[QC] Frame QC filter: {qc_info['kept']}/{qc_info['total']} kept.")
+            elif qc_info.get("path") is None:
+                self.log("[QC] frame_quality.csv not found; using all frames.")
+            else:
+                self.log(f"[QC] frame_quality.csv ignored ({qc_info['reason']}); using all frames.")
+        if not files:
+            QMessageBox.warning(self, "Warning", "No frames after QC filter.")
+            return
+
         cache_dir = Path(self.params.P.cache_dir)
         step4_out = step4_dir(self.params.P.result_dir)
         available = [
@@ -1117,7 +1132,6 @@ class StarIdMatchingWindow(StepWindowBase):
             return
 
         # Get two-pass matching parameters from config
-        idmatch_cfg = getattr(self.params.P, "idmatch", None)
         two_pass_enable = bool(getattr(idmatch_cfg, "two_pass_enable", True)) if idmatch_cfg else True
         tight_radius_arcsec = float(getattr(idmatch_cfg, "tight_radius_arcsec", 1.0)) if idmatch_cfg else 1.0
         loose_radius_arcsec = float(getattr(idmatch_cfg, "loose_radius_arcsec", 3.0)) if idmatch_cfg else 3.0

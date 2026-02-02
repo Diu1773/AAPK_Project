@@ -45,6 +45,7 @@ from ...utils.step_paths import (
     legacy_step7_wcs_dir,
 )
 from ...utils.common_helpers import safe_float as _safe_float
+from ...utils.qc_utils import filter_files_by_qc
 
 
 _FILTER_RE = re.compile(r"[-_]([ugrizbvUGRIZBV])[-_.]", re.IGNORECASE)
@@ -1415,6 +1416,19 @@ class RefBuildWindow(StepWindowBase):
                 return
         if not files:
             QMessageBox.warning(self, "Warning", "No frames found")
+            return
+
+        use_qc = bool(getattr(self.params.P, "wcs_require_qc_pass", True))
+        files, qc_info = filter_files_by_qc(Path(self.params.P.result_dir), files, require_qc=use_qc)
+        if use_qc:
+            if qc_info.get("applied"):
+                self.log(f"[REF][QC] Frame QC filter: {qc_info['kept']}/{qc_info['total']} kept.")
+            elif qc_info.get("path") is None:
+                self.log("[REF][QC] frame_quality.csv not found; using all frames.")
+            else:
+                self.log(f"[REF][QC] frame_quality.csv ignored ({qc_info['reason']}); using all frames.")
+        if not files:
+            QMessageBox.warning(self, "Warning", "No frames after QC filter.")
             return
 
         ref_filter = str(getattr(self.params.P, "global_ref_filter", "") or "").strip().lower()

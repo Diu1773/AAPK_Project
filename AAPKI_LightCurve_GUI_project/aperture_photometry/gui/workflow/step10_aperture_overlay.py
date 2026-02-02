@@ -34,6 +34,7 @@ from ...utils.step_paths import (
     legacy_step5_refbuild_dir,
     legacy_step7_refbuild_dir,
 )
+from ...utils.qc_utils import filter_files_by_qc
 
 
 class ApertureOverlayWindow(StepWindowBase):
@@ -262,6 +263,15 @@ class ApertureOverlayWindow(StepWindowBase):
                     pass
             files = self.file_manager.filenames
             self.use_cropped = False
+        use_qc = bool(getattr(self.params.P, "phot_use_qc_pass_only", False))
+        files, qc_info = filter_files_by_qc(Path(self.params.P.result_dir), files, require_qc=use_qc)
+        if use_qc:
+            if qc_info.get("applied"):
+                self.log(f"[QC] Frame QC filter: {qc_info['kept']}/{qc_info['total']} kept.")
+            elif qc_info.get("path") is None:
+                self.log("[QC] frame_quality.csv not found; using all frames.")
+            else:
+                self.log(f"[QC] frame_quality.csv ignored ({qc_info['reason']}); using all frames.")
         self.file_list = list(files)
         self.file_combo.clear()
         self.file_combo.addItems(self.file_list)
