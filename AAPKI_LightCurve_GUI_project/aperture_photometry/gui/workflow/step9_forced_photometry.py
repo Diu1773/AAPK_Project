@@ -1,5 +1,5 @@
 """
-Step 9: Forced Photometry (per-frame ID-matched XY) + Aperture Overlay
+Step 9: Forced Photometry (per-frame ID-matched XY)
 Ported from AAPKI_GUI.ipynb Cell 12 (GUI adaptation).
 
 Features:
@@ -982,7 +982,7 @@ class ForcedPhotometryWindow(StepWindowBase):
 
         super().__init__(
             step_index=8,
-            step_name="Forced Photometry + Overlay",
+            step_name="Forced Photometry",
             params=params,
             project_state=project_state,
             main_window=main_window

@@ -37,6 +37,7 @@ class ProjectState:
             "star_id_match",
             "target_selection",
             "forced_photometry",
+            "aperture_overlay",
             "light_curve",
             "detrend_merge",
             "period_analysis",

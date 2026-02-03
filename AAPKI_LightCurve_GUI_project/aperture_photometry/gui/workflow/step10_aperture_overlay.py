@@ -110,7 +110,7 @@ class ApertureOverlayWindow(StepWindowBase):
             self.btn_previous.hide()
             self.btn_complete.hide()
             self.btn_next.hide()
-            self.title_label.setText("Aperture Overlay (Step 9)")
+            self.title_label.setText("Aperture Overlay (from Step 9)")
         self.restore_state()
 
     def setup_step_ui(self):

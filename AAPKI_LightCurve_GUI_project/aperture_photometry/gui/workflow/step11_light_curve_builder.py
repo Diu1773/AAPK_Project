@@ -1,5 +1,5 @@
 """
-Step 10 (UI): Light Curve Builder
+Step 11: Light Curve Builder
 """
 
 from __future__ import annotations
@@ -726,7 +726,7 @@ FILTER_COLORS = {
 
 
 class LightCurveBuilderWindow(StepWindowBase):
-    """Step 10 (UI): Light curve builder (diff/abs)."""
+    """Step 11: Light curve builder (diff/abs)."""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -780,6 +780,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._frame_qc_selected_dir: Path | None = None
         self._frame_qc_total = 0
         self._plot_point_map: dict[object, dict[str, object]] = {}
+        self._frame_qc_done_cache: dict[str, bool] = {}
 
         # 필터별 플롯 표시/색상 설정
         self.filter_visibility: dict[str, bool] = {}
@@ -788,7 +789,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.filter_control_map: dict[str, QPushButton] = {}
 
         super().__init__(
-            step_index=9,
+            step_index=10,
             step_name="Light Curve Builder",
             params=params,
             project_state=project_state,
@@ -874,6 +875,10 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.plot_info_label.setStyleSheet("QLabel { font-weight: bold; }")
         plot_layout.addWidget(self.plot_info_label)
 
+        self.qc_gate_label = QLabel("Frame QC: not confirmed. Exclude bad frames and click 'Save Exclusions'.")
+        self.qc_gate_label.setStyleSheet("QLabel { color: #D84315; font-weight: bold; }")
+        plot_layout.addWidget(self.qc_gate_label)
+
         # 컨트롤 버튼 row
         btn_row = QHBoxLayout()
 
@@ -894,10 +899,10 @@ class LightCurveBuilderWindow(StepWindowBase):
         btn_row.addStretch()
 
         # Plot 버튼 (자동 저장 포함)
-        btn_plot = QPushButton("Plot && Save")
-        btn_plot.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 16px; font-size: 10pt; }")
-        btn_plot.clicked.connect(self.plot_and_save)
-        btn_row.addWidget(btn_plot)
+        self.btn_plot = QPushButton("Plot && Save")
+        self.btn_plot.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 16px; font-size: 10pt; }")
+        self.btn_plot.clicked.connect(self.plot_and_save)
+        btn_row.addWidget(self.btn_plot)
 
         plot_layout.addLayout(btn_row)
 
@@ -1102,6 +1107,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         log_layout.addWidget(self.log_text)
 
         # build button moved to plot group
+        self._update_qc_gate_ui()
 
     def log(self, msg: str):
         self.log_text.append(msg)
@@ -1582,6 +1588,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.datasets.append((label, path))
         self.clear_diff_series_cache()  # 새 데이터셋 추가 시 캐시 클리어
         self.refresh_dataset_table()
+        self._update_qc_gate_ui()
 
     def remove_selected_dataset(self):
         rows = self.dataset_table.selectionModel().selectedRows()
@@ -1591,6 +1598,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         if 0 <= idx < len(self.datasets):
             self.datasets.pop(idx)
         self.refresh_dataset_table()
+        self._update_qc_gate_ui()
 
     def refresh_dataset_table(self):
         self.dataset_table.setRowCount(0)
@@ -1599,6 +1607,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.dataset_table.insertRow(r)
             self.dataset_table.setItem(r, 0, QTableWidgetItem(label))
             self.dataset_table.setItem(r, 1, QTableWidgetItem(str(path)))
+        self._update_qc_gate_ui()
 
     def load_from_selection(self):
         if not self.datasets:
@@ -1613,6 +1622,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.comp_candidate_ids = list(comp_ids)
         self._update_comp_ids_from_input()
         self.plot_current_comparison()
+        self._update_qc_gate_ui()
 
     def _update_comp_ids_from_input(self):
         self.comp_ids_list = _safe_int_list(self.comp_edit.text())
@@ -2254,6 +2264,54 @@ class LightCurveBuilderWindow(StepWindowBase):
             return None
         return Path(self.datasets[0][1])
 
+    def _frame_qc_marker_path(self, result_dir: Path) -> Path:
+        return step11_dir(result_dir) / "frame_qc_done.json"
+
+    def _load_frame_qc_done(self, result_dir: Path) -> bool:
+        key = str(result_dir)
+        if key in self._frame_qc_done_cache:
+            return self._frame_qc_done_cache[key]
+        marker = self._frame_qc_marker_path(result_dir)
+        exclude_path = step11_dir(result_dir) / "frame_exclude.csv"
+        done = marker.exists() or exclude_path.exists()
+        self._frame_qc_done_cache[key] = done
+        return done
+
+    def _mark_frame_qc_done(self, result_dir: Path) -> None:
+        path = self._frame_qc_marker_path(result_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        payload = {
+            "done": True,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "excluded": int(len(exclude_map)),
+        }
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        self._frame_qc_done_cache[str(result_dir)] = True
+
+    def _is_frame_qc_ready(self, result_dir: Path | None) -> bool:
+        if result_dir is None:
+            return False
+        done = self._load_frame_qc_done(result_dir)
+        dirty = str(result_dir) in self._frame_exclude_dirty
+        return done and not dirty
+
+    def _update_qc_gate_ui(self) -> None:
+        result_dir = self._current_result_dir()
+        ready = self._is_frame_qc_ready(result_dir)
+        if hasattr(self, "btn_plot"):
+            self.btn_plot.setEnabled(ready)
+        if hasattr(self, "qc_gate_label"):
+            if ready:
+                self.qc_gate_label.setText("Frame QC: ready. You can build the light curve.")
+                self.qc_gate_label.setStyleSheet("QLabel { color: #2E7D32; font-weight: bold; }")
+            else:
+                self.qc_gate_label.setText("Frame QC: not confirmed. Exclude bad frames and click 'Save Exclusions'.")
+                self.qc_gate_label.setStyleSheet("QLabel { color: #D84315; font-weight: bold; }")
+
     def _get_frame_exclude_map(self, result_dir: Path) -> dict[str, set[str]]:
         key = str(result_dir)
         if key not in self._frame_exclude_cache:
@@ -2307,6 +2365,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
         self._update_frame_qc_summary()
         self.plot_current_comparison()
+        self._update_qc_gate_ui()
 
     def _include_selected_frame(self) -> None:
         if not self._frame_qc_selected or self._frame_qc_selected_dir is None:
@@ -2318,6 +2377,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
         self._update_frame_qc_summary()
         self.plot_current_comparison()
+        self._update_qc_gate_ui()
 
     def clear_frame_excludes(self) -> None:
         result_dir = self._current_result_dir()
@@ -2327,6 +2387,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._frame_exclude_dirty.add(str(result_dir))
         self._update_frame_qc_summary()
         self.plot_current_comparison()
+        self._update_qc_gate_ui()
 
     def save_frame_excludes(self) -> None:
         result_dir = self._current_result_dir()
@@ -2337,7 +2398,9 @@ class LightCurveBuilderWindow(StepWindowBase):
             save_frame_excludes_file(result_dir, exclude_map)
             if str(result_dir) in self._frame_exclude_dirty:
                 self._frame_exclude_dirty.remove(str(result_dir))
+            self._mark_frame_qc_done(result_dir)
             self._update_frame_qc_summary()
+            self._update_qc_gate_ui()
             self.log("[Frame QC] Saved frame exclusions.")
         except Exception as e:
             self.log(f"[Frame QC] Save failed: {e}")
@@ -2832,6 +2895,20 @@ class LightCurveBuilderWindow(StepWindowBase):
             QMessageBox.information(self, "Light Curve", "데이터셋이 없습니다.")
             return
 
+        pending_qc = []
+        for label, path in self.datasets:
+            if not self._is_frame_qc_ready(Path(path)):
+                pending_qc.append(label)
+        if pending_qc:
+            QMessageBox.information(
+                self,
+                "Light Curve",
+                "Frame QC가 완료되지 않았습니다.\n"
+                "나쁜 프레임을 제외한 뒤 'Save Exclusions'을 눌러주세요.\n\n"
+                f"미완료: {', '.join(pending_qc)}",
+            )
+            return
+
         target_id = self.target_edit.text().strip()
         if not target_id:
             target_id, comp_ids = _load_selection_ids(self.datasets[0][1])
@@ -2846,17 +2923,6 @@ class LightCurveBuilderWindow(StepWindowBase):
         if not comp_ids:
             QMessageBox.information(self, "Light Curve", "비교성 ID가 필요합니다.")
             return
-
-        # Persist frame excludes before build so downstream steps can consume them.
-        for _, path in self.datasets:
-            key = str(path)
-            if key in self._frame_exclude_dirty:
-                try:
-                    save_frame_excludes_file(Path(path), self._get_frame_exclude_map(Path(path)))
-                    self._frame_exclude_dirty.remove(key)
-                    self.log(f"[Frame QC] Saved exclusions for {path}")
-                except Exception as e:
-                    self.log(f"[Frame QC] Save failed for {path}: {e}")
 
         active_comp_ids = list(comp_ids)
 
@@ -3066,3 +3132,4 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self._update_sliders_from_values()
         self._update_comp_ids_from_input()
         self._update_qc_threshold_label()
+        self._update_qc_gate_ui()

@@ -1,5 +1,5 @@
 """
-Step 12 (UI): Period Analysis (Lomb-Scargle Periodogram)
+Step 13: Period Analysis (Lomb-Scargle Periodogram)
 
 - Lomb-Scargle periodogram for period detection
 - Phase folded light curve plots
@@ -382,7 +382,7 @@ class PeriodAnalysisWorker(QThread):
 
 
 class PeriodAnalysisWindow(StepWindowBase):
-    """Step 12 (UI): Period Analysis with Lomb-Scargle Periodogram"""
+    """Step 13: Period Analysis with Lomb-Scargle Periodogram"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -392,7 +392,7 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.current_filter = None
 
         super().__init__(
-            step_index=11,
+            step_index=12,
             step_name="Period Analysis",
             params=params,
             project_state=project_state,
@@ -666,7 +666,7 @@ class PeriodAnalysisWindow(StepWindowBase):
             QMessageBox.warning(
                 self, "Not Found",
                 f"Could not find light curve data for ID {target_id}.\n"
-                "Run Step 10 (Light Curve Builder) first."
+                "Run Step 11 (Light Curve Builder) first."
             )
             return
 

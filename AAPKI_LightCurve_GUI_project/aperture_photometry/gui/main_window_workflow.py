@@ -220,7 +220,8 @@ class MainWindowWorkflow(QMainWindow):
             "Reference Build",
             "Star ID Matching",
             "Target/Comparison Selection",
-            "Forced Photometry + Overlay",
+            "Forced Photometry",
+            "Aperture Overlay",
             "Light Curve Builder",
             "Detrend & Night Merge",
             "Period Analysis",
@@ -518,16 +519,21 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 9:
+            from .workflow.step10_aperture_overlay import ApertureOverlayWindow
+            self.current_step_window = ApertureOverlayWindow(
+                self.params, self.file_manager, self.project_state, self
+            )
+        elif step_index == 10:
             from .workflow.step11_light_curve_builder import LightCurveBuilderWindow
             self.current_step_window = LightCurveBuilderWindow(
                 self.params, self.file_manager, self.project_state, self
             )
-        elif step_index == 10:
+        elif step_index == 11:
             from .workflow.step12_detrend_merge import DetrendNightMergeWindow
             self.current_step_window = DetrendNightMergeWindow(
                 self.params, self.file_manager, self.project_state, self
             )
-        elif step_index == 11:
+        elif step_index == 12:
             from .workflow.step13_period_analysis import PeriodAnalysisWindow
             self.current_step_window = PeriodAnalysisWindow(
                 self.params, self.file_manager, self.project_state, self
