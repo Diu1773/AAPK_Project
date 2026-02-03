@@ -1,5 +1,5 @@
 """
-Step 11: Light Curve Builder
+Step 10 (UI): Light Curve Builder
 """
 
 from __future__ import annotations
@@ -726,7 +726,7 @@ FILTER_COLORS = {
 
 
 class LightCurveBuilderWindow(StepWindowBase):
-    """Step 11: Light curve builder (diff/abs)."""
+    """Step 10 (UI): Light curve builder (diff/abs)."""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -788,7 +788,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.filter_control_map: dict[str, QPushButton] = {}
 
         super().__init__(
-            step_index=10,
+            step_index=9,
             step_name="Light Curve Builder",
             params=params,
             project_state=project_state,

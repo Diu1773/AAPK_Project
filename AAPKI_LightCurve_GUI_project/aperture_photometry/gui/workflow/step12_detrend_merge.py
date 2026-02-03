@@ -1,5 +1,5 @@
 """
-Step 12: Detrend & Night Merge
+Step 11 (UI): Detrend & Night Merge
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def _load_headers_table(result_dir: Path) -> pd.DataFrame:
 
 
 class DetrendNightMergeWindow(StepWindowBase):
-    """Step 12: Nightly detrend + merge"""
+    """Step 11 (UI): Nightly detrend + merge"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -136,7 +136,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.global_rescale_errors = True
 
         super().__init__(
-            step_index=11,
+            step_index=10,
             step_name="Detrend & Night Merge",
             params=params,
             project_state=project_state,
@@ -882,7 +882,7 @@ class DetrendNightMergeWindow(StepWindowBase):
 
         if not raw_frames:
             step11_path = step11_dir(self.params.P.result_dir)
-            msg = f"Raw 데이터를 찾지 못했습니다.\n\n경로: {step11_path}\n\nStep 11에서 먼저 'Build Light Curve'를 실행하세요."
+            msg = f"Raw 데이터를 찾지 못했습니다.\n\n경로: {step11_path}\n\nStep 10에서 먼저 'Build Light Curve'를 실행하세요."
             QMessageBox.information(self, "Detrend", msg)
             return
 
@@ -1579,7 +1579,7 @@ class DetrendNightMergeWindow(StepWindowBase):
                     "Color mode를 사용하려면 ΔC (색지수 차이)가 필요합니다.\n\n"
                     "해결방법:\n"
                     "• Color Index 설정에서 필터별 색지수 조합 선택\n"
-                    "• Step 11에서 color_index 컬럼이 있는 데이터 생성\n\n"
+                    "• Step 10에서 color_index 컬럼이 있는 데이터 생성\n\n"
                     "현재는 Offset 모드로 진행합니다."
                 )
                 QMessageBox.warning(self, "Color Mode", msg)

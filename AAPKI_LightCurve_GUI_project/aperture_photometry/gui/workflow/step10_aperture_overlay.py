@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -38,9 +39,17 @@ from ...utils.qc_utils import filter_files_by_qc
 
 
 class ApertureOverlayWindow(StepWindowBase):
-    """Step 10: Aperture Overlay"""
+    """Step 10: Aperture Overlay (also used within Step 9)"""
 
-    def __init__(self, params, file_manager, project_state, main_window):
+    def __init__(
+        self,
+        params,
+        file_manager,
+        project_state,
+        main_window,
+        step_index_override: Optional[int] = None,
+        embedded: bool = False,
+    ):
         self.file_manager = file_manager
         self.file_list = []
         self.use_cropped = False
@@ -87,8 +96,9 @@ class ApertureOverlayWindow(StepWindowBase):
         self._stretch_marker_min_line = None
         self._stretch_marker_max_line = None
 
+        step_index = step_index_override if step_index_override is not None else 9
         super().__init__(
-            step_index=9,
+            step_index=step_index,
             step_name="Aperture Overlay",
             params=params,
             project_state=project_state,
@@ -96,6 +106,11 @@ class ApertureOverlayWindow(StepWindowBase):
         )
 
         self.setup_step_ui()
+        if embedded:
+            self.btn_previous.hide()
+            self.btn_complete.hide()
+            self.btn_next.hide()
+            self.title_label.setText("Aperture Overlay (Step 9)")
         self.restore_state()
 
     def setup_step_ui(self):

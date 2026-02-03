@@ -118,6 +118,10 @@ class MasterIdEditorWindow(StepWindowBase):
         self.id_to_sid: Dict[int, int] = {}
         self._pending_frame_index = None
 
+        # Global ID map (source_id -> display ID) from Step 6
+        self._global_id_map: Dict[int, int] = {}
+        self._global_id_map_source: Optional[Path] = None
+
         # Stable ID registry (per filter) - IDs persist across sessions
         self._id_registry: Dict[str, Dict[int, int]] = {}  # filter -> {source_id: stable_id}
         self._next_id: Dict[str, int] = {}  # filter -> next available ID
@@ -877,6 +881,49 @@ class MasterIdEditorWindow(StepWindowBase):
     # Stable ID Registry Management
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _load_global_id_map(self, flt: Optional[str] = None) -> None:
+        """Load global ID map (source_id -> ID) from Step 6 output."""
+        step6_out = step6_dir(self.params.P.result_dir)
+        global_path = step6_out / "sourceid_to_ID.csv"
+
+        path = None
+        if global_path.exists():
+            path = global_path
+        else:
+            use_flt = flt or self.current_filter
+            if use_flt:
+                cand = step6_out / f"sourceid_to_ID_{use_flt}.csv"
+                if cand.exists():
+                    path = cand
+
+        if path is None:
+            # If we previously loaded a filter-specific map, drop it when filter changes.
+            if flt and self._global_id_map_source is not None:
+                if self._global_id_map_source.name != "sourceid_to_ID.csv":
+                    if self._global_id_map_source.name != f"sourceid_to_ID_{flt}.csv":
+                        self._global_id_map = {}
+                        self._global_id_map_source = None
+            return
+        if self._global_id_map_source is not None and self._global_id_map_source == path:
+            return
+
+        try:
+            df = pd.read_csv(path)
+            if not {"source_id", "ID"} <= set(df.columns):
+                return
+            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
+            id_vals = pd.to_numeric(df["ID"], errors="coerce")
+            mapping: Dict[int, int] = {}
+            for sid, sid_id in zip(sid_vals, id_vals):
+                if np.isfinite(sid) and np.isfinite(sid_id):
+                    mapping[int(sid)] = int(sid_id)
+            if mapping:
+                self._global_id_map = mapping
+                self._global_id_map_source = path
+                self.log(f"Global ID map loaded: {path.name} ({len(mapping)} IDs)")
+        except Exception as e:
+            self.log(f"Failed to load global ID map: {e}")
+
     def _load_id_registry(self, flt: str) -> None:
         """Load persistent ID registry for a filter, or migrate from legacy format."""
         if flt in self._id_registry:
@@ -943,9 +990,14 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def _get_or_assign_stable_id(self, flt: str, source_id: int) -> int:
         """Get existing stable ID or assign a new one. Retired IDs are never reused."""
-        self._load_id_registry(flt)
+        self._load_global_id_map(flt)
 
         source_id = int(source_id)
+        if source_id in self._global_id_map:
+            return self._global_id_map[source_id]
+
+        self._load_id_registry(flt)
+
         registry = self._id_registry[flt]
 
         if source_id in registry:
@@ -1408,8 +1460,8 @@ class MasterIdEditorWindow(StepWindowBase):
 
         # 파일 목록 업데이트
         self.populate_file_list()
-        self.update_target_labels()
         self.update_master_table()
+        self.update_target_labels()
 
     def populate_file_list(self):
         """현재 필터의 파일 목록 로드"""
@@ -1841,7 +1893,8 @@ class MasterIdEditorWindow(StepWindowBase):
             if self.current_filter:
                 stable_id = self._get_or_assign_stable_id(self.current_filter, sid)
             else:
-                stable_id = i + 1  # Fallback
+                self._load_global_id_map()
+                stable_id = self._global_id_map.get(sid, i + 1)  # Fallback
             self.sid_to_id[sid] = stable_id
             self.id_to_sid[stable_id] = sid
 
@@ -1938,13 +1991,22 @@ class MasterIdEditorWindow(StepWindowBase):
             self.target_label.setText("Target: (none)")
         else:
             # Show stable ID (1, 2, 3...) with source type
-            display_id = self.sid_to_id.get(self.target_source_id, "?")
+            display_id = self.sid_to_id.get(self.target_source_id)
+            if display_id is None:
+                self._load_global_id_map(self.current_filter)
+                display_id = self._global_id_map.get(self.target_source_id, "?")
             src_type = "Gaia" if self.target_source_id > 0 else "Local"
             self.target_label.setText(f"Target: ID {display_id} ({src_type})")
         # Show comparison count with IDs if few
         n_comp = len(self.comparison_ids)
         if n_comp <= 5 and n_comp > 0:
-            comp_ids = [str(self.sid_to_id.get(sid, "?")) for sid in sorted(self.comparison_ids)]
+            comp_ids = []
+            for sid in sorted(self.comparison_ids):
+                comp_id = self.sid_to_id.get(sid)
+                if comp_id is None:
+                    self._load_global_id_map(self.current_filter)
+                    comp_id = self._global_id_map.get(sid, "?")
+                comp_ids.append(str(comp_id))
             self.comparison_label.setText(f"Comparisons: {', '.join(comp_ids)}")
         else:
             self.comparison_label.setText(f"Comparisons: {n_comp}")

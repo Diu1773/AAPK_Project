@@ -1,5 +1,5 @@
 """
-Step 9: Forced Photometry (per-frame ID-matched XY)
+Step 9: Forced Photometry (per-frame ID-matched XY) + Aperture Overlay
 Ported from AAPKI_GUI.ipynb Cell 12 (GUI adaptation).
 
 Features:
@@ -33,6 +33,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
 from .aperture_photometry_worker import ApertureWorker
+from .step10_aperture_overlay import ApertureOverlayWindow
 from ...utils.step_paths import (
     step2_cropped_dir,
     step5_dir,
@@ -977,10 +978,11 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.file_list = []
         self.use_cropped = False
         self.log_window = None
+        self.overlay_window = None
 
         super().__init__(
             step_index=8,
-            step_name="Forced Photometry",
+            step_name="Forced Photometry + Overlay",
             params=params,
             project_state=project_state,
             main_window=main_window
@@ -1017,6 +1019,11 @@ class ForcedPhotometryWindow(StepWindowBase):
         btn_log.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 15px; }")
         btn_log.clicked.connect(self.show_log_window)
         control_layout.addWidget(btn_log)
+
+        btn_overlay = QPushButton("Aperture Overlay")
+        btn_overlay.setStyleSheet("QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 8px 15px; }")
+        btn_overlay.clicked.connect(self.open_aperture_overlay)
+        control_layout.addWidget(btn_overlay)
 
         self.content_layout.addLayout(control_layout)
 
@@ -1061,6 +1068,20 @@ class ForcedPhotometryWindow(StepWindowBase):
         self._restore_file_context()
         self.populate_file_list()
         self.update_frame_table()
+
+    def open_aperture_overlay(self):
+        if self.overlay_window is None:
+            self.overlay_window = ApertureOverlayWindow(
+                self.params,
+                self.file_manager,
+                self.project_state,
+                self.main_window,
+                step_index_override=self.step_index,
+                embedded=True,
+            )
+        self.overlay_window.show()
+        self.overlay_window.raise_()
+        self.overlay_window.activateWindow()
 
     def log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")

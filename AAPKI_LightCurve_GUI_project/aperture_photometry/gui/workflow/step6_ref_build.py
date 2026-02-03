@@ -398,7 +398,7 @@ class RefBuildWorker(QThread):
             pass
         return out
 
-    def _apply_hybrid_source_ids(self, df: pd.DataFrame, gaia_mag_limit: float = 18.0) -> pd.DataFrame:
+    def _apply_hybrid_source_ids(self, df: pd.DataFrame, gaia_mag_limit: float = 18.0) -> tuple[pd.DataFrame, dict[int, int], dict[int, int]]:
         """Apply hybrid source_id assignment: Gaia ID for matched sources, negative ID for non-Gaia.
 
         In hybrid mode:
@@ -408,11 +408,12 @@ class RefBuildWorker(QThread):
         This ensures consistent source_id across all frames for Gaia-matched sources.
         """
         out = df.copy()
+        old_ids = pd.to_numeric(out.get("source_id"), errors="coerce")
 
         # Check if gaia_source_id column exists
         if "gaia_source_id" not in out.columns:
             self._log("[REF] No gaia_source_id column; hybrid mode not applied.")
-            return out
+            return out, {}, {}
 
         # Filter by magnitude limit if gaia_G is available
         if "gaia_G" in out.columns and gaia_mag_limit > 0:
@@ -442,11 +443,23 @@ class RefBuildWorker(QThread):
         # Keep ID as sequential for display purposes
         out["ID"] = range(1, len(out) + 1)
 
+        # Build mapping from old source_id to new source_id and display ID
+        sid_map = {}
+        id_map = {}
+        if old_ids is not None:
+            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy()
+            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy()
+            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy()
+            for o, n, i in zip(old_vals, new_vals, id_vals):
+                if np.isfinite(o):
+                    sid_map[int(o)] = int(n) if np.isfinite(n) else int(o)
+                    id_map[int(o)] = int(i) if np.isfinite(i) else int(o)
+
         n_gaia = int(has_gaia.sum())
         n_local = len(out) - n_gaia
         self._log(f"[REF] Hybrid IDs assigned: {n_gaia} Gaia, {n_local} local (negative)")
 
-        return out
+        return out, sid_map, id_map
 
     def _merge_ref_catalogs(
         self,
@@ -1011,13 +1024,19 @@ class RefBuildWorker(QThread):
 
         # Apply hybrid source_id assignment if mode is "hybrid"
         if self.ref_build_mode == "hybrid":
-            master_df = self._apply_hybrid_source_ids(master_df, self.gaia_mag_limit)
-            # Also apply to date catalogs if ref_per_date
-            if self.ref_per_date:
+            master_df, sid_map, id_map = self._apply_hybrid_source_ids(master_df, self.gaia_mag_limit)
+            # Also apply to date catalogs if ref_per_date (map to master IDs for consistency)
+            if self.ref_per_date and sid_map:
                 for date_key in ref_catalogs_by_date:
-                    ref_catalogs_by_date[date_key] = self._apply_hybrid_source_ids(
-                        ref_catalogs_by_date[date_key], self.gaia_mag_limit
-                    )
+                    df_date = ref_catalogs_by_date[date_key].copy()
+                    old_sid = pd.to_numeric(df_date.get("source_id"), errors="coerce")
+                    if old_sid is not None:
+                        mapped_sid = old_sid.map(sid_map)
+                        mapped_id = old_sid.map(id_map)
+                        # Fallback to original IDs if mapping missing
+                        df_date["source_id"] = mapped_sid.where(mapped_sid.notna(), old_sid)
+                        df_date["ID"] = mapped_id.where(mapped_id.notna(), old_sid)
+                    ref_catalogs_by_date[date_key] = df_date
 
         if "phot_g_mean_mag" in master_df.columns:
             try:
