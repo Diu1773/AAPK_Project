@@ -261,6 +261,12 @@ class MasterIdEditorWindow(StepWindowBase):
         self.show_selected_only.stateChanged.connect(self.update_overlay)
         select_layout.addWidget(self.show_selected_only)
 
+        self.show_gaia_id = QCheckBox("Show Gaia ID")
+        self.show_gaia_id.setToolTip("Show Gaia DR3 source_id column in the table")
+        self.show_gaia_id.setChecked(False)
+        self.show_gaia_id.stateChanged.connect(self._toggle_gaia_id_column)
+        select_layout.addWidget(self.show_gaia_id)
+
         self.content_layout.addWidget(select_group)
 
         # 선택 정보
@@ -396,6 +402,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self.master_table.horizontalHeaderItem(4).setToolTip("Gaia DR3 source_id (매칭 안되면 '-')")
         self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.master_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.master_table.setColumnHidden(4, True)
         self.master_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         table_layout.addWidget(self.master_table)
 
@@ -1831,10 +1838,10 @@ class MasterIdEditorWindow(StepWindowBase):
         self._sid_to_row = {}
         for i, (sid, x_pos, y_pos, g_mag, gaia_id_str, match_status, role) in enumerate(rows):
             # 안정적인 ID 사용 (ID registry 기반)
-            if self.current_filter and sid in self.master_ids:
+            if self.current_filter:
                 stable_id = self._get_or_assign_stable_id(self.current_filter, sid)
             else:
-                stable_id = i + 1  # Fallback for non-master sources
+                stable_id = i + 1  # Fallback
             self.sid_to_id[sid] = stable_id
             self.id_to_sid[stable_id] = sid
 
@@ -1848,6 +1855,8 @@ class MasterIdEditorWindow(StepWindowBase):
             self.master_table.setItem(i, 6, QTableWidgetItem(role))
             self._sid_to_row[int(sid)] = i
             self._sid_to_row[int(sid)] = i
+
+        self._toggle_gaia_id_column()
 
     def on_table_selection_changed(self):
         rows = self.master_table.selectionModel().selectedRows()
@@ -1869,6 +1878,13 @@ class MasterIdEditorWindow(StepWindowBase):
                     pass
         else:
             self.selected_source_id = None
+
+    def _toggle_gaia_id_column(self):
+        """Hide/show Gaia ID column in the table."""
+        if not hasattr(self, "master_table"):
+            return
+        show = bool(self.show_gaia_id.isChecked()) if hasattr(self, "show_gaia_id") else False
+        self.master_table.setColumnHidden(4, not show)
 
     def on_click(self, event):
         if event.inaxes != self.ax:
@@ -2216,7 +2232,21 @@ class MasterIdEditorWindow(StepWindowBase):
 
         # 선택 적용
         picked_sids = set(int(sid) for sid in picked["source_id"])
+        # Safety: ensure target is never included
+        if self.target_source_id is not None and self.target_source_id in picked_sids:
+            picked_sids.discard(self.target_source_id)
+        # If count dropped, top-up from remaining candidates
+        if len(picked_sids) < n_pick:
+            remaining = cand_df[~cand_df["source_id"].astype(int).isin(picked_sids)]
+            if self.target_source_id is not None:
+                remaining = remaining[remaining["source_id"].astype(int) != int(self.target_source_id)]
+            need = max(n_pick - len(picked_sids), 0)
+            if need > 0 and not remaining.empty:
+                extra = remaining.head(need)["source_id"].astype(int).tolist()
+                picked_sids.update(extra)
         self.comparison_ids.update(picked_sids)
+        if self.target_source_id is not None:
+            self.comparison_ids.discard(self.target_source_id)
         self._add_to_master(picked_sids, reason="auto_add_comp")
 
         self.filter_comparisons[self.current_filter] = self.comparison_ids.copy()
