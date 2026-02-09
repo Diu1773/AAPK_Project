@@ -564,7 +564,7 @@ class IsochroneFitterV2:
                     )
 
             if original_callback:
-                original_callback(seg_base, f"Local refine {_j + 1}/{n_local} [{cand['source']}]")
+                original_callback(seg_base, f"Local refine {j + 1}/{n_local} [{cand['source']}]")
 
             try:
                 result = minimize(
