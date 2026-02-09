@@ -35,3 +35,6 @@ parametertxt.txt
 # OS
 .DS_Store
 Thumbs.db
+# local large isochrone tables
+AAPKC_GUI_project/iso_data.dat
+AAPKC_GUI_project/iso.dat
