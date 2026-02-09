@@ -41,6 +41,18 @@ def crop_is_active(result_dir: Optional[PathLike]) -> bool:
     return crop_rect_path(result_dir).exists()
 
 
+def step4_dir(result_dir: Optional[PathLike]) -> Path:
+    """
+    Step 4 output directory with compatibility fallback.
+
+    Newer layouts may use a dedicated subdirectory, while legacy runs write
+    directly to result_dir.
+    """
+    root = _as_path(result_dir)
+    candidate = root / "step4_detection"
+    return candidate if candidate.exists() else root
+
+
 def step5_dir(result_dir: Optional[PathLike]) -> Path:
     return _as_path(result_dir)
 
@@ -51,6 +63,24 @@ def step6_dir(result_dir: Optional[PathLike]) -> Path:
 
 def step7_dir(result_dir: Optional[PathLike]) -> Path:
     return _as_path(result_dir)
+
+
+def legacy_step5_refbuild_dir(result_dir: Optional[PathLike]) -> Path:
+    root = _as_path(result_dir)
+    candidate = root / "step5_refbuild"
+    return candidate if candidate.exists() else root
+
+
+def legacy_step7_wcs_dir(result_dir: Optional[PathLike]) -> Path:
+    root = _as_path(result_dir)
+    candidate = root / "step7_wcs"
+    return candidate if candidate.exists() else root
+
+
+def legacy_step7_refbuild_dir(result_dir: Optional[PathLike]) -> Path:
+    root = _as_path(result_dir)
+    candidate = root / "step7_refbuild"
+    return candidate if candidate.exists() else root
 
 
 def step8_dir(result_dir: Optional[PathLike]) -> Path:
@@ -83,9 +113,13 @@ __all__ = [
     "step2_cropped_dir",
     "crop_rect_path",
     "crop_is_active",
+    "step4_dir",
     "step5_dir",
     "step6_dir",
     "step7_dir",
+    "legacy_step5_refbuild_dir",
+    "legacy_step7_wcs_dir",
+    "legacy_step7_refbuild_dir",
     "step8_dir",
     "step9_dir",
     "step11_dir",

@@ -684,7 +684,7 @@ class MainWindowWorkflow(QMainWindow):
 
         parallel_workers_spin = QSpinBox()
         parallel_workers_spin.setRange(0, 16)
-        parallel_workers_spin.setValue(int(getattr(self.params.P, "parallel_max_workers", 0)))
+        parallel_workers_spin.setValue(int(getattr(self.params.P, "max_workers", getattr(self.params.P, "parallel_max_workers", 0))))
         parallel_workers_spin.setToolTip("0 = auto (use ~75% of CPU cores)")
         parallel_layout.addRow("Max Workers (0=auto):", parallel_workers_spin)
 
@@ -769,6 +769,8 @@ class MainWindowWorkflow(QMainWindow):
                 self.params.P.site_lon_deg = new_site_lon
                 self.params.P.site_alt_m = new_site_alt
                 self.params.P.site_tz_offset_hours = new_site_tz
+                self.params.P.max_workers = new_parallel_workers
+                # Backward-compatible alias.
                 self.params.P.parallel_max_workers = new_parallel_workers
 
                 # Save to parameter file using save_toml (saves all parameters)
@@ -785,7 +787,7 @@ class MainWindowWorkflow(QMainWindow):
                         "site_lon_deg": new_site_lon,
                         "site_alt_m": new_site_alt,
                         "site_tz_offset_hours": new_site_tz,
-                        "parallel_max_workers": new_parallel_workers,
+                        "max_workers": new_parallel_workers,
                     })
 
                 # Save instrument settings to instrument.py
@@ -980,7 +982,9 @@ class MainWindowWorkflow(QMainWindow):
             set_path(("instrument", "datamax_adu"), updates["datamax_adu"])
         if "binning_default" in updates:
             set_path(("instrument", "binning"), updates["binning_default"])
-        if "parallel_max_workers" in updates:
+        if "max_workers" in updates:
+            set_path(("parallel", "max_workers"), updates["max_workers"])
+        elif "parallel_max_workers" in updates:
             set_path(("parallel", "max_workers"), updates["parallel_max_workers"])
 
         if "site_lat_deg" in updates:

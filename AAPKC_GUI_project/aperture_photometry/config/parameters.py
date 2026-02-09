@@ -60,7 +60,7 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("io", "result_dir"), "result_dir"),
     (("io", "cache_dir"), "cache_dir"),
     (("parallel", "mode"), "parallel_mode"),
-    (("parallel", "max_workers"), "parallel_max_workers"),
+    (("parallel", "max_workers"), "max_workers"),
     (("parallel", "resume_mode"), "resume_mode"),
     (("parallel", "force_redetect"), "force_redetect"),
     (("parallel", "force_rephot"), "force_rephot"),
@@ -146,13 +146,14 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("photometry", "apcorr", "large_scale"), "apcorr_large_scale"),
     (("photometry", "apcorr", "min_n"), "apcorr_use_min_n"),
     (("photometry", "apcorr", "scatter_max"), "apcorr_scatter_max"),
-        (("wcs", "astap_exe"), "astap_exe"),
-        (("wcs", "timeout_s"), "astap_timeout_s"),
-        (("wcs", "astap_search_radius_deg"), "astap_search_radius_deg"),
-        (("wcs", "astap_database"), "astap_database"),
-        (("wcs", "astap_fov_fudge"), "astap_fov_fudge"),
+    (("wcs", "astap_exe"), "astap_exe"),
+    (("wcs", "timeout_s"), "astap_timeout_s"),
+    (("wcs", "astap_search_radius_deg"), "astap_search_radius_deg"),
+    (("wcs", "astap_database"), "astap_database"),
+    (("wcs", "astap_fov_fudge"), "astap_fov_fudge"),
     (("wcs", "astap_downsample"), "astap_downsample_z"),
     (("wcs", "astap_max_stars"), "astap_max_stars_s"),
+    (("wcs", "max_workers"), "wcs_max_workers"),
     (("wcs", "require_qc_pass"), "wcs_require_qc_pass"),
     (("wcs", "refine_enable"), "wcs_refine_enable"),
     (("wcs_refine", "enable"), "wcs_refine_enable"),
@@ -342,6 +343,7 @@ class Parameters:
     def _load_from_file(path: Path) -> types.SimpleNamespace:
         """Load parameters from text file"""
         raw = _read_toml(path)
+        parallel_workers = _geti(raw, "max_workers", _geti(raw, "parallel_max_workers", 0))
 
         # --- rdnoise is REQUIRED ---
         rdnoise_candidate = (
@@ -365,7 +367,9 @@ class Parameters:
 
             # Parallel processing
             parallel_mode=raw.get("parallel_mode", "thread"),
-            parallel_max_workers=_geti(raw, "parallel_max_workers", 0),  # 0 = auto
+            max_workers=parallel_workers,  # 0 = auto
+            # Backward-compatible alias for older code paths.
+            parallel_max_workers=parallel_workers,
             ui_log_tail=_geti(raw, "ui_log_tail", 300),
             resume_mode=_as_bool(raw.get("resume_mode", "true"), True),
             force_redetect=_as_bool(raw.get("force_redetect", "false"), False),
@@ -527,6 +531,7 @@ class Parameters:
             astap_fov_fudge=_getf(raw, "astap_fov_fudge", 1.0),
             astap_downsample_z=_geti(raw, "astap_downsample_z", 2),
             astap_max_stars_s=_geti(raw, "astap_max_stars_s", 500),
+            wcs_max_workers=_geti(raw, "wcs_max_workers", 1),
             wcs_require_qc_pass=_as_bool(raw.get("wcs_require_qc_pass", "true"), True),
             wcs_refine_enable=_as_bool(raw.get("wcs_refine_enable", "true"), True),
             wcs_refine_max_match=_geti(raw, "wcs_refine_max_match", 600),
@@ -646,6 +651,15 @@ class Parameters:
             return rawv
         return default
 
+    def get_file_path(self, filename: str) -> Path:
+        """Resolve a filename to the original FITS path (multi-night safe)."""
+        path_map = getattr(self.P, "file_path_map", None)
+        if isinstance(path_map, dict):
+            mapped = path_map.get(filename)
+            if mapped:
+                return Path(mapped)
+        return Path(self.P.data_dir) / filename
+
     def save_toml(self, path: Path | str | None = None) -> bool:
         """Persist current parameters to TOML file while preserving structure."""
         if tomli_w is None:
@@ -703,7 +717,7 @@ class Parameters:
         print(f"RESULT_DIR    : {P.result_dir}")
         print(f"CACHE_DIR     : {P.cache_dir}")
         print(f"resume_mode   : {P.resume_mode} | force_redetect={P.force_redetect} | force_rephot={P.force_rephot}")
-        print(f"parallel_mode : {P.parallel_mode} | parallel_max_workers={P.parallel_max_workers}")
+        print(f"parallel_mode : {P.parallel_mode} | max_workers={P.max_workers}")
         print(f"FWHM seed     : {P.fwhm_seed_px:.2f} px (from={getattr(P, '_fwhm_seed_from', '?')})")
         print(f"FWHM range    : {P.fwhm_px_min:.2f} ~ {P.fwhm_px_max:.2f} px | elong_max={P.fwhm_elong_max} | iso_min_sep={P.iso_min_sep_pix}px")
         print(f"bkg2d detect  : {P.bkg2d_in_detect} | box={P.bkg2d_box}")
