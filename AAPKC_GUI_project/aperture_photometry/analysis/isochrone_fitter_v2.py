@@ -453,89 +453,188 @@ class IsochroneFitterV2:
     def _fit_hessian(self, bounds: FitBounds, n_stars: int, **kwargs) -> FitResult:
         de_maxiter = int(kwargs.get("de_maxiter", kwargs.get("maxiter", 50)))
         local_maxiter = int(kwargs.get("local_maxiter", 100))
-        de_seed = kwargs.get("seed", 42)
+        n_starts = max(1, int(kwargs.get("n_starts", 6)))
+        de_seed = int(kwargs.get("seed", 42))
         initial_guess = kwargs.get("initial_guess", None)
+        bounds_list = bounds.to_list()
 
-        # Map global search progress into 5%~55%.
-        original_callback = self.progress_callback
-        if original_callback:
-            def _scaled_global_cb(progress, message):
-                p = 0.05 + 0.50 * float(np.clip(progress, 0.0, 1.0))
-                msg = f"Global search: {message}"
-                original_callback(p, msg)
-            self.progress_callback = _scaled_global_cb
-        try:
-            fast_result = self._fit_fast(bounds, n_stars, maxiter=de_maxiter, seed=de_seed)
-        finally:
-            self.progress_callback = original_callback
-
-        if self.progress_callback:
-            self.progress_callback(0.60, "Preparing local refinement...")
-
-        x0 = [fast_result.log_age, fast_result.metallicity,
-              fast_result.distance_mod, fast_result.extinction_gr]
-
-        # Use manual slider state as local-refine initial guess when provided.
-        if initial_guess is not None:
+        def _clip_guess(guess):
             try:
-                guess = np.asarray(initial_guess, dtype=float).reshape(-1)
-                if guess.size == 4 and np.isfinite(guess).all():
-                    clipped = []
-                    for val, (lo, hi) in zip(guess, bounds.to_list()):
-                        clipped.append(float(np.clip(val, lo, hi)))
-                    x0 = clipped
-                    if self.progress_callback:
-                        self.progress_callback(0.62, "Using CMD slider initial guess")
+                g = np.asarray(guess, dtype=float).reshape(-1)
             except Exception:
-                pass
+                return None
+            if g.size != 4 or (not np.isfinite(g).all()):
+                return None
+            clipped = [float(np.clip(val, lo, hi)) for val, (lo, hi) in zip(g, bounds_list)]
+            return np.array(clipped, dtype=float)
 
-        local_iter = {"n": 0}
+        original_callback = self.progress_callback
 
-        def _local_callback(_xk):
-            local_iter["n"] += 1
-            if self.progress_callback:
-                frac = min(1.0, local_iter["n"] / max(local_maxiter, 1))
-                prog = 0.60 + 0.35 * frac
-                self.progress_callback(prog, f"Local refinement {local_iter['n']}/{local_maxiter}")
+        # ---------------------------------------------------------------------
+        # 1) Global multi-start search (Differential Evolution)
+        # ---------------------------------------------------------------------
+        global_candidates = []
+        global_base = 0.05
+        global_span = 0.50
+        for i in range(n_starts):
+            seg_base = global_base + global_span * (i / n_starts)
+            seg_span = global_span / n_starts
 
-        result = minimize(
-            self._objective,
-            x0,
-            method='L-BFGS-B',
-            bounds=bounds.to_list(),
-            options={'maxiter': local_maxiter},
-            callback=_local_callback,
-        )
+            if original_callback:
+                def _scaled_global_cb(progress, message, _b=seg_base, _s=seg_span, _i=i):
+                    p = _b + _s * float(np.clip(progress, 0.0, 1.0))
+                    original_callback(p, f"Global {_i + 1}/{n_starts}: {message}")
+                self.progress_callback = _scaled_global_cb
+
+            try:
+                fast_result = self._fit_fast(
+                    bounds,
+                    n_stars,
+                    maxiter=de_maxiter,
+                    seed=de_seed + i * 1009,
+                )
+            finally:
+                self.progress_callback = original_callback
+
+            x_fast = np.array(
+                [
+                    fast_result.log_age,
+                    fast_result.metallicity,
+                    fast_result.distance_mod,
+                    fast_result.extinction_gr,
+                ],
+                dtype=float,
+            )
+            global_candidates.append(
+                {
+                    "source": f"global#{i + 1}",
+                    "x0": x_fast,
+                    "chi2": float(fast_result.chi2),
+                    "converged": bool(fast_result.converged),
+                }
+            )
+
+        # ---------------------------------------------------------------------
+        # 2) Build local-start candidate set
+        # ---------------------------------------------------------------------
+        local_candidates = []
+        seen = set()
+
+        g0 = _clip_guess(initial_guess)
+        if g0 is not None:
+            key = tuple(np.round(g0, 6))
+            seen.add(key)
+            local_candidates.append({"source": "slider", "x0": g0})
+            if original_callback:
+                original_callback(0.57, "Added slider initial guess candidate")
+
+        for c in sorted(global_candidates, key=lambda x: x["chi2"]):
+            key = tuple(np.round(c["x0"], 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            local_candidates.append({"source": c["source"], "x0": c["x0"]})
+
+        if not local_candidates and global_candidates:
+            best_global = min(global_candidates, key=lambda x: x["chi2"])
+            local_candidates.append({"source": best_global["source"], "x0": best_global["x0"]})
+
+        # ---------------------------------------------------------------------
+        # 3) Local refinement for each candidate; select minimum chi²
+        # ---------------------------------------------------------------------
+        best_local_result = None
+        best_local_source = None
+        local_base = 0.55
+        local_span = 0.40
+        n_local = max(1, len(local_candidates))
+
+        for j, cand in enumerate(local_candidates):
+            seg_base = local_base + local_span * (j / n_local)
+            seg_span = local_span / n_local
+            iter_box = {"n": 0}
+
+            def _local_callback(_xk, _b=seg_base, _s=seg_span, _j=j, _src=cand["source"]):
+                iter_box["n"] += 1
+                if original_callback:
+                    frac = min(1.0, iter_box["n"] / max(local_maxiter, 1))
+                    p = _b + _s * frac
+                    original_callback(
+                        p,
+                        f"Local {_j + 1}/{n_local} [{_src}] {iter_box['n']}/{local_maxiter}",
+                    )
+
+            if original_callback:
+                original_callback(seg_base, f"Local refine {_j + 1}/{n_local} [{cand['source']}]")
+
+            try:
+                result = minimize(
+                    self._objective,
+                    cand["x0"],
+                    method='L-BFGS-B',
+                    bounds=bounds_list,
+                    options={'maxiter': local_maxiter},
+                    callback=_local_callback,
+                )
+            except Exception:
+                continue
+
+            if (best_local_result is None) or (float(result.fun) < float(best_local_result.fun)):
+                best_local_result = result
+                best_local_source = cand["source"]
+
+        # ---------------------------------------------------------------------
+        # 4) Compare with best global-only result and finalize
+        # ---------------------------------------------------------------------
+        best_global = min(global_candidates, key=lambda x: x["chi2"]) if global_candidates else None
+        use_local = best_local_result is not None
+        use_global = best_global is not None
 
         errors = [None, None, None, None]
-        if hasattr(result, 'hess_inv') and result.hess_inv is not None:
-            try:
-                if hasattr(result.hess_inv, 'todense'):
-                    hess_inv = np.array(result.hess_inv.todense())
-                else:
-                    hess_inv = np.array(result.hess_inv)
-                errors = np.sqrt(np.abs(np.diag(hess_inv)))
-            except Exception:
-                pass
+        converged = False
 
-        if self.progress_callback:
-            self.progress_callback(1.0, "Complete")
+        if use_local and (not use_global or float(best_local_result.fun) <= float(best_global["chi2"])):
+            best_x = np.asarray(best_local_result.x, dtype=float)
+            chi2 = float(best_local_result.fun)
+            converged = bool(best_local_result.success)
+            if hasattr(best_local_result, 'hess_inv') and best_local_result.hess_inv is not None:
+                try:
+                    if hasattr(best_local_result.hess_inv, 'todense'):
+                        hess_inv = np.array(best_local_result.hess_inv.todense())
+                    else:
+                        hess_inv = np.array(best_local_result.hess_inv)
+                    errors = np.sqrt(np.abs(np.diag(hess_inv)))
+                except Exception:
+                    pass
+            selected_source = best_local_source or "local"
+        elif use_global:
+            best_x = np.asarray(best_global["x0"], dtype=float)
+            chi2 = float(best_global["chi2"])
+            converged = bool(best_global["converged"])
+            selected_source = best_global["source"]
+        else:
+            # Fallback: center of bounds
+            best_x = np.array([(lo + hi) * 0.5 for lo, hi in bounds_list], dtype=float)
+            chi2 = float(self._objective(best_x))
+            converged = False
+            selected_source = "fallback"
 
-        chi2 = result.fun
+        if original_callback:
+            original_callback(0.98, f"Selected {selected_source} | chi2={chi2:.2f}")
+            original_callback(1.0, "Complete")
+
         dof = max(1, n_stars - 4)
-
         return FitResult(
-            log_age=result.x[0],
-            metallicity=result.x[1],
-            distance_mod=result.x[2],
-            extinction_gr=result.x[3],
+            log_age=float(best_x[0]),
+            metallicity=float(best_x[1]),
+            distance_mod=float(best_x[2]),
+            extinction_gr=float(best_x[3]),
             log_age_err=errors[0] if errors[0] else None,
             metallicity_err=errors[1] if errors[1] else None,
             distance_mod_err=errors[2] if errors[2] else None,
             extinction_gr_err=errors[3] if errors[3] else None,
             chi2=chi2,
             reduced_chi2=chi2 / dof,
-            converged=result.success
+            converged=converged,
         )
 
     def get_best_fit_isochrone(self, result: FitResult) -> Tuple[np.ndarray, np.ndarray]:

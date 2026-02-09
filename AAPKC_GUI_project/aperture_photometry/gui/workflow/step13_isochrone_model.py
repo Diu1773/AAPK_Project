@@ -762,15 +762,29 @@ class IsochroneModelWindow(StepWindowBase):
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting autofit...")
 
-        self.log(f"Starting autofit (hessian mode) with {len(g)} stars...")
+        self.log(f"Starting autofit (hessian mode, multi-start) with {len(g)} stars...")
 
         # Run in background thread
         initial_guess = self._get_fit_initial_guess()
-        fit_kwargs = {"de_maxiter": 120, "local_maxiter": 200, "initial_guess": initial_guess}
+        n_starts = int(getattr(self.params.P, "iso_autofit_starts", 6))
+        de_maxiter = int(getattr(self.params.P, "iso_autofit_de_maxiter", 120))
+        local_maxiter = int(getattr(self.params.P, "iso_autofit_local_maxiter", 200))
+        fit_seed = int(getattr(self.params.P, "iso_autofit_seed", 42))
+        fit_kwargs = {
+            "de_maxiter": de_maxiter,
+            "local_maxiter": local_maxiter,
+            "n_starts": n_starts,
+            "seed": fit_seed,
+            "initial_guess": initial_guess,
+        }
         self.log(
             "Initial guess | "
             f"logAge={initial_guess[0]:.3f}, [M/H]={initial_guess[1]:.3f}, "
             f"DM={initial_guess[2]:.3f}, E(g-r)={initial_guess[3]:.4f}"
+        )
+        self.log(
+            f"AutoFit settings | n_starts={n_starts}, de_maxiter={de_maxiter}, "
+            f"local_maxiter={local_maxiter}, seed={fit_seed}"
         )
         self.fit_worker = FitWorker(
             self.fitter, color, g, color_err, g_err,
