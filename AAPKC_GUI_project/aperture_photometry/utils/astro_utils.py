@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Optional
 import math
 import re
+import warnings
 import numpy as np
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 import astropy.units as u
@@ -373,7 +374,9 @@ def _parse_ra_dec_from_header(header: fits.Header) -> tuple[float, float] | None
 def _parse_radec_from_wcs(header: fits.Header) -> tuple[float, float] | None:
     """Parse RA/Dec from WCS center if available."""
     try:
-        w = WCS(header, relax=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            w = WCS(header, relax=True)
         if w.celestial is None:
             return None
         nx = header.get("NAXIS1", None)

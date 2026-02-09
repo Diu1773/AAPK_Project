@@ -584,7 +584,6 @@ class WcsWorker(QThread):
             astap_radius = float(getattr(self.params.P, "astap_search_radius_deg", 8.0))
             astap_db = str(getattr(self.params.P, "astap_database", "D50") or "").strip()
             astap_fov_fudge = float(getattr(self.params.P, "astap_fov_fudge", 1.0))
-            astnet_local_enable = bool(getattr(self.params.P, "astnet_local_enable", False))
             astnet_use_wsl = bool(getattr(self.params.P, "astnet_local_use_wsl", True))
             astnet_timeout_s = float(getattr(self.params.P, "astnet_local_timeout_s", 300.0))
             astnet_downsample = int(getattr(self.params.P, "astnet_local_downsample", 2))
@@ -607,10 +606,11 @@ class WcsWorker(QThread):
                     pass
 
             L(f"[WCS] astap_timeout_s={astap_timeout} astap_radius_deg={astap_radius} astap_db={astap_db or 'default'} astap_fov_fudge={astap_fov_fudge}")
-            L(f"[WCS] astnet_local_enable={astnet_local_enable} use_wsl={astnet_use_wsl} timeout_s={astnet_timeout_s} downsample={astnet_downsample}")
+            L(f"[WCS] astnet_local_use_wsl={astnet_use_wsl} timeout_s={astnet_timeout_s} downsample={astnet_downsample}")
 
-            # Determine Gaia center - PRIORITY: FITS header > project_state
-            # FITS header OBJCTRA/OBJCTDEC is more reliable as it comes from the actual observation
+            # Determine Gaia center
+            # For multi-night/offset observations, use project target coordinates first.
+            # FITS OBJCTRA/OBJCTDEC is used only as a fallback when project target is missing.
             header_coord = None
             try:
                 sample = files[0]
@@ -629,18 +629,32 @@ class WcsWorker(QThread):
 
             # Decide which coordinate to use
             center_coord = None
+            max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
+            warn_sep_deg = float(getattr(self.params.P, "wcs_header_coord_warn_sep_deg", 0.5))
             if header_coord is not None and self.target_coord is not None:
-                # Both available - check if they match
-                sep_deg = float(header_coord.separation(self.target_coord).deg)
-                if sep_deg > 5.0:
-                    L(f"[WCS] WARNING: FITS header coords differ by {sep_deg:.2f}deg from project_state, using header")
-                    center_coord = header_coord
-                else:
+                try:
+                    sep_deg = float(header_coord.separation(self.target_coord).deg)
+                except Exception:
+                    sep_deg = np.nan
+                if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
                     center_coord = self.target_coord
+                    L(
+                        f"[WCS] WARNING: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg; "
+                        f"using project target."
+                    )
+                else:
+                    center_coord = header_coord
+                    if np.isfinite(sep_deg) and sep_deg > warn_sep_deg:
+                        L(
+                            f"[WCS] INFO: header/project offset={sep_deg:.3f}deg; "
+                            f"using header center."
+                        )
             elif header_coord is not None:
                 center_coord = header_coord
+                L("[WCS] Using FITS OBJCTRA/OBJCTDEC center (project target unavailable).")
             elif self.target_coord is not None:
                 center_coord = self.target_coord
+                L("[WCS] Using project target center (header center unavailable).")
 
             if center_coord is None:
                 raise RuntimeError("Target coordinate not set (SIMBAD/OBJCTRA/OBJCTDEC missing).")
@@ -688,6 +702,39 @@ class WcsWorker(QThread):
                         return filename, {"ok": False, "status": "data_none"}
                     ny, nx = data.shape
 
+                # Per-frame center for solve-field:
+                # header first, then project target. If they disagree too much, use target.
+                solve_center_coord = None
+                header_frame_coord = None
+                try:
+                    ra_h = hdr.get("OBJCTRA", None)
+                    dec_h = hdr.get("OBJCTDEC", None)
+                    if ra_h is not None and dec_h is not None:
+                        header_frame_coord = SkyCoord(str(ra_h), str(dec_h), unit=(u.hourangle, u.deg))
+                except Exception:
+                    header_frame_coord = None
+
+                max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
+                if header_frame_coord is not None and self.target_coord is not None:
+                    try:
+                        sep_deg = float(header_frame_coord.separation(self.target_coord).deg)
+                    except Exception:
+                        sep_deg = np.nan
+                    if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
+                        solve_center_coord = self.target_coord
+                        L(
+                            f"{filename}: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg; "
+                            f"using project target."
+                        )
+                    else:
+                        solve_center_coord = header_frame_coord
+                elif header_frame_coord is not None:
+                    solve_center_coord = header_frame_coord
+                elif self.target_coord is not None:
+                    solve_center_coord = self.target_coord
+                else:
+                    solve_center_coord = center_coord
+
                 fov_w_deg = (nx * pix_arc) / 3600.0 * astap_fov_fudge
                 fov_h_deg = (ny * pix_arc) / 3600.0 * astap_fov_fudge
                 fov_deg = float(max(fov_w_deg, fov_h_deg))
@@ -699,14 +746,6 @@ class WcsWorker(QThread):
                 if not ok_astap:
                     L(f"{filename}: ASTAP fail rc={rc} dt={dt_astap:.1f}s err={str(err_s)[:120]}")
                     L(f"{filename}: ASTAP cmd={cmd_str}")
-                    if not astnet_local_enable:
-                        return filename, {
-                            "ok": False,
-                            "status": f"astap_fail rc={rc}",
-                            "pix_fit": pix_fit,
-                            "elapsed": float(dt_astap),
-                            "refine": refine_note,
-                        }
 
                 astnet_ok = False
                 astnet_dt = np.nan
@@ -732,7 +771,7 @@ class WcsWorker(QThread):
                         if not wcs_ok:
                             wcs_ok = self._try_ingest_wcs(fits_path, hdr)
 
-                    if (not ok_astap or not wcs_ok) and astnet_local_enable:
+                    if (not ok_astap or not wcs_ok):
                         scale_low = astnet_scale_low
                         scale_high = astnet_scale_high
                         if scale_low <= 0 or scale_high <= 0:
@@ -743,7 +782,7 @@ class WcsWorker(QThread):
                         astnet_ok, astnet_dt, astnet_stdout, astnet_stderr, astnet_cmd, astnet_new_path = (
                             self._run_solve_field(
                                 fits_path,
-                                center_coord=center_coord,
+                                center_coord=solve_center_coord,
                                 scale_low=scale_low,
                                 scale_high=scale_high,
                                 radius_deg=astnet_radius_deg,
@@ -756,6 +795,37 @@ class WcsWorker(QThread):
                                 cpulimit_s=astnet_cpulimit_s,
                             )
                         )
+                        if (not astnet_ok) and (solve_center_coord is not None):
+                            L(f"[ASTNET_WSL] {filename} constrained solve failed; retrying blind.")
+                            astnet_ok2, astnet_dt2, astnet_stdout2, astnet_stderr2, astnet_cmd2, astnet_new_path2 = (
+                                self._run_solve_field(
+                                    fits_path,
+                                    center_coord=None,
+                                    scale_low=scale_low,
+                                    scale_high=scale_high,
+                                    radius_deg=astnet_radius_deg,
+                                    downsample=astnet_downsample,
+                                    timeout_s=max(astnet_timeout_s, 120.0),
+                                    outdir=outdir,
+                                    use_wsl=astnet_use_wsl,
+                                    use_cache=False,
+                                    max_objs=astnet_max_objs,
+                                    cpulimit_s=max(astnet_cpulimit_s, 60.0),
+                                )
+                            )
+                            astnet_dt = float(astnet_dt) + float(astnet_dt2)
+                            if astnet_ok2:
+                                astnet_ok = astnet_ok2
+                                astnet_stdout = astnet_stdout2
+                                astnet_stderr = astnet_stderr2
+                                astnet_cmd = astnet_cmd2
+                                astnet_new_path = astnet_new_path2
+                                L(f"[ASTNET_WSL] {filename} blind retry solved.")
+                            else:
+                                if str(astnet_stderr2).strip():
+                                    astnet_stderr = astnet_stderr2
+                                if astnet_cmd2:
+                                    astnet_cmd = astnet_cmd2
                         cmd_wsl = " ".join(str(c) for c in astnet_cmd)
                         L(f"[ASTNET_WSL] {filename} ok={astnet_ok} dt={astnet_dt:.1f}s")
                         L(f"[ASTNET_WSL] cmd={cmd_wsl}")
@@ -896,9 +966,8 @@ class WcsWorker(QThread):
                 return filename, meta
 
             completed = 0
-            _default_workers = get_parallel_workers(self.params)
-            max_workers = int(getattr(self.params.P, "wcs_max_workers", _default_workers))
-            with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
+            max_workers = get_parallel_workers(self.params)
+            with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
                 futures = {ex.submit(solve_one, f): f for f in files}
                 for fut in as_completed(futures):
                     if self._stop_requested:
@@ -1327,7 +1396,7 @@ class AstrometryNetWorker(QThread):
         keep_outputs = bool(getattr(self.params.P, "astnet_local_keep_outputs", True))
         use_cache = bool(getattr(self.params.P, "astnet_local_use_cache", True))
         cpulimit_s = float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0))
-        max_workers = get_parallel_workers(self.params)
+        max_workers = max(1, int(get_parallel_workers(self.params)))
 
         if scale_low <= 0 or scale_high <= 0:
             scale_low = float(pix_arc) * 0.85
@@ -1352,8 +1421,11 @@ class AstrometryNetWorker(QThread):
             if not fits_path.exists():
                 return filename, {"ok": False, "status": "file_not_found"}
 
-            # 헤더에서 중심 좌표 읽기
+            # Center coordinate selection:
+            # use per-frame header first, fallback to project target.
+            # if they disagree too much, trust project target.
             center_coord = None
+            header_coord = None
             try:
                 # memmap=False로 읽어서 파일 핸들 즉시 반환 유도
                 with fits.open(fits_path, memmap=False) as hdul:
@@ -1361,11 +1433,27 @@ class AstrometryNetWorker(QThread):
                     ra0 = hdr0.get("OBJCTRA", None)
                     dec0 = hdr0.get("OBJCTDEC", None)
                     if ra0 is not None and dec0 is not None:
-                        center_coord = SkyCoord(str(ra0), str(dec0), unit=(u.hourangle, u.deg))
+                        header_coord = SkyCoord(str(ra0), str(dec0), unit=(u.hourangle, u.deg))
             except Exception:
-                center_coord = None
-            
-            if center_coord is None and self.target_coord is not None:
+                header_coord = None
+
+            max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
+            if header_coord is not None and self.target_coord is not None:
+                try:
+                    sep_deg = float(header_coord.separation(self.target_coord).deg)
+                except Exception:
+                    sep_deg = np.nan
+                if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
+                    center_coord = self.target_coord
+                    self.log_message.emit(
+                        f"[WCS] {filename}: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg "
+                        f"(using project target)"
+                    )
+                else:
+                    center_coord = header_coord
+            elif header_coord is not None:
+                center_coord = header_coord
+            elif self.target_coord is not None:
                 center_coord = self.target_coord
 
             # solve-field 실행
@@ -1373,13 +1461,31 @@ class AstrometryNetWorker(QThread):
                 fits_path, center_coord, scale_low, scale_high, radius_deg,
                 downsample, timeout_s, outdir, use_wsl, True, use_cache, max_objs, cpulimit_s
             )
+            if (not ok) and (center_coord is not None):
+                self.log_message.emit(f"[ASTNET] {filename}: constrained solve failed, retrying blind...")
+                ok2, dt2, out_s2, err_s2, cmd2, new_path2 = self._run_solve_field(
+                    fits_path, None, scale_low, scale_high, radius_deg,
+                    downsample, max(timeout_s, 120.0), outdir, use_wsl, True, False, max_objs, max(cpulimit_s, 60.0)
+                )
+                dt = float(dt) + float(dt2)
+                if ok2:
+                    ok, out_s, err_s, cmd, new_path = ok2, out_s2, err_s2, cmd2, new_path2
+                else:
+                    if str(err_s2).strip():
+                        err_s = err_s2
+                    if cmd2:
+                        cmd = cmd2
 
             result = {
                 "ok": False,
-                "status": "fail",
+                "status": "solve_field_fail",
                 "ra": 0.0, "dec": 0.0, "pixscale": 0.0,
                 "elapsed_s": float(dt),
             }
+
+            if (not ok) and str(err_s).strip():
+                err_short = str(err_s).replace("\n", " ").strip()
+                result["status"] = f"solve_field_fail: {err_short[:120]}"
 
             if ok and new_path is not None and new_path.exists():
                 try:
@@ -2008,9 +2114,11 @@ class WcsPlateSolvingWindow(StepWindowBase):
         wcs_form.addRow("Max Stars (S):", self.param_max_stars)
 
         self.param_max_workers = QSpinBox()
-        self.param_max_workers.setRange(1, 16)
-        self.param_max_workers.setValue(int(getattr(self.params.P, "wcs_max_workers", 1)))
-        wcs_form.addRow("Max Workers:", self.param_max_workers)
+        self.param_max_workers.setRange(0, 16)
+        self.param_max_workers.setValue(int(getattr(self.params.P, "max_workers", getattr(self.params.P, "parallel_max_workers", 0))))
+        self.param_max_workers.setEnabled(False)
+        self.param_max_workers.setToolTip("Step 5 uses global parallel workers from main settings.")
+        wcs_form.addRow("Workers (Global):", self.param_max_workers)
 
         self.param_require_qc = QCheckBox("Enable")
         self.param_require_qc.setChecked(bool(getattr(self.params.P, "wcs_require_qc_pass", True)))
@@ -2078,10 +2186,6 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
-
-        self.param_astnet_enable = QCheckBox("Enable")
-        self.param_astnet_enable.setChecked(bool(getattr(self.params.P, "astnet_local_enable", False)))
-        form.addRow("Enable Local Solve:", self.param_astnet_enable)
 
         self.param_astnet_use_wsl = QCheckBox("Use WSL")
         self.param_astnet_use_wsl.setChecked(bool(getattr(self.params.P, "astnet_local_use_wsl", True)))
@@ -2152,7 +2256,6 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astap_fov_fudge = self.param_fov_fudge.value()
         self.params.P.astap_downsample_z = self.param_downsample.value()
         self.params.P.astap_max_stars_s = self.param_max_stars.value()
-        self.params.P.wcs_max_workers = self.param_max_workers.value()
         self.params.P.wcs_require_qc_pass = self.param_require_qc.isChecked()
         self.params.P.wcs_refine_enable = self.param_refine_enable.isChecked()
         self.params.P.wcs_refine_max_match = self.param_refine_max_match.value()
@@ -2163,13 +2266,15 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.gaia_retry = self.param_gaia_retry.value()
         self.params.P.gaia_backoff_s = self.param_gaia_backoff.value()
         self.params.P.gaia_allow_no_cache = self.param_gaia_allow_no_cache.isChecked()
-        self.persist_params()
+        saved = self.persist_params()
         self.save_state()
-        QMessageBox.information(dialog, "Success", "Parameters saved!")
+        if saved:
+            QMessageBox.information(dialog, "Success", "Parameters saved!")
+        else:
+            QMessageBox.warning(dialog, "Warning", "parameters.toml save failed. Settings are only in memory.")
         dialog.accept()
 
     def save_astrometrynet_parameters(self, dialog):
-        self.params.P.astnet_local_enable = self.param_astnet_enable.isChecked()
         self.params.P.astnet_local_use_wsl = self.param_astnet_use_wsl.isChecked()
         self.params.P.astnet_local_command = self.param_astnet_command.text().strip()
         self.params.P.astnet_local_timeout_s = self.param_astnet_timeout.value()
@@ -2181,9 +2286,12 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astnet_local_use_cache = self.param_astnet_use_cache.isChecked()
         self.params.P.astnet_local_max_objs = self.param_astnet_max_objs.value()
         self.params.P.astnet_local_cpulimit_s = self.param_astnet_cpulimit.value()
-        self.persist_params()
+        saved = self.persist_params()
         self.save_state()
-        QMessageBox.information(dialog, "Success", "Astrometry.net parameters saved!")
+        if saved:
+            QMessageBox.information(dialog, "Success", "Astrometry.net parameters saved!")
+        else:
+            QMessageBox.warning(dialog, "Warning", "parameters.toml save failed. Settings are only in memory.")
         dialog.accept()
 
     def run_wcs(self):

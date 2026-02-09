@@ -931,7 +931,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.params.P.annulus_min_width_px = self.param_ann_minw.value()
         self.params.P.annulus_sigma_clip = self.param_sigma_clip.value()
         self.save_state()
-        QMessageBox.information(dialog, "Success", "Parameters saved!")
+        saved = self.persist_params()
+        msg = "Parameters saved to TOML." if saved else "Parameters saved (TOML save failed)."
+        QMessageBox.information(dialog, "Success", msg)
         dialog.accept()
 
     def run_photometry(self):
@@ -1006,12 +1008,8 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.progress_label.setText("Done")
         self.log(f"Photometry done: {summary}")
 
-        # Clean up worker safely (avoid blocking)
-        if self.worker:
-            self.worker.quit()
-            # Use QTimer for delayed cleanup instead of blocking wait
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(500, self._cleanup_worker)
+        # Deterministic worker cleanup to avoid QThread destruction race.
+        self._cleanup_worker(timeout_ms=5000)
 
         # Don't call update_frame_table() here - already updated via frame_done
         idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
@@ -1042,16 +1040,28 @@ class ForcedPhotometryWindow(StepWindowBase):
     def on_error(self, filename, error):
         self.log(f"ERROR {filename}: {error}")
 
-    def _cleanup_worker(self):
-        """Safely cleanup worker thread after completion."""
-        if self.worker:
-            if self.worker.isRunning():
-                self.worker.wait(1000)
+    def _cleanup_worker(self, timeout_ms=5000):
+        """Safely cleanup worker thread after completion or stop request."""
+        if not self.worker:
+            return True
+
+        worker = self.worker
+        if worker.isRunning():
             try:
-                self.worker.deleteLater()
+                worker.stop()
             except Exception:
                 pass
-            self.worker = None
+            worker.quit()
+            if not worker.wait(int(timeout_ms)):
+                self.log("Worker is still running; close is deferred.")
+                return False
+
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        self.worker = None
+        return True
 
     def show_log_window(self):
         self.log_window.show()
@@ -1118,8 +1128,15 @@ class ForcedPhotometryWindow(StepWindowBase):
         """Ensure worker thread is stopped before closing window"""
         if self.worker and self.worker.isRunning():
             self.stop_photometry()
-            self.worker.wait(5000)
-        event.accept()
+        if not self._cleanup_worker(timeout_ms=10000):
+            QMessageBox.warning(
+                self,
+                "Background Task Running",
+                "Photometry worker is still stopping. Please wait a few seconds and close again.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def validate_step(self) -> bool:
         idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"

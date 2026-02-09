@@ -6,7 +6,7 @@ Extracted from AAPKI_GUI.ipynb Cell 2-3
 from __future__ import annotations
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from astropy.io import fits
@@ -102,14 +102,16 @@ class FileManager:
                 except (TypeError, ValueError):
                     airmass = np.nan
 
-                rows.append({
+                row = {
                     "Filename": fn,
                     "DATE-OBS": h.get("DATE-OBS", "N/A"),
                     "FILTER": normalize_filter_name(h.get("FILTER", "UNKNOWN")),
                     "EXPTIME": exptime,
                     "AIRMASS": airmass,
                     "IMAGETYP": h.get("IMAGETYP", h.get("FRAME", "Unknown")),
-                })
+                }
+                row.update(self._extract_full_header_columns(h))
+                rows.append(row)
             except Exception as e:
                 log.warning(f"{fn}: Header read failed - {e}")
 
@@ -123,6 +125,47 @@ class FileManager:
         log.info(f"Saved: {headers_path} | rows: {len(self.df_headers)}")
 
         return self.df_headers
+
+    @staticmethod
+    def _coerce_header_value(value: Any) -> Any:
+        """Convert FITS header card values into CSV-safe scalar values."""
+        if value is None:
+            return ""
+        if isinstance(value, (np.generic,)):
+            return value.item()
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(value)
+        if isinstance(value, (list, tuple)):
+            return " | ".join(str(v) for v in value)
+        return value
+
+    def _extract_full_header_columns(self, header: fits.Header) -> Dict[str, Any]:
+        """
+        Expand all FITS header cards into CSV columns.
+
+        Columns are prefixed with HDR_ to avoid collisions with summary columns.
+        Repeated keys (e.g., COMMENT, HISTORY) are concatenated.
+        """
+        out: Dict[str, Any] = {}
+        repeated: Dict[str, List[str]] = {}
+
+        for card in header.cards:
+            key = str(card.keyword).strip()
+            if not key:
+                continue
+            col = f"HDR_{key}"
+            val = self._coerce_header_value(card.value)
+
+            if col in out:
+                repeated.setdefault(col, [str(out[col])]).append(str(val))
+                out[col] = " || ".join(repeated[col])
+            else:
+                out[col] = val
+
+        return out
 
     def select_reference_frame(self) -> str:
         """

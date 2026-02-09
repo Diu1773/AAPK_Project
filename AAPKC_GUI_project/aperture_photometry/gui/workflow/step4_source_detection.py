@@ -1983,8 +1983,15 @@ class SourceDetectionWindow(StepWindowBase):
         """Ensure worker thread is stopped before closing window"""
         if self.detection_worker and self.detection_worker.isRunning():
             self.stop_detection()
-            self.detection_worker.wait(5000)
-        event.accept()
+            if not self.detection_worker.wait(10000):
+                QMessageBox.warning(
+                    self,
+                    "Background Task Running",
+                    "Detection worker is still stopping. Please wait a few seconds and close again.",
+                )
+                event.ignore()
+                return
+        super().closeEvent(event)
 
     def populate_results_table(self):
         """Populate results table from detection_results"""

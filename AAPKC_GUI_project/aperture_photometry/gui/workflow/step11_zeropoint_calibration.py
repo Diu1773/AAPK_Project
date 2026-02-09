@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import time
 import traceback
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.table import Table
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.wcs.utils import proj_plane_pixel_scales
 from astropy.coordinates import SkyCoord
 import astropy.units as u
@@ -177,10 +178,16 @@ class ZeropointCalibrationWorker(QThread):
 
     def _has_wcs(self, header):
         try:
-            w0 = WCS(header)
+            w0 = self._wcs_from_header(header)
             return bool(w0.has_celestial)
         except Exception:
             return False
+
+    @staticmethod
+    def _wcs_from_header(header):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            return WCS(header)
 
     def _list_frames(self):
         crop_active = crop_is_active(self.result_dir)
@@ -207,7 +214,7 @@ class ZeropointCalibrationWorker(QThread):
                     hdr = fits.getheader(fp)
                     if self._has_wcs(hdr):
                         self._log(f"WCS from ref_frame index: {fp.name}")
-                        return WCS(hdr), fp
+                        return self._wcs_from_header(hdr), fp
             else:
                 fp = Path(ref_txt)
                 if not fp.is_absolute():
@@ -226,7 +233,7 @@ class ZeropointCalibrationWorker(QThread):
                     hdr = fits.getheader(fp)
                     if self._has_wcs(hdr):
                         self._log(f"WCS from ref_frame: {fp.name}")
-                        return WCS(hdr), fp
+                        return self._wcs_from_header(hdr), fp
 
         # Check cropped directory FIRST (coordinates are from cropped images)
         patterns = ["ref*.fit*", "rc_*.fit*", "Crop_*.fit*", "crop_*.fit*", "*.fit*"]
@@ -245,7 +252,7 @@ class ZeropointCalibrationWorker(QThread):
                         hdr = fits.getheader(fp)
                         if self._has_wcs(hdr):
                             self._log(f"WCS auto-detected: {fp.name} (from {base.name})")
-                            return WCS(hdr), fp
+                            return self._wcs_from_header(hdr), fp
                     except Exception:
                         continue
         return None, None
@@ -1681,7 +1688,9 @@ class ZeropointCalibrationWindow(StepWindowBase):
         self.params.P.gaia_zp_slope_absmax = self.param_gz_slope.value()
         self.params.P.gaia_color_slope_absmax = self.param_gc_slope.value()
         self.save_state()
-        QMessageBox.information(dialog, "Success", "Parameters saved!")
+        saved = self.persist_params()
+        msg = "Parameters saved to TOML." if saved else "Parameters saved (TOML save failed)."
+        QMessageBox.information(dialog, "Success", msg)
         dialog.accept()
 
     def run_analysis(self):
@@ -1725,12 +1734,49 @@ class ZeropointCalibrationWindow(StepWindowBase):
             self.log("ZP calibration complete")
             self.save_state()
             self.update_navigation_buttons()
+        self._cleanup_worker()
 
     def on_error(self, message):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress_label.setText("Error")
         self.log(f"ERROR: {message}")
+        self._cleanup_worker()
+
+    def _cleanup_worker(self, timeout_ms=5000):
+        if not self.worker:
+            return True
+
+        worker = self.worker
+        if worker.isRunning():
+            try:
+                worker.stop()
+            except Exception:
+                pass
+            worker.quit()
+            if not worker.wait(int(timeout_ms)):
+                self.log("Calibration worker is still running; close is deferred.")
+                return False
+
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        self.worker = None
+        return True
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.stop_analysis()
+        if not self._cleanup_worker(timeout_ms=10000):
+            QMessageBox.warning(
+                self,
+                "Background Task Running",
+                "Calibration worker is still stopping. Please wait a few seconds and close again.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def validate_step(self) -> bool:
         result_dir = self.params.P.result_dir
