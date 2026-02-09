@@ -27,7 +27,6 @@ class FitMode(Enum):
     """Fitting mode selection"""
     FAST = "fast"
     HESSIAN = "hessian"
-    MCMC = "mcmc"
 
 
 @dataclass
@@ -400,7 +399,7 @@ class IsochroneFitterV2:
         elif mode == FitMode.HESSIAN:
             result = self._fit_hessian(bounds, n_stars, **kwargs)
         else:
-            result = self._fit_fast(bounds, n_stars, **kwargs)
+            raise ValueError(f"Unsupported fit mode: {mode}")
 
         result.n_stars = n_stars
         result.elapsed_sec = time.time() - t0
@@ -413,6 +412,7 @@ class IsochroneFitterV2:
 
     def _fit_fast(self, bounds: FitBounds, n_stars: int, **kwargs) -> FitResult:
         maxiter = kwargs.get('maxiter', 100)
+        seed = kwargs.get('seed', 42)
         self._fit_max_iter = maxiter
 
         if self.progress_callback:
@@ -425,7 +425,7 @@ class IsochroneFitterV2:
             workers=1,
             updating='immediate',
             polish=True,
-            seed=42,
+            seed=seed,
             tol=0.01,
             atol=0.01,
             popsize=10,
@@ -451,23 +451,60 @@ class IsochroneFitterV2:
         )
 
     def _fit_hessian(self, bounds: FitBounds, n_stars: int, **kwargs) -> FitResult:
-        if self.progress_callback:
-            self.progress_callback(0.05, "Fast fit first...")
+        de_maxiter = int(kwargs.get("de_maxiter", kwargs.get("maxiter", 50)))
+        local_maxiter = int(kwargs.get("local_maxiter", 100))
+        de_seed = kwargs.get("seed", 42)
+        initial_guess = kwargs.get("initial_guess", None)
 
-        fast_result = self._fit_fast(bounds, n_stars, maxiter=50)
+        # Map global search progress into 5%~55%.
+        original_callback = self.progress_callback
+        if original_callback:
+            def _scaled_global_cb(progress, message):
+                p = 0.05 + 0.50 * float(np.clip(progress, 0.0, 1.0))
+                msg = f"Global search: {message}"
+                original_callback(p, msg)
+            self.progress_callback = _scaled_global_cb
+        try:
+            fast_result = self._fit_fast(bounds, n_stars, maxiter=de_maxiter, seed=de_seed)
+        finally:
+            self.progress_callback = original_callback
 
         if self.progress_callback:
-            self.progress_callback(0.6, "Refining + uncertainties...")
+            self.progress_callback(0.60, "Preparing local refinement...")
 
         x0 = [fast_result.log_age, fast_result.metallicity,
               fast_result.distance_mod, fast_result.extinction_gr]
+
+        # Use manual slider state as local-refine initial guess when provided.
+        if initial_guess is not None:
+            try:
+                guess = np.asarray(initial_guess, dtype=float).reshape(-1)
+                if guess.size == 4 and np.isfinite(guess).all():
+                    clipped = []
+                    for val, (lo, hi) in zip(guess, bounds.to_list()):
+                        clipped.append(float(np.clip(val, lo, hi)))
+                    x0 = clipped
+                    if self.progress_callback:
+                        self.progress_callback(0.62, "Using CMD slider initial guess")
+            except Exception:
+                pass
+
+        local_iter = {"n": 0}
+
+        def _local_callback(_xk):
+            local_iter["n"] += 1
+            if self.progress_callback:
+                frac = min(1.0, local_iter["n"] / max(local_maxiter, 1))
+                prog = 0.60 + 0.35 * frac
+                self.progress_callback(prog, f"Local refinement {local_iter['n']}/{local_maxiter}")
 
         result = minimize(
             self._objective,
             x0,
             method='L-BFGS-B',
             bounds=bounds.to_list(),
-            options={'maxiter': 100}
+            options={'maxiter': local_maxiter},
+            callback=_local_callback,
         )
 
         errors = [None, None, None, None]

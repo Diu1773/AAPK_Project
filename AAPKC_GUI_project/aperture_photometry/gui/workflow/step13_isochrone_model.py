@@ -3,9 +3,7 @@ Step 13: Isochrone Model
 Ported from AAPKI_GUI.ipynb Cell 16 (isochrone fitting).
 
 Extended with automatic isochrone fitting:
-- Fast mode (~1-3s): Quick Differential Evolution
-- Hessian mode (~5s): Fast + uncertainty estimation
-- MCMC mode (~60s): Full Bayesian posterior sampling
+- AutoFit mode: Global search + local refinement for initial parameter estimation
 """
 
 from __future__ import annotations
@@ -25,9 +23,9 @@ from scipy.spatial import cKDTree
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
-    QTextEdit, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox,
-    QLineEdit, QWidget, QFileDialog, QProgressBar, QFrame, QSplitter,
-    QTabWidget, QSpinBox, QCheckBox
+    QTextEdit, QFormLayout, QDoubleSpinBox,
+    QLineEdit, QWidget, QFileDialog, QProgressBar,
+    QTabWidget, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -45,7 +43,8 @@ class FitWorker(QThread):
     def __init__(self, fitter: IsochroneFitterV2,
                  obs_color: np.ndarray, obs_mag: np.ndarray,
                  obs_color_err: np.ndarray, obs_mag_err: np.ndarray,
-                 mode: FitMode, bounds: FitBounds, snr_min: float):
+                 mode: FitMode, bounds: FitBounds, snr_min: float,
+                 fit_kwargs: Optional[dict] = None):
         super().__init__()
         self.fitter = fitter
         self.obs_color = obs_color
@@ -55,6 +54,7 @@ class FitWorker(QThread):
         self.mode = mode
         self.bounds = bounds
         self.snr_min = snr_min
+        self.fit_kwargs = fit_kwargs or {}
 
     def run(self):
         try:
@@ -66,7 +66,8 @@ class FitWorker(QThread):
                 self.obs_color_err, self.obs_mag_err,
                 mode=self.mode,
                 bounds=self.bounds,
-                snr_min=self.snr_min
+                snr_min=self.snr_min,
+                **self.fit_kwargs
             )
             self.finished.emit(result)
 
@@ -77,24 +78,42 @@ class FitWorker(QThread):
 class IsochroneViewerWindow(QWidget):
     """Interactive isochrone viewer using matplotlib sliders."""
 
-    def __init__(self, df: pd.DataFrame, iso_raw: np.ndarray, params, parent=None):
+    def __init__(self, df: pd.DataFrame, iso_raw: np.ndarray, params, parent=None, embedded=False):
         super().__init__(parent)
         self.df = df
         self.iso_raw = iso_raw
         self.params = params
+        self.embedded = bool(embedded)
 
-        self.setWindowTitle("Isochrone Viewer")
-        self.resize(1200, 900)
-        self.setMinimumSize(900, 700)
+        if not self.embedded:
+            self.setWindowTitle("Isochrone Viewer")
+            self.resize(1200, 900)
+            self.setMinimumSize(900, 700)
+        else:
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
-        self.figure = Figure(figsize=(14, 10))
+        fig_size = (14, 10) if not self.embedded else (11, 8)
+        self.figure = Figure(figsize=fig_size)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumSize(800, 600)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        if not self.embedded:
+            self.canvas.setMinimumSize(800, 600)
         layout.addWidget(self.canvas, stretch=1)
 
         self._build_plot()
+
+    def current_slider_values(self):
+        """Return current manual slider state as a fit-initial guess dict."""
+        if not all(hasattr(self, attr) for attr in ("s_age", "s_mh", "s_vshift", "s_hshift")):
+            return None
+        return {
+            "log_age": float(self.s_age.val),
+            "metallicity": float(self.s_mh.val),
+            "distance_mod": float(self.s_vshift.val),
+            "extinction_gr": float(self.s_hshift.val),
+        }
 
     def _build_plot(self):
         mpl.rcParams['axes.unicode_minus'] = False
@@ -249,6 +268,12 @@ class IsochroneViewerWindow(QWidget):
             age, mh = s_age.val, s_mh.val
             h_s, v_s = s_hshift.val, s_vshift.val
 
+            # Keep current manual values in sync for subsequent auto-fit runs.
+            self.params.P.iso_age_init = float(age)
+            self.params.P.iso_mh_init = float(mh)
+            self.params.P.iso_eg_r_init = float(h_s)
+            self.params.P.iso_dm_init = float(v_s)
+
             new_gr, new_g = get_iso_points(age, mh, h_s, v_s)
 
             if len(new_gr) > 0:
@@ -331,32 +356,11 @@ class IsochroneModelWindow(StepWindowBase):
         file_layout.addWidget(btn_browse)
         self.content_layout.addWidget(file_group)
 
-        # === Tabs: Manual vs Auto Fit ===
+        # === Tabs: Auto Fit + CMD Viewer ===
         self.tabs = QTabWidget()
-        self.content_layout.addWidget(self.tabs)
+        self.content_layout.addWidget(self.tabs, stretch=1)
 
-        # --- Tab 1: Manual Viewer ---
-        manual_tab = QWidget()
-        manual_layout = QVBoxLayout(manual_tab)
-
-        control_layout = QHBoxLayout()
-        btn_params = QPushButton("Isochrone Parameters")
-        btn_params.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 8px 15px; }")
-        btn_params.clicked.connect(self.open_parameters_dialog)
-        control_layout.addWidget(btn_params)
-
-        self.btn_view = QPushButton("Open Isochrone Viewer")
-        self.btn_view.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 15px; }")
-        self.btn_view.clicked.connect(self.open_viewer)
-        control_layout.addWidget(self.btn_view)
-
-        control_layout.addStretch()
-        manual_layout.addLayout(control_layout)
-        manual_layout.addStretch()
-
-        self.tabs.addTab(manual_tab, "Manual (Slider)")
-
-        # --- Tab 2: Auto Fit ---
+        # --- Tab 1: Auto Fit ---
         fit_tab = QWidget()
         fit_layout = QVBoxLayout(fit_tab)
 
@@ -448,59 +452,31 @@ class IsochroneModelWindow(StepWindowBase):
 
         fit_layout.addWidget(bounds_group)
 
-        # Fitting buttons
+        # Fitting button (single recommended method)
         btn_group = QGroupBox("Run Fitting")
         btn_layout = QHBoxLayout(btn_group)
 
-        self.btn_fast = QPushButton("⚡ Fast Fit\n(~1-3 sec)")
-        self.btn_fast.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-                padding: 15px 25px;
-                font-size: 11pt;
-                border-radius: 5px;
-            }
-            QPushButton:hover { background-color: #1976D2; }
-            QPushButton:disabled { background-color: #BDBDBD; }
-        """)
-        self.btn_fast.clicked.connect(lambda: self.run_fitting(FitMode.FAST))
-        btn_layout.addWidget(self.btn_fast)
-
-        self.btn_hessian = QPushButton("📊 Hessian Fit\n(~5 sec, +errors)")
-        self.btn_hessian.setStyleSheet("""
+        self.btn_autofit = QPushButton("Run Auto Fit (Recommended)\nGlobal + Local refinement")
+        self.btn_autofit.setStyleSheet("""
             QPushButton {
                 background-color: #FF9800;
                 color: white;
                 font-weight: bold;
-                padding: 15px 25px;
+                padding: 14px 22px;
                 font-size: 11pt;
                 border-radius: 5px;
             }
             QPushButton:hover { background-color: #F57C00; }
             QPushButton:disabled { background-color: #BDBDBD; }
         """)
-        self.btn_hessian.clicked.connect(lambda: self.run_fitting(FitMode.HESSIAN))
-        btn_layout.addWidget(self.btn_hessian)
-
-        self.btn_mcmc = QPushButton("🎲 MCMC Fit\n(~60 sec, full posterior)")
-        self.btn_mcmc.setStyleSheet("""
-            QPushButton {
-                background-color: #9C27B0;
-                color: white;
-                font-weight: bold;
-                padding: 15px 25px;
-                font-size: 11pt;
-                border-radius: 5px;
-            }
-            QPushButton:hover { background-color: #7B1FA2; }
-            QPushButton:disabled { background-color: #BDBDBD; }
-        """)
-        self.btn_mcmc.clicked.connect(lambda: self.run_fitting(FitMode.MCMC))
-        btn_layout.addWidget(self.btn_mcmc)
+        self.btn_autofit.clicked.connect(self.run_fitting)
+        btn_layout.addWidget(self.btn_autofit)
+        btn_layout.addStretch()
 
         fit_layout.addWidget(btn_group)
+        fit_hint = QLabel("Auto fit is an initial guess tool. Final science fit should be validated with CMD viewer sliders.")
+        fit_hint.setStyleSheet("QLabel { color: #546E7A; font-style: italic; }")
+        fit_layout.addWidget(fit_hint)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -533,7 +509,7 @@ class IsochroneModelWindow(StepWindowBase):
 
         # Action buttons after fitting
         action_row = QHBoxLayout()
-        self.btn_apply = QPushButton("Apply to Viewer")
+        self.btn_apply = QPushButton("Apply to CMD Viewer")
         self.btn_apply.setEnabled(False)
         self.btn_apply.clicked.connect(self.apply_fit_to_viewer)
         action_row.addWidget(self.btn_apply)
@@ -554,7 +530,27 @@ class IsochroneModelWindow(StepWindowBase):
         fit_layout.addWidget(results_group)
         fit_layout.addStretch()
 
-        self.tabs.addTab(fit_tab, "Auto Fit")
+        self.auto_fit_tab_index = self.tabs.addTab(fit_tab, "Auto Fit")
+
+        # --- Tab 2: CMD Viewer (default tab) ---
+        manual_tab = QWidget()
+        manual_layout = QVBoxLayout(manual_tab)
+        manual_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.viewer_container = QWidget()
+        self.viewer_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.viewer_layout = QVBoxLayout(self.viewer_container)
+        self.viewer_layout.setContentsMargins(0, 0, 0, 0)
+        self.viewer_layout.setSpacing(0)
+        manual_layout.addWidget(self.viewer_container, stretch=1)
+        self.viewer_placeholder = None
+        self._show_viewer_placeholder(
+            "Select an isochrone file to render CMD + sliders.\n"
+            "Auto Fit results can be applied directly to this viewer."
+        )
+
+        self.cmd_viewer_tab_index = self.tabs.addTab(manual_tab, "CMD Viewer")
+        self.tabs.setCurrentIndex(self.cmd_viewer_tab_index)
 
         # --- Log Window ---
         log_row = QHBoxLayout()
@@ -584,22 +580,26 @@ class IsochroneModelWindow(StepWindowBase):
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
 
-    # =========================================================================
-    # Fitting Methods
-    # =========================================================================
-
-    def run_fitting(self, mode: FitMode):
-        """Run isochrone fitting in the selected mode"""
-
-        # Validate isochrone file
-        iso_path = self.iso_path_edit.text().strip()
+    def _get_iso_path(self) -> str:
+        iso_path = ""
+        if self.iso_path_edit is not None:
+            iso_path = self.iso_path_edit.text().strip()
         if not iso_path:
             iso_path = str(getattr(self.params.P, "iso_file_path", ""))
-        if not iso_path or not Path(iso_path).exists():
-            QMessageBox.warning(self, "Missing File", "Select an isochrone data file first")
-            return
+        return iso_path
 
-        # Load CMD data
+    def _load_cmd_and_iso_data(self, show_error=True):
+        iso_path = self._get_iso_path()
+        if not iso_path:
+            if show_error:
+                QMessageBox.warning(self, "Missing File", "Select an isochrone data file first")
+            return None, None, None
+        iso_file = Path(iso_path)
+        if not iso_file.exists():
+            if show_error:
+                QMessageBox.warning(self, "Missing File", f"Isochrone file not found: {iso_file}")
+            return None, None, None
+
         input_dir = step11_dir(self.params.P.result_dir)
         if not input_dir.exists():
             input_dir = self.params.P.result_dir
@@ -607,14 +607,104 @@ class IsochroneModelWindow(StepWindowBase):
         if not wide_path.exists():
             wide_path = input_dir / "median_by_ID_filter_wide.csv"
         if not wide_path.exists():
-            QMessageBox.warning(self, "Missing Data", "Run CMD Plot (Step 12) first")
-            return
+            if show_error:
+                QMessageBox.warning(self, "Missing Data", "CMD wide CSV not found")
+            return None, None, None
 
         try:
-            self.cmd_df = pd.read_csv(wide_path)
+            df = pd.read_csv(wide_path)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load CMD data: {e}")
+            if show_error:
+                QMessageBox.critical(self, "Error", f"Failed to load CMD data: {e}")
+            return None, None, None
+
+        try:
+            iso_raw = np.genfromtxt(iso_file, comments="#")
+            iso_raw = iso_raw[~np.isnan(iso_raw).any(axis=1)]
+            if iso_raw.size == 0:
+                if show_error:
+                    QMessageBox.warning(self, "Data Error", "Isochrone file is empty")
+                return None, None, None
+        except Exception as e:
+            if show_error:
+                QMessageBox.critical(self, "Error", f"Failed to parse isochrone file: {e}")
+            return None, None, None
+
+        return df, iso_raw, iso_file
+
+    def _show_viewer_placeholder(self, message: str):
+        self._clear_viewer_widget()
+        placeholder = QLabel(message)
+        placeholder.setAlignment(Qt.AlignCenter)
+        placeholder.setStyleSheet(
+            "QLabel { color: #607D8B; font-size: 11pt; border: 1px dashed #B0BEC5; padding: 24px; }"
+        )
+        self.viewer_layout.addWidget(placeholder, stretch=1)
+        self.viewer_placeholder = placeholder
+
+    def _clear_viewer_widget(self):
+        while self.viewer_layout.count():
+            item = self.viewer_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.viewer = None
+
+    def refresh_cmd_viewer(self, show_error=True) -> bool:
+        df, iso_raw, iso_file = self._load_cmd_and_iso_data(show_error=show_error)
+        if df is None or iso_raw is None:
+            self._show_viewer_placeholder(
+                "CMD viewer not ready.\nSelect an isochrone file and ensure Step 12 output exists."
+            )
+            return False
+
+        self._clear_viewer_widget()
+        viewer = IsochroneViewerWindow(df, iso_raw, self.params, self.viewer_container, embedded=True)
+        self.viewer_layout.addWidget(viewer, stretch=1)
+        self.viewer = viewer
+        self.log(f"CMD viewer updated: {iso_file.name}")
+        return True
+
+    def _get_fit_initial_guess(self):
+        """Build fit initial guess from current CMD slider state when available."""
+        values = None
+        if self.viewer is not None and hasattr(self.viewer, "current_slider_values"):
+            try:
+                values = self.viewer.current_slider_values()
+            except Exception:
+                values = None
+
+        if not values:
+            values = {
+                "log_age": float(getattr(self.params.P, "iso_age_init", 9.7)),
+                "metallicity": float(getattr(self.params.P, "iso_mh_init", -0.1)),
+                "distance_mod": float(getattr(self.params.P, "iso_dm_init", 9.46)),
+                "extinction_gr": float(getattr(self.params.P, "iso_eg_r_init", 0.0033)),
+            }
+
+        return np.array(
+            [
+                values["log_age"],
+                values["metallicity"],
+                values["distance_mod"],
+                values["extinction_gr"],
+            ],
+            dtype=float,
+        )
+
+    # =========================================================================
+    # Fitting Methods
+    # =========================================================================
+
+    def run_fitting(self):
+        """Run the single recommended auto-fit pipeline."""
+
+        cmd_df, _, iso_file = self._load_cmd_and_iso_data(show_error=True)
+        if cmd_df is None or iso_file is None:
             return
+        self.cmd_df = cmd_df
+        iso_path = str(iso_file)
 
         # Extract CMD columns
         if "mag_std_g" in self.cmd_df.columns and "mag_std_r" in self.cmd_df.columns:
@@ -668,15 +758,24 @@ class IsochroneModelWindow(StepWindowBase):
         # Disable buttons during fitting
         self._set_fitting_ui_enabled(False)
         self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_label.setText(f"Starting {mode.value} fit...")
+        self.progress_label.setText("Starting autofit...")
 
-        self.log(f"Starting {mode.value} fit with {len(g)} stars...")
+        self.log(f"Starting autofit (hessian mode) with {len(g)} stars...")
 
         # Run in background thread
+        initial_guess = self._get_fit_initial_guess()
+        fit_kwargs = {"de_maxiter": 120, "local_maxiter": 200, "initial_guess": initial_guess}
+        self.log(
+            "Initial guess | "
+            f"logAge={initial_guess[0]:.3f}, [M/H]={initial_guess[1]:.3f}, "
+            f"DM={initial_guess[2]:.3f}, E(g-r)={initial_guess[3]:.4f}"
+        )
         self.fit_worker = FitWorker(
             self.fitter, color, g, color_err, g_err,
-            mode, bounds, snr_min
+            FitMode.HESSIAN, bounds, snr_min,
+            fit_kwargs=fit_kwargs
         )
         self.fit_worker.progress.connect(self._on_fit_progress)
         self.fit_worker.finished.connect(self._on_fit_complete)
@@ -684,13 +783,13 @@ class IsochroneModelWindow(StepWindowBase):
 
     def _set_fitting_ui_enabled(self, enabled: bool):
         """Enable/disable fitting UI elements"""
-        self.btn_fast.setEnabled(enabled)
-        self.btn_hessian.setEnabled(enabled)
-        self.btn_mcmc.setEnabled(enabled)
+        self.btn_autofit.setEnabled(enabled)
 
     def _on_fit_progress(self, progress: float, message: str):
         """Update progress bar"""
-        self.progress_bar.setValue(int(progress * 100))
+        pct = int(np.clip(progress, 0.0, 1.0) * 100.0)
+        self.progress_bar.setValue(pct)
+        self.progress_bar.setFormat(f"{pct}%")
         self.progress_label.setText(message)
 
     def _on_fit_complete(self, result):
@@ -706,6 +805,8 @@ class IsochroneModelWindow(StepWindowBase):
 
         self.fit_result = result
         self.log(f"Fitting complete in {result.elapsed_sec:.2f} sec")
+        if not result.converged:
+            self.log("Auto fit did not fully converge; use CMD Viewer sliders for manual refinement.")
         self.progress_label.setText(f"Complete in {result.elapsed_sec:.2f} sec")
 
         # Display results
@@ -717,7 +818,7 @@ class IsochroneModelWindow(StepWindowBase):
         self.btn_membership.setEnabled(True)
 
     def apply_fit_to_viewer(self):
-        """Apply fit results and open viewer directly"""
+        """Apply fit results to CMD viewer parameters and refresh the viewer."""
         if self.fit_result is None:
             return
 
@@ -728,10 +829,10 @@ class IsochroneModelWindow(StepWindowBase):
         self.params.P.iso_eg_r_init = self.fit_result.extinction_gr
 
         self.save_state()
-        self.log(f"Applied fit results to parameters")
-
-        # Open viewer directly
-        self.open_viewer()
+        self.persist_params()
+        self.log("Applied fit results to parameters")
+        if self.refresh_cmd_viewer(show_error=True):
+            self.tabs.setCurrentIndex(self.cmd_viewer_tab_index)
 
     def export_fit_results(self):
         """Export fitting results to files"""
@@ -826,112 +927,13 @@ class IsochroneModelWindow(StepWindowBase):
             self.iso_path_edit.setText(path)
             self.params.P.iso_file_path = path
             self.save_state()
+            self.persist_params()
+            self.refresh_cmd_viewer(show_error=True)
             self.update_navigation_buttons()
 
-    def open_parameters_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Isochrone Parameters")
-        dialog.resize(520, 360)
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-
-        self.param_iso_path = QLineEdit()
-        self.param_iso_path.setPlaceholderText("Select iso_data.dat")
-        self.param_iso_path.setText(str(getattr(self.params.P, "iso_file_path", "") or ""))
-        iso_row = QHBoxLayout()
-        iso_row.addWidget(self.param_iso_path)
-        btn_iso_browse = QPushButton("Browse")
-        btn_iso_browse.clicked.connect(lambda: self._browse_iso_param(self.param_iso_path))
-        iso_row.addWidget(btn_iso_browse)
-        iso_widget = QWidget()
-        iso_widget.setLayout(iso_row)
-        form.addRow("Isochrone file:", iso_widget)
-
-        self.param_age = QDoubleSpinBox()
-        self.param_age.setRange(6.0, 12.0)
-        self.param_age.setValue(float(getattr(self.params.P, "iso_age_init", 9.7)))
-        form.addRow("Init log Age:", self.param_age)
-
-        self.param_mh = QDoubleSpinBox()
-        self.param_mh.setRange(-2.5, 0.5)
-        self.param_mh.setValue(float(getattr(self.params.P, "iso_mh_init", -0.1)))
-        form.addRow("Init [Fe/H]:", self.param_mh)
-
-        self.param_eg = QDoubleSpinBox()
-        self.param_eg.setRange(-0.5, 2.0)
-        self.param_eg.setDecimals(4)
-        self.param_eg.setSingleStep(0.0001)
-        self.param_eg.setValue(float(getattr(self.params.P, "iso_eg_r_init", 0.0033)))
-        form.addRow("Init E(g-r):", self.param_eg)
-
-        self.param_dm = QDoubleSpinBox()
-        self.param_dm.setRange(0.0, 30.0)
-        self.param_dm.setDecimals(2)
-        self.param_dm.setSingleStep(0.01)
-        self.param_dm.setValue(float(getattr(self.params.P, "iso_dm_init", 9.46)))
-        form.addRow("Init Dist. Mod:", self.param_dm)
-
-        layout.addLayout(form)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(lambda: self.save_parameters(dialog))
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        dialog.exec_()
-
-    def save_parameters(self, dialog):
-        iso_path = self.param_iso_path.text().strip()
-        if iso_path:
-            self.params.P.iso_file_path = iso_path
-            if self.iso_path_edit is not None:
-                self.iso_path_edit.setText(iso_path)
-        self.params.P.iso_age_init = self.param_age.value()
-        self.params.P.iso_mh_init = self.param_mh.value()
-        self.params.P.iso_eg_r_init = self.param_eg.value()
-        self.params.P.iso_dm_init = self.param_dm.value()
-        self.save_state()
-        if hasattr(self.params, "save_toml"):
-            self.params.save_toml()
-        QMessageBox.information(dialog, "Success", "Parameters saved!")
-        dialog.accept()
-
     def open_viewer(self):
-        iso_path = ""
-        if self.iso_path_edit is not None:
-            iso_path = self.iso_path_edit.text().strip()
-        if not iso_path:
-            iso_path = str(getattr(self.params.P, "iso_file_path", ""))
-        if not iso_path:
-            QMessageBox.warning(self, "Missing File", "Select an isochrone data file")
-            return
-        iso_file = Path(iso_path)
-        if not iso_file.exists():
-            QMessageBox.warning(self, "Missing File", f"Isochrone file not found: {iso_file}")
-            return
-
-        input_dir = step11_dir(self.params.P.result_dir)
-        if not input_dir.exists():
-            input_dir = self.params.P.result_dir
-        wide_path = input_dir / "median_by_ID_filter_wide_cmd.csv"
-        if not wide_path.exists():
-            wide_path = input_dir / "median_by_ID_filter_wide.csv"
-        if not wide_path.exists():
-            QMessageBox.warning(self, "Missing Data", "CMD wide CSV not found")
-            return
-
-        df = pd.read_csv(wide_path)
-        iso_raw = np.genfromtxt(iso_file, comments="#")
-        iso_raw = iso_raw[~np.isnan(iso_raw).any(axis=1)]
-        if iso_raw.size == 0:
-            QMessageBox.warning(self, "Data Error", "Isochrone file is empty")
-            return
-
-        viewer = IsochroneViewerWindow(df, iso_raw, self.params, self)
-        viewer.setAttribute(Qt.WA_DeleteOnClose, True)
-        viewer.show()
-        viewer.raise_()
-        viewer.activateWindow()
-        self.viewer = viewer
-        self.log(f"Opened isochrone viewer: {iso_file}")
+        if self.refresh_cmd_viewer(show_error=True):
+            self.tabs.setCurrentIndex(self.cmd_viewer_tab_index)
 
     def validate_step(self) -> bool:
         iso_path = ""
@@ -967,9 +969,10 @@ class IsochroneModelWindow(StepWindowBase):
             if state_data.get("iso_file_path"):
                 if self.iso_path_edit is not None:
                     self.iso_path_edit.setText(state_data["iso_file_path"])
+        if self.iso_path_edit is not None and not self.iso_path_edit.text().strip():
+            iso_path = str(getattr(self.params.P, "iso_file_path", "") or "")
+            if iso_path:
+                self.iso_path_edit.setText(iso_path)
+        if self._get_iso_path():
+            self.refresh_cmd_viewer(show_error=False)
         self.update_navigation_buttons()
-
-    def _browse_iso_param(self, edit: QLineEdit):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Isochrone File", str(Path.cwd()), "Data Files (*.dat *.txt);;All Files (*.*)")
-        if path:
-            edit.setText(path)
