@@ -548,7 +548,9 @@ class RefBuildWorker(QThread):
             return master_df
 
         out = master_df.copy()
-        out["gaia_source_id"] = np.nan
+        # Keep Gaia source_id as nullable Int64 to avoid float64 precision loss
+        # on 64-bit IDs (which can introduce +/-256 rounding drift).
+        out["gaia_source_id"] = pd.Series(pd.array([pd.NA] * len(out), dtype="Int64"), index=out.index)
         out["gaia_ra_deg"] = np.nan
         out["gaia_dec_deg"] = np.nan
         out["phot_g_mean_mag"] = np.nan
@@ -560,8 +562,11 @@ class RefBuildWorker(QThread):
         gaia_idx = idx[ok]
 
         if "source_id" in gaia_df.columns:
-            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").to_numpy()
-            out.loc[match_idx, "gaia_source_id"] = gaia_sid[gaia_idx]
+            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").astype("Int64")
+            out.loc[match_idx, "gaia_source_id"] = pd.array(
+                gaia_sid.iloc[np.asarray(gaia_idx, dtype=int)].tolist(),
+                dtype="Int64",
+            )
 
         out.loc[match_idx, "gaia_ra_deg"] = gaia_ra[gaia_idx]
         out.loc[match_idx, "gaia_dec_deg"] = gaia_dec[gaia_idx]
@@ -604,32 +609,32 @@ class RefBuildWorker(QThread):
 
         # Filter by magnitude limit if gaia_G is available
         n_trimmed = 0
+        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
         if "gaia_G" in out.columns and gaia_mag_limit > 0:
             gaia_g = pd.to_numeric(out["gaia_G"], errors="coerce")
             too_faint = gaia_g > gaia_mag_limit
-            gaia_sid_before = pd.to_numeric(out["gaia_source_id"], errors="coerce")
-            n_trimmed = int((too_faint & gaia_sid_before.notna() & (gaia_sid_before > 0)).sum())
+            n_trimmed = int((too_faint & gaia_sid.notna() & (gaia_sid > 0)).sum())
             # Clear Gaia ID for sources fainter than limit
-            out.loc[too_faint, "gaia_source_id"] = np.nan
+            out.loc[too_faint, "gaia_source_id"] = pd.NA
+            gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
 
         # Identify sources with valid Gaia source_id
-        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce")
         has_gaia = gaia_sid.notna() & (gaia_sid > 0)
 
         # Create new source_id column
-        new_source_id = out["source_id"].copy()  # Start with existing
+        new_source_id = pd.Series(pd.array([pd.NA] * len(out), dtype="Int64"), index=out.index)
         next_local_id = -1
 
         for i in out.index:
-            if has_gaia[i]:
+            if bool(has_gaia.loc[i]):
                 # Use Gaia source_id (positive)
-                new_source_id[i] = int(gaia_sid[i])
+                new_source_id.loc[i] = int(gaia_sid.loc[i])
             else:
                 # Assign negative local ID
-                new_source_id[i] = next_local_id
+                new_source_id.loc[i] = next_local_id
                 next_local_id -= 1
 
-        out["source_id"] = new_source_id
+        out["source_id"] = new_source_id.astype("Int64")
         # Keep ID as sequential for display purposes
         out["ID"] = range(1, len(out) + 1)
 
@@ -637,9 +642,9 @@ class RefBuildWorker(QThread):
         sid_map = {}
         id_map = {}
         if old_ids is not None:
-            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy()
-            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy()
-            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy()
+            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy(dtype=float)
+            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy(dtype=float)
+            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy(dtype=float)
             for o, n, i in zip(old_vals, new_vals, id_vals):
                 if np.isfinite(o):
                     sid_map[int(o)] = int(n) if np.isfinite(n) else int(o)
