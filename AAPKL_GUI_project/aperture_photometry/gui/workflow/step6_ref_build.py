@@ -361,7 +361,9 @@ class RefBuildWorker(QThread):
             return master_df
 
         out = master_df.copy()
-        out["gaia_source_id"] = np.nan
+        # Keep Gaia source_id as nullable Int64 to avoid float64 precision loss
+        # on 64-bit IDs (which can introduce +/-256 rounding drift).
+        out["gaia_source_id"] = pd.Series(pd.array([pd.NA] * len(out), dtype="Int64"), index=out.index)
         out["gaia_ra_deg"] = np.nan
         out["gaia_dec_deg"] = np.nan
         out["phot_g_mean_mag"] = np.nan
@@ -373,8 +375,11 @@ class RefBuildWorker(QThread):
         gaia_idx = idx[ok]
 
         if "source_id" in gaia_df.columns:
-            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").to_numpy()
-            out.loc[match_idx, "gaia_source_id"] = gaia_sid[gaia_idx]
+            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").astype("Int64")
+            out.loc[match_idx, "gaia_source_id"] = pd.array(
+                gaia_sid.iloc[np.asarray(gaia_idx, dtype=int)].tolist(),
+                dtype="Int64",
+            )
 
         out.loc[match_idx, "gaia_ra_deg"] = gaia_ra[gaia_idx]
         out.loc[match_idx, "gaia_dec_deg"] = gaia_dec[gaia_idx]
@@ -416,30 +421,33 @@ class RefBuildWorker(QThread):
             return out, {}, {}
 
         # Filter by magnitude limit if gaia_G is available
+        n_trimmed = 0
+        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
         if "gaia_G" in out.columns and gaia_mag_limit > 0:
             gaia_g = pd.to_numeric(out["gaia_G"], errors="coerce")
             too_faint = gaia_g > gaia_mag_limit
+            n_trimmed = int((too_faint & gaia_sid.notna() & (gaia_sid > 0)).sum())
             # Clear Gaia ID for sources fainter than limit
-            out.loc[too_faint, "gaia_source_id"] = np.nan
+            out.loc[too_faint, "gaia_source_id"] = pd.NA
+            gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
 
         # Identify sources with valid Gaia source_id
-        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce")
         has_gaia = gaia_sid.notna() & (gaia_sid > 0)
 
         # Create new source_id column
-        new_source_id = out["source_id"].copy()  # Start with existing
+        new_source_id = pd.Series(pd.array([pd.NA] * len(out), dtype="Int64"), index=out.index)
         next_local_id = -1
 
         for i in out.index:
-            if has_gaia[i]:
+            if bool(has_gaia.loc[i]):
                 # Use Gaia source_id (positive)
-                new_source_id[i] = int(gaia_sid[i])
+                new_source_id.loc[i] = int(gaia_sid.loc[i])
             else:
                 # Assign negative local ID
-                new_source_id[i] = next_local_id
+                new_source_id.loc[i] = next_local_id
                 next_local_id -= 1
 
-        out["source_id"] = new_source_id
+        out["source_id"] = new_source_id.astype("Int64")
         # Keep ID as sequential for display purposes
         out["ID"] = range(1, len(out) + 1)
 
@@ -447,9 +455,9 @@ class RefBuildWorker(QThread):
         sid_map = {}
         id_map = {}
         if old_ids is not None:
-            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy()
-            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy()
-            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy()
+            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy(dtype=float)
+            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy(dtype=float)
+            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy(dtype=float)
             for o, n, i in zip(old_vals, new_vals, id_vals):
                 if np.isfinite(o):
                     sid_map[int(o)] = int(n) if np.isfinite(n) else int(o)
@@ -457,6 +465,8 @@ class RefBuildWorker(QThread):
 
         n_gaia = int(has_gaia.sum())
         n_local = len(out) - n_gaia
+        if n_trimmed > 0:
+            self._log(f"[REF] Gaia IDs excluded by mag limit (G>{gaia_mag_limit:.2f}): {n_trimmed}")
         self._log(f"[REF] Hybrid IDs assigned: {n_gaia} Gaia, {n_local} local (negative)")
 
         return out, sid_map, id_map
@@ -898,6 +908,8 @@ class RefBuildWorker(QThread):
     def _run_impl(self):
         if not self.file_list:
             raise RuntimeError("No frames available")
+
+        self._log(f"[REF] Gaia hybrid ID mag limit: G<={self.gaia_mag_limit:.2f}")
 
         metrics_rows = []
         total = len(self.file_list)
@@ -1398,6 +1410,13 @@ class RefBuildWindow(StepWindowBase):
         max_dup_spin.setValue(float(getattr(self.params.P, "ref_wcs_max_dup_rate", 0.1)))
         form.addRow("WCS max duplicate rate:", max_dup_spin)
 
+        gaia_mag_spin = QDoubleSpinBox()
+        gaia_mag_spin.setRange(10.0, 25.0)
+        gaia_mag_spin.setDecimals(2)
+        gaia_mag_spin.setSingleStep(0.5)
+        gaia_mag_spin.setValue(float(getattr(self.params.P, "idmatch_gaia_g_limit", getattr(self.params.P, "gaia_mag_max", 18.0))))
+        form.addRow("Gaia G limit (hybrid ID):", gaia_mag_spin)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -1420,6 +1439,7 @@ class RefBuildWindow(StepWindowBase):
             self.params.P.ref_wcs_max_sep_med_arcsec = max_sep_med_spin.value()
             self.params.P.ref_wcs_max_sep_p90_arcsec = max_sep_p90_spin.value()
             self.params.P.ref_wcs_max_dup_rate = max_dup_spin.value()
+            self.params.P.idmatch_gaia_g_limit = gaia_mag_spin.value()
             self.persist_params()
             QMessageBox.information(dialog, "Success", "Parameters saved!")
 
@@ -1492,7 +1512,13 @@ class RefBuildWindow(StepWindowBase):
             wcs_max_dup_rate=self.params.P.ref_wcs_max_dup_rate,
             ref_per_date=self.params.P.ref_per_date,
             ref_build_mode=getattr(self.params.P, "ref_build_mode", "hybrid"),
-            gaia_mag_limit=getattr(self.params.P, "gaia_mag_limit", 18.0),
+            gaia_mag_limit=float(
+                getattr(
+                    self.params.P,
+                    "idmatch_gaia_g_limit",
+                    getattr(self.params.P, "gaia_mag_max", 18.0),
+                )
+            ),
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.log)
