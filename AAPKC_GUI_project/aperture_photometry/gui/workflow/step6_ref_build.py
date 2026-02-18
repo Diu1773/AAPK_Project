@@ -288,9 +288,10 @@ class RefBuildWorker(QThread):
         # Cache for WCS headers (path -> fits.Header)
         self._wcs_header_cache: Dict[str, fits.Header] = {}
         self._wcs_summary_by_file: Optional[Dict[str, dict]] = None
-        self._meta_relaxed_mtime_logged: set[str] = set()
-        self._meta_fallback_warned: set[str] = set()
-        self._detect_csv_fallback_warned: set[str] = set()
+        self._meta_missing_files: set[str] = set()
+        self._meta_incompatible_files: set[str] = set()
+        self._detcsv_missing_files: set[str] = set()
+        self._detcsv_incompatible_files: set[str] = set()
 
     def stop(self):
         self._stop_requested = True
@@ -305,30 +306,17 @@ class RefBuildWorker(QThread):
         ]
         candidates = [p for p in candidates if p.exists()]
         if not candidates:
-            self._log(f"[REF][QC] skip {fname}: detection meta not found")
+            self._meta_missing_files.add(str(fname))
             return None
         candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
-        saw_incompatible = False
-        fallback_payload = None
         for meta_path in candidates:
             try:
                 payload = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if fallback_payload is None:
-                fallback_payload = payload
             if self._detect_meta_compatible(fname, payload, meta_path):
                 return payload
-            saw_incompatible = True
-        if saw_incompatible and fallback_payload is not None:
-            if fname not in self._meta_fallback_warned:
-                self._meta_fallback_warned.add(fname)
-                self._log(
-                    f"[REF][QC] {fname}: using detection meta despite signature mismatch "
-                    f"(cache drift; re-run Step4 recommended)"
-                )
-            fallback_payload["__compat_fallback"] = True
-            return fallback_payload
+        self._meta_incompatible_files.add(str(fname))
         return None
 
     def _resolve_detect_csv(self, fname: str) -> Optional[Path]:
@@ -337,11 +325,11 @@ class RefBuildWorker(QThread):
             step4_dir(self.result_dir) / f"detect_{fname}.csv",
         ]
         candidates = [p for p in candidates if p.exists()]
+        if not candidates:
+            self._detcsv_missing_files.add(str(fname))
+            return None
         candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
-        fallback_candidate = None
         for cand in candidates:
-            if fallback_candidate is None and cand.stat().st_size > 0:
-                fallback_candidate = cand
             meta_path = cand.with_suffix(".json")
             if meta_path.exists():
                 try:
@@ -350,14 +338,7 @@ class RefBuildWorker(QThread):
                     continue
                 if self._detect_meta_compatible(fname, payload, meta_path):
                     return cand
-        if fallback_candidate is not None:
-            if fname not in self._detect_csv_fallback_warned:
-                self._detect_csv_fallback_warned.add(fname)
-                self._log(
-                    f"[REF][QC] {fname}: using detection CSV despite signature mismatch "
-                    f"(cache drift; re-run Step4 recommended)"
-                )
-            return fallback_candidate
+        self._detcsv_incompatible_files.add(str(fname))
         return None
 
     def _resolve_fits_path(self, fname: str) -> Optional[Path]:
@@ -883,18 +864,6 @@ class RefBuildWorker(QThread):
         meta = self._load_meta(fname)
         if not meta:
             return None
-        if bool(meta.get("__compat_relaxed_mtime", False)) and fname not in self._meta_relaxed_mtime_logged:
-            self._meta_relaxed_mtime_logged.add(fname)
-            if bool(meta.get("__compat_relaxed_size", False)):
-                self._log(
-                    f"[REF][QC] {fname}: accepted detection meta with relaxed size+mtime "
-                    f"(likely FITS header updated after Step4; path/crop matched)"
-                )
-            else:
-                self._log(
-                    f"[REF][QC] {fname}: accepted detection meta with relaxed mtime "
-                    f"(likely FITS header updated after Step4; path/size matched)"
-                )
         filt = str(meta.get("filter", "") or "").strip().lower()
         if not filt:
             filt = _get_filter_from_filename(fname) or "unknown"
@@ -1234,7 +1203,13 @@ class RefBuildWorker(QThread):
             self.progress.emit(i, total, fname)
 
         if not metrics_rows:
-            raise RuntimeError("No detection metrics found. Run Source Detection first.")
+            miss_meta = len(self._meta_missing_files)
+            bad_meta = len(self._meta_incompatible_files)
+            raise RuntimeError(
+                "No compatible detection metrics found. "
+                f"(missing_meta={miss_meta}, incompatible_meta={bad_meta}) "
+                "Run Step4 Source Detection for the current source/crop state."
+            )
 
         metrics = pd.DataFrame(metrics_rows)
 

@@ -235,8 +235,6 @@ class WcsWorker(QThread):
         self.use_cropped = use_cropped
         self.target_coord = target_coord
         self._stop_requested = False
-        self._legacy_detect_warned = set()
-        self._detect_csv_fallback_warned = set()
 
     def stop(self):
         self._stop_requested = True
@@ -603,14 +601,11 @@ class WcsWorker(QThread):
         ]
         candidates = [p for p in candidates if p.exists()]
         candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
-        fallback_meta = None
         for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if fallback_meta is None:
-                fallback_meta = meta
             if not self._detect_meta_matches(meta, sig_now, meta_json):
                 continue
             try:
@@ -619,13 +614,6 @@ class WcsWorker(QThread):
                 return fpx, farc
             except Exception:
                 continue
-        if fallback_meta is not None:
-            try:
-                fpx = float(fallback_meta.get("fwhm_med_rad_px", fallback_meta.get("fwhm_med_px", np.nan)))
-                farc = float(fallback_meta.get("fwhm_med_rad_arcsec", fallback_meta.get("fwhm_med_arc", np.nan)))
-                return fpx, farc
-            except Exception:
-                pass
         # Backward compatibility: legacy detect cache (schema<2) can be used
         # when it is newer than the current crop selection marker.
         for meta_json in candidates:
@@ -657,12 +645,9 @@ class WcsWorker(QThread):
             self.cache_dir / f"detect_{fname}.csv",
             step4_dir(self.result_dir) / f"detect_{fname}.csv",
         ]
-        fallback_candidate = None
         for path in candidates:
             if not path.exists():
                 continue
-            if fallback_candidate is None and path.stat().st_size > 0:
-                fallback_candidate = path
             meta_path = path.with_suffix(".json")
             if not meta_path.exists():
                 continue
@@ -707,15 +692,6 @@ class WcsWorker(QThread):
             xy = df[["x", "y"]].to_numpy(float)
             xy = xy[np.isfinite(xy).all(axis=1)]
             return xy
-        if fallback_candidate is not None:
-            try:
-                df = pd.read_csv(fallback_candidate)
-                if {"x", "y"} <= set(df.columns):
-                    xy = df[["x", "y"]].to_numpy(float)
-                    xy = xy[np.isfinite(xy).all(axis=1)]
-                    return xy
-            except Exception:
-                pass
         return np.zeros((0, 2), float)
 
     def _empty_wcs_qc_metrics(self, n_detect: int = 0) -> dict:
@@ -2014,8 +1990,6 @@ class AstrometryNetWorker(QThread):
         self.use_cropped = use_cropped
         self.target_coord = target_coord
         self._stop_requested = False
-        self._legacy_detect_warned = set()
-        self._detect_csv_fallback_warned = set()
 
     def stop(self):
         self._stop_requested = True
@@ -2342,14 +2316,11 @@ class AstrometryNetWorker(QThread):
         ]
         candidates = [p for p in candidates if p.exists()]
         candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
-        fallback_meta = None
         for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if fallback_meta is None:
-                fallback_meta = meta
             if not self._detect_meta_matches(meta, sig_now, meta_json):
                 continue
             try:
@@ -2368,23 +2339,6 @@ class AstrometryNetWorker(QThread):
                 return fpx, farc
             except Exception:
                 continue
-        if fallback_meta is not None:
-            try:
-                fpx = float(
-                    fallback_meta.get(
-                        "fwhm_med_rad_px",
-                        fallback_meta.get("fwhm_med_px", fallback_meta.get("fwhm_px", np.nan)),
-                    )
-                )
-                farc = float(
-                    fallback_meta.get(
-                        "fwhm_med_rad_arcsec",
-                        fallback_meta.get("fwhm_med_arc", fallback_meta.get("fwhm_arcsec", np.nan)),
-                    )
-                )
-                return fpx, farc
-            except Exception:
-                pass
         for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
@@ -2424,12 +2378,9 @@ class AstrometryNetWorker(QThread):
             self.cache_dir / f"detect_{fname}.csv",
             step4_dir(self.result_dir) / f"detect_{fname}.csv",
         ]
-        fallback_candidate = None
         for csv_path in candidates:
             if not csv_path.exists():
                 continue
-            if fallback_candidate is None and csv_path.stat().st_size > 0:
-                fallback_candidate = csv_path
             meta_path = csv_path.with_suffix(".json")
             if not meta_path.exists():
                 continue
@@ -2470,32 +2421,9 @@ class AstrometryNetWorker(QThread):
                     continue
                 xy = df[["x", "y"]].to_numpy(float)
                 xy = xy[np.isfinite(xy).all(axis=1)]
-                try:
-                    if fname not in self._legacy_detect_warned:
-                        self._legacy_detect_warned.add(str(fname))
-                        self.log_message.emit(
-                            f"[Refine] {fname}: using legacy detection cache (re-run Step4 recommended)."
-                        )
-                except Exception:
-                    pass
                 return xy, df
             except Exception:
                 continue
-        if fallback_candidate is not None:
-            try:
-                df = pd.read_csv(fallback_candidate)
-                if {"x", "y"} <= set(df.columns):
-                    xy = df[["x", "y"]].to_numpy(float)
-                    xy = xy[np.isfinite(xy).all(axis=1)]
-                    if fname not in self._detect_csv_fallback_warned:
-                        self._detect_csv_fallback_warned.add(str(fname))
-                        self.log_message.emit(
-                            f"[Refine] {fname}: using detection CSV despite incompatible meta "
-                            f"(cache signature drift; re-run Step4 recommended)."
-                        )
-                    return xy, df
-            except Exception:
-                pass
         return np.empty((0, 2)), None
 
     def _wcs_rotation_deg(self, w: WCS) -> float:
