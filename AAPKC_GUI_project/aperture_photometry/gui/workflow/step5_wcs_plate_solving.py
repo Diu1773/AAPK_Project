@@ -12,6 +12,7 @@ import threading
 import warnings
 import shlex
 import shutil
+import os
 from pathlib import Path, PureWindowsPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -46,14 +47,174 @@ from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step2_cropped_dir,
     crop_is_active,
+    crop_rect_path,
     step4_dir,
     step5_dir,
-    step6_dir,
     legacy_step5_refbuild_dir,
     legacy_step7_wcs_dir,
     legacy_step7_refbuild_dir,
 )
 from ...utils.constants import get_parallel_workers
+
+
+def _tail_text(value: str | None, limit: int = 800, max_lines: int = 8) -> str:
+    if value is None:
+        return ""
+    s = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return ""
+    lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+    if max_lines > 0 and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    one_line = " | ".join(lines)
+    if len(one_line) > limit:
+        one_line = "..." + one_line[-limit:]
+    return one_line
+
+
+def _exc_brief(exc: Exception, limit: int = 260) -> str:
+    return _tail_text(f"{type(exc).__name__}: {exc}", limit=limit, max_lines=4)
+
+
+def _norm_path_key(path_value) -> str:
+    if path_value is None:
+        return ""
+    try:
+        s = str(path_value).strip().replace("\\", "/")
+    except Exception:
+        s = str(path_value).replace("\\", "/")
+    if len(s) >= 3 and s[1] == ":" and s[2] == "/" and s[0].isalpha():
+        s = f"/mnt/{s[0].lower()}/{s[3:]}"
+    while "//" in s:
+        s = s.replace("//", "/")
+    if len(s) > 1 and s.endswith("/"):
+        s = s[:-1]
+    return s.lower()
+
+
+def _build_source_signature(path: Path, *, use_cropped: bool) -> dict:
+    sig = {
+        "source_path": _norm_path_key(path),
+        "source_use_cropped": bool(use_cropped),
+        "source_size": None,
+        "source_mtime_ns": None,
+    }
+    try:
+        st = path.stat()
+        sig["source_size"] = int(st.st_size)
+        sig["source_mtime_ns"] = int(st.st_mtime_ns)
+    except Exception:
+        pass
+    return sig
+
+
+def _source_signature_matches(saved_sig: dict, current_sig: dict) -> bool:
+    if not isinstance(saved_sig, dict) or not isinstance(current_sig, dict):
+        return False
+    if bool(saved_sig.get("source_use_cropped", None)) != bool(current_sig.get("source_use_cropped", None)):
+        return False
+    if _norm_path_key(saved_sig.get("source_path", "")) != _norm_path_key(current_sig.get("source_path", "")):
+        return False
+    try:
+        saved_mtime_ns = int(saved_sig.get("source_mtime_ns"))
+        curr_mtime_ns = int(current_sig.get("source_mtime_ns"))
+    except Exception:
+        return False
+    return saved_mtime_ns == curr_mtime_ns
+
+
+def _source_signature_detection_compatible(saved_sig: dict, current_sig: dict) -> bool:
+    """Compatibility check for Step4 detection caches consumed by Step5.
+
+    Step5 can update FITS headers in-place after solving, which changes mtime
+    without invalidating detection XY. In that case, accept cache when path,
+    crop mode, and file size still match.
+    """
+    if _source_signature_matches(saved_sig, current_sig):
+        return True
+    if not isinstance(saved_sig, dict) or not isinstance(current_sig, dict):
+        return False
+    if bool(saved_sig.get("source_use_cropped", None)) != bool(current_sig.get("source_use_cropped", None)):
+        return False
+    if _norm_path_key(saved_sig.get("source_path", "")) != _norm_path_key(current_sig.get("source_path", "")):
+        return False
+    try:
+        saved_size = int(saved_sig.get("source_size"))
+        curr_size = int(current_sig.get("source_size"))
+    except Exception:
+        return False
+    if saved_size <= 0 or curr_size <= 0:
+        return False
+    return saved_size == curr_size
+
+
+def _canonicalize_windows_path_case(path_value) -> Path:
+    """Best-effort case normalization for Windows paths.
+
+    When data lives on case-sensitive external drives, incoming paths may have
+    case variants (e.g. m13 vs M13). WSL access then fails even though Windows
+    can open the file. Resolve each component by case-insensitive lookup.
+    """
+    try:
+        wp = PureWindowsPath(str(path_value))
+    except Exception:
+        return Path(path_value)
+    if not wp.drive:
+        ptxt = str(path_value).replace("\\", "/")
+        if not ptxt.startswith("/mnt/"):
+            return Path(path_value)
+        cur = Path("/")
+        for part in Path(ptxt).parts[1:]:
+            if not part:
+                continue
+            cand = cur / part
+            if cand.exists():
+                cur = cand
+                continue
+            try:
+                low = part.lower()
+                match = None
+                for ent in os.scandir(cur):
+                    name = ent.name
+                    if name.lower() == low:
+                        match = name
+                        break
+                if match is not None:
+                    cur = cur / match
+                    continue
+            except Exception:
+                pass
+            cur = cand
+        return cur
+
+    root = Path(f"{wp.drive}\\")
+    cur = root
+    parts = list(wp.parts[1:])
+    if not parts:
+        return cur
+
+    for part in parts:
+        if not part:
+            continue
+        cand = cur / part
+        if cand.exists():
+            cur = cand
+            continue
+        try:
+            low = part.lower()
+            match = None
+            for ent in os.scandir(cur):
+                name = ent.name
+                if name.lower() == low:
+                    match = name
+                    break
+            if match is not None:
+                cur = cur / match
+                continue
+        except Exception:
+            pass
+        cur = cand
+    return cur
 
 
 class WcsWorker(QThread):
@@ -74,6 +235,8 @@ class WcsWorker(QThread):
         self.use_cropped = use_cropped
         self.target_coord = target_coord
         self._stop_requested = False
+        self._legacy_detect_warned = set()
+        self._detect_csv_fallback_warned = set()
 
     def stop(self):
         self._stop_requested = True
@@ -143,7 +306,8 @@ class WcsWorker(QThread):
 
     def _win_to_wsl_path(self, path: Path) -> str:
         try:
-            wp = PureWindowsPath(str(path))
+            canon = _canonicalize_windows_path_case(path)
+            wp = PureWindowsPath(str(canon))
             if wp.drive:
                 drive = wp.drive.rstrip(":").lower()
                 parts = "/".join(wp.parts[1:])
@@ -172,15 +336,26 @@ class WcsWorker(QThread):
         stem = fits_path.stem
         new_path = outdir / f"{stem}.new"
         solved_path = outdir / f"{stem}.solved"
-        if use_cache and new_path.exists() and solved_path.exists():
-            return True, 0.0, "cache_hit", "", [], new_path
+        wcs_path = outdir / f"{stem}.wcs"
+        sig_path = outdir / f"{stem}.input.json"
+        source_sig = _build_source_signature(fits_path, use_cropped=bool(self.use_cropped))
+        if use_cache and new_path.exists() and (solved_path.exists() or wcs_path.exists()):
+            cache_ok = False
+            try:
+                if sig_path.exists():
+                    saved_sig = json.loads(sig_path.read_text(encoding="utf-8"))
+                    cache_ok = _source_signature_detection_compatible(saved_sig, source_sig)
+            except Exception:
+                cache_ok = False
+            if cache_ok:
+                return True, 0.0, "cache_hit", "", [], new_path
         for p in outdir.glob(f"{stem}.*"):
             try:
                 p.unlink()
             except Exception:
                 pass
         staged_path = fits_path
-        if stage_in_outdir:
+        if stage_in_outdir and (not use_wsl):
             try:
                 staged_path = outdir / fits_path.name
                 if staged_path != fits_path:
@@ -197,6 +372,34 @@ class WcsWorker(QThread):
 
         outdir_arg = self._win_to_wsl_path(outdir) if use_wsl else str(outdir)
         fits_arg = self._win_to_wsl_path(staged_path) if use_wsl else str(staged_path)
+        if not staged_path.exists():
+            return False, 0.0, "", f"input_missing:{staged_path}", cmd, None
+        if use_wsl and cmd and str(cmd[0]).lower() == "wsl":
+            try:
+                chk = subprocess.run(
+                    ["wsl", "test", "-f", fits_arg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if chk.returncode != 0:
+                    err_msg = (
+                        f"wsl_path_unavailable:{fits_arg} | "
+                        "WSL cannot read this file path. Use ASTAP solver or move data to a local "
+                        "drive/folder that WSL can access (e.g. C:) and rerun."
+                    )
+                    return False, 0.0, "", err_msg, cmd, None
+            except FileNotFoundError:
+                return (
+                    False,
+                    0.0,
+                    "",
+                    "wsl_not_found: WSL command not available. Disable WSL solve and use ASTAP.",
+                    cmd,
+                    None,
+                )
+            except Exception:
+                pass
 
         cmd += [
             "--dir", outdir_arg,
@@ -225,20 +428,34 @@ class WcsWorker(QThread):
             start = time.time()
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
             dt = time.time() - start
-            ok = (cp.returncode == 0 and new_path.exists() and solved_path.exists())
+            # Some solve-field builds can return non-zero even when solution artifacts are created.
+            # Prefer artifact existence over process return code.
+            wcs_path = outdir / f"{stem}.wcs"
+            ok = bool(new_path.exists() and (solved_path.exists() or wcs_path.exists()))
+            if ok:
+                try:
+                    sig_path.write_text(json.dumps(source_sig, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             if staged_path != fits_path:
                 try:
                     staged_path.unlink()
                 except Exception:
                     pass
             return ok, dt, cp.stdout, cp.stderr, cmd, new_path
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             if staged_path != fits_path:
                 try:
                     staged_path.unlink()
                 except Exception:
                     pass
-            return False, timeout_s, "", "timeout", cmd, None
+            out_s = e.stdout or ""
+            err_s = e.stderr or ""
+            err_msg = "timeout"
+            err_tail = _tail_text(err_s, limit=1000, max_lines=10)
+            if err_tail:
+                err_msg = f"timeout | {err_tail}"
+            return False, timeout_s, out_s, err_msg, cmd, None
         except Exception as e:
             if staged_path != fits_path:
                 try:
@@ -325,17 +542,439 @@ class WcsWorker(QThread):
         except Exception:
             return 0
 
+    def _resolve_source_fits_path(self, fname: str) -> Path | None:
+        if self.use_cropped:
+            cand = step2_cropped_dir(self.result_dir) / fname
+            if cand.exists():
+                return cand
+            legacy = self.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        try:
+            orig = Path(self.params.get_file_path(fname))
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        return None
+
+    def _compatible_detect_signature(self, fname: str) -> dict | None:
+        src = self._resolve_source_fits_path(fname)
+        if src is None or not src.exists():
+            return None
+        return _build_source_signature(src, use_cropped=bool(self.use_cropped))
+
+    def _detect_meta_matches(self, payload: dict, sig_now: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict) or not isinstance(sig_now, dict):
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return False
+        if not _source_signature_detection_compatible(payload, sig_now):
+            return False
+        return True
+
+    def _legacy_detect_cache_allowed(self, marker_path: Path) -> bool:
+        try:
+            marker_mtime = int(marker_path.stat().st_mtime_ns)
+        except Exception:
+            return False
+        if self.use_cropped:
+            rect_path = crop_rect_path(self.result_dir)
+            if rect_path.exists():
+                try:
+                    rect_mtime = int(rect_path.stat().st_mtime_ns)
+                    if marker_mtime < rect_mtime:
+                        return False
+                except Exception:
+                    return False
+        return True
+
     def _load_fwhm_for_frame(self, fname: str):
-        meta_json = self.cache_dir / f"detect_{fname}.json"
-        if meta_json.exists():
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
+            return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
+        candidates = [
+            self.cache_dir / f"detect_{fname}.json",
+            step4_dir(self.result_dir) / f"detect_{fname}.json",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
+        fallback_meta = None
+        for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if fallback_meta is None:
+                fallback_meta = meta
+            if not self._detect_meta_matches(meta, sig_now, meta_json):
+                continue
+            try:
                 fpx = float(meta.get("fwhm_med_rad_px", meta.get("fwhm_med_px", np.nan)))
                 farc = float(meta.get("fwhm_med_rad_arcsec", meta.get("fwhm_med_arc", np.nan)))
                 return fpx, farc
             except Exception:
+                continue
+        if fallback_meta is not None:
+            try:
+                fpx = float(fallback_meta.get("fwhm_med_rad_px", fallback_meta.get("fwhm_med_px", np.nan)))
+                farc = float(fallback_meta.get("fwhm_med_rad_arcsec", fallback_meta.get("fwhm_med_arc", np.nan)))
+                return fpx, farc
+            except Exception:
                 pass
+        # Backward compatibility: legacy detect cache (schema<2) can be used
+        # when it is newer than the current crop selection marker.
+        for meta_json in candidates:
+            try:
+                meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            try:
+                schema = int(meta.get("cache_schema", 0) or 0)
+            except Exception:
+                schema = 0
+            if schema >= 2:
+                continue
+            if not self._legacy_detect_cache_allowed(meta_json):
+                continue
+            try:
+                fpx = float(meta.get("fwhm_med_rad_px", meta.get("fwhm_med_px", np.nan)))
+                farc = float(meta.get("fwhm_med_rad_arcsec", meta.get("fwhm_med_arc", np.nan)))
+                return fpx, farc
+            except Exception:
+                continue
         return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
+
+    def _load_detect_xy(self, fname: str) -> np.ndarray:
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
+            return np.zeros((0, 2), float)
+        candidates = [
+            self.cache_dir / f"detect_{fname}.csv",
+            step4_dir(self.result_dir) / f"detect_{fname}.csv",
+        ]
+        fallback_candidate = None
+        for path in candidates:
+            if not path.exists():
+                continue
+            if fallback_candidate is None and path.stat().st_size > 0:
+                fallback_candidate = path
+            meta_path = path.with_suffix(".json")
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._detect_meta_matches(payload, sig_now, meta_path):
+                continue
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            if not {"x", "y"} <= set(df.columns):
+                continue
+            xy = df[["x", "y"]].to_numpy(float)
+            xy = xy[np.isfinite(xy).all(axis=1)]
+            return xy
+        # Backward compatibility for legacy detect cache.
+        for csv_path in candidates:
+            if not csv_path.exists():
+                continue
+            meta_path = csv_path.with_suffix(".json")
+            schema = 0
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                    schema = int(payload.get("cache_schema", 0) or 0)
+                except Exception:
+                    continue
+            if schema >= 2:
+                continue
+            marker_path = meta_path if meta_path.exists() else csv_path
+            if not self._legacy_detect_cache_allowed(marker_path):
+                continue
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            if not {"x", "y"} <= set(df.columns):
+                continue
+            xy = df[["x", "y"]].to_numpy(float)
+            xy = xy[np.isfinite(xy).all(axis=1)]
+            return xy
+        if fallback_candidate is not None:
+            try:
+                df = pd.read_csv(fallback_candidate)
+                if {"x", "y"} <= set(df.columns):
+                    xy = df[["x", "y"]].to_numpy(float)
+                    xy = xy[np.isfinite(xy).all(axis=1)]
+                    return xy
+            except Exception:
+                pass
+        return np.zeros((0, 2), float)
+
+    def _empty_wcs_qc_metrics(self, n_detect: int = 0) -> dict:
+        return {
+            "n_detect": int(max(0, n_detect)),
+            "n_catalog_in_fov": 0,
+            "n_match": 0,
+            "n_inlier": 0,
+            "match_rate": np.nan,
+            "match_rate_cat": np.nan,
+            "match_rate_eff": np.nan,
+            "match_radius_arcsec": np.nan,
+            "match_radius_px": np.nan,
+            "dx_med_px": np.nan,
+            "dy_med_px": np.nan,
+            "resid_med_px": np.nan,
+            "resid_mad_px": np.nan,
+            "resid_peak_px": np.nan,
+            "resid_p99_px": np.nan,
+            "rms_px": np.nan,
+            "inlier_rate": np.nan,
+            "resid_vs_radius_slope": np.nan,
+            "edge_resid_ratio": np.nan,
+            "center_offset_arcsec": np.nan,
+            "pix_scale_input_arcsec": np.nan,
+            "pix_scale_fit_arcsec": np.nan,
+            "scale_delta_pct": np.nan,
+        }
+
+    def _compute_wcs_qc_metrics(
+        self,
+        *,
+        w: WCS | None,
+        det_xy: np.ndarray,
+        nx: int,
+        ny: int,
+        gaia_ra_deg: np.ndarray,
+        gaia_dec_deg: np.ndarray,
+        pix_input_arcsec: float,
+        pix_fit_arcsec: float,
+        center_coord: SkyCoord | None,
+    ) -> dict:
+        out = self._empty_wcs_qc_metrics(n_detect=len(det_xy))
+        if np.isfinite(pix_input_arcsec):
+            out["pix_scale_input_arcsec"] = float(pix_input_arcsec)
+        if np.isfinite(pix_fit_arcsec):
+            out["pix_scale_fit_arcsec"] = float(pix_fit_arcsec)
+        if np.isfinite(pix_input_arcsec) and pix_input_arcsec > 0 and np.isfinite(pix_fit_arcsec):
+            out["scale_delta_pct"] = float((pix_fit_arcsec - pix_input_arcsec) / pix_input_arcsec * 100.0)
+
+        if w is not None and w.has_celestial and center_coord is not None:
+            try:
+                c_ra, c_dec = self._wcs_center_coords(w, nx, ny)
+                if np.isfinite(c_ra) and np.isfinite(c_dec):
+                    c_sky = SkyCoord(c_ra * u.deg, c_dec * u.deg, frame="icrs")
+                    out["center_offset_arcsec"] = float(c_sky.separation(center_coord).arcsec)
+            except Exception:
+                pass
+
+        if w is None or (not w.has_celestial):
+            return out
+        if len(det_xy) == 0:
+            return out
+        if gaia_ra_deg.size == 0 or gaia_dec_deg.size == 0:
+            return out
+
+        try:
+            xg, yg = w.celestial.all_world2pix(gaia_ra_deg, gaia_dec_deg, 0)
+            xg = np.asarray(xg, float)
+            yg = np.asarray(yg, float)
+        except Exception:
+            return out
+
+        ok_g = (
+            np.isfinite(xg)
+            & np.isfinite(yg)
+            & (xg >= 0.0)
+            & (xg < float(nx))
+            & (yg >= 0.0)
+            & (yg < float(ny))
+        )
+        if not np.any(ok_g):
+            return out
+
+        gaia_xy = np.column_stack((xg[ok_g], yg[ok_g]))
+        out["n_catalog_in_fov"] = int(len(gaia_xy))
+
+        pix_use = pix_fit_arcsec if np.isfinite(pix_fit_arcsec) and pix_fit_arcsec > 0 else pix_input_arcsec
+        match_r_arcsec = float(getattr(self.params.P, "wcs_qc_match_radius_arcsec", 2.0))
+        if not np.isfinite(match_r_arcsec) or match_r_arcsec <= 0:
+            match_r_arcsec = 2.0
+        if np.isfinite(pix_use) and pix_use > 0:
+            match_r_px = float(match_r_arcsec / pix_use)
+        else:
+            match_r_px = float(getattr(self.params.P, "wcs_qc_match_radius_px", 2.5))
+        match_r_px = float(np.clip(match_r_px, 1.0, 25.0))
+        out["match_radius_arcsec"] = float(match_r_arcsec)
+        out["match_radius_px"] = float(match_r_px)
+
+        tree = KDTree(gaia_xy)
+        d, j = tree.query(det_xy, k=1)
+        d = np.asarray(d, float)
+        j = np.asarray(j, int)
+        ok = np.isfinite(d) & (d <= match_r_px) & (j >= 0) & (j < len(gaia_xy))
+        if not np.any(ok):
+            return out
+
+        det_candidates = np.where(ok)[0]
+        order = np.argsort(d[det_candidates])
+        used_gaia = set()
+        keep_det = []
+        keep_gaia = []
+        for ord_idx in order:
+            det_i = int(det_candidates[ord_idx])
+            gaia_i = int(j[det_i])
+            if gaia_i in used_gaia:
+                continue
+            used_gaia.add(gaia_i)
+            keep_det.append(det_i)
+            keep_gaia.append(gaia_i)
+        if not keep_det:
+            return out
+
+        det_keep = np.asarray(keep_det, dtype=int)
+        gaia_keep = np.asarray(keep_gaia, dtype=int)
+        dx = det_xy[det_keep, 0] - gaia_xy[gaia_keep, 0]
+        dy = det_xy[det_keep, 1] - gaia_xy[gaia_keep, 1]
+        r = np.hypot(dx, dy)
+        finite_r = np.isfinite(r)
+        if not np.any(finite_r):
+            return out
+        if not np.all(finite_r):
+            dx = dx[finite_r]
+            dy = dy[finite_r]
+            r = r[finite_r]
+            gaia_keep = gaia_keep[finite_r]
+
+        n_match = int(len(r))
+        out["n_match"] = n_match
+        out["match_rate"] = float(n_match / max(int(len(det_xy)), 1))
+        out["match_rate_cat"] = float(n_match / max(int(len(gaia_xy)), 1))
+        out["match_rate_eff"] = float(max(out["match_rate"], out["match_rate_cat"]))
+        if n_match == 0:
+            return out
+
+        dx_med = float(np.nanmedian(dx)) if len(dx) else np.nan
+        dy_med = float(np.nanmedian(dy)) if len(dy) else np.nan
+        out["dx_med_px"] = dx_med
+        out["dy_med_px"] = dy_med
+
+        resid_med = float(np.nanmedian(r))
+        resid_mad = float(1.4826 * np.nanmedian(np.abs(r - resid_med)))
+        resid_p99 = float(np.nanpercentile(r, 99))
+        out["resid_med_px"] = resid_med
+        out["resid_mad_px"] = resid_mad
+        out["resid_p99_px"] = resid_p99
+        out["resid_peak_px"] = resid_p99
+
+        clip_sigma = float(getattr(self.params.P, "wcs_qc_clip_sigma", 3.0))
+        if not np.isfinite(clip_sigma) or clip_sigma <= 0:
+            clip_sigma = 3.0
+        if np.isfinite(resid_mad) and resid_mad > 0:
+            inlier = np.abs(r - resid_med) <= clip_sigma * resid_mad
+        else:
+            resid_std = float(np.nanstd(r))
+            if np.isfinite(resid_std) and resid_std > 0:
+                inlier = np.abs(r - float(np.nanmean(r))) <= clip_sigma * resid_std
+            else:
+                inlier = np.ones(len(r), dtype=bool)
+        n_inlier = int(np.sum(inlier))
+        r_in = r[inlier] if n_inlier > 0 else r
+        out["n_inlier"] = n_inlier
+        out["inlier_rate"] = float(n_inlier / max(n_match, 1))
+        out["rms_px"] = float(np.sqrt(np.nanmean(r_in ** 2))) if len(r_in) else np.nan
+
+        if len(det_keep) >= 8:
+            cx = float(nx) / 2.0
+            cy = float(ny) / 2.0
+            rr = np.hypot(gaia_xy[gaia_keep, 0] - cx, gaia_xy[gaia_keep, 1] - cy)
+            max_rr = max(float(np.hypot(max(cx, 1.0), max(cy, 1.0))), 1.0)
+            rho = rr / max_rr
+            if np.isfinite(np.nanstd(rho)) and float(np.nanstd(rho)) > 1e-6:
+                try:
+                    out["resid_vs_radius_slope"] = float(np.polyfit(rho, r, 1)[0])
+                except Exception:
+                    out["resid_vs_radius_slope"] = np.nan
+            core = r[rho <= 0.4]
+            edge = r[rho >= 0.8]
+            if len(core) >= 3 and len(edge) >= 3:
+                core_med = float(np.nanmedian(core))
+                if np.isfinite(core_med) and core_med > 1e-9:
+                    out["edge_resid_ratio"] = float(np.nanmedian(edge) / core_med)
+
+        return out
+
+    def _evaluate_wcs_qc_pass(self, metrics: dict, *, wcs_ok: bool) -> tuple[bool, list[str]]:
+        def _num(key: str) -> float:
+            try:
+                return float(metrics.get(key, np.nan))
+            except Exception:
+                return np.nan
+
+        reasons: list[str] = []
+
+        require_wcs_ok = bool(getattr(self.params.P, "wcs_qc_require_wcs_ok", True))
+        if require_wcs_ok and not wcs_ok:
+            reasons.append("wcs_fail")
+
+        n_detect = int(metrics.get("n_detect", 0) or 0)
+        n_match = int(metrics.get("n_match", 0) or 0)
+        if n_detect <= 0:
+            reasons.append("no_detect_data")
+
+        min_match_n = int(getattr(self.params.P, "wcs_qc_min_match_n", 20))
+        if min_match_n > 0 and n_match < min_match_n:
+            reasons.append("low_match_n")
+
+        min_match_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
+        mrate_det = _num("match_rate")
+        mrate_cat = _num("match_rate_cat")
+        mrate_eff = _num("match_rate_eff")
+        if not np.isfinite(mrate_eff):
+            if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
+                mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
+        if np.isfinite(min_match_rate) and min_match_rate > 0:
+            if (not np.isfinite(mrate_eff)) or (mrate_eff < min_match_rate):
+                reasons.append("low_match_rate")
+
+        max_rms_px = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
+        if n_match > 0 and np.isfinite(max_rms_px) and max_rms_px > 0:
+            rms_px = _num("rms_px")
+            if (not np.isfinite(rms_px)) or (rms_px > max_rms_px):
+                reasons.append("high_rms")
+
+        max_p99_px = float(getattr(self.params.P, "wcs_qc_max_p99_px", 5.0))
+        if n_match > 0 and np.isfinite(max_p99_px) and max_p99_px > 0:
+            p99_px = _num("resid_p99_px")
+            if (not np.isfinite(p99_px)) or (p99_px > max_p99_px):
+                reasons.append("high_p99")
+
+        min_inlier_rate = float(getattr(self.params.P, "wcs_qc_min_inlier_rate", 0.50))
+        if n_match > 0 and np.isfinite(min_inlier_rate) and min_inlier_rate > 0:
+            inlier_rate = _num("inlier_rate")
+            if (not np.isfinite(inlier_rate)) or (inlier_rate < min_inlier_rate):
+                reasons.append("low_inlier")
+
+        max_edge_ratio = float(getattr(self.params.P, "wcs_qc_max_edge_ratio", 0.0))
+        edge_ratio = _num("edge_resid_ratio")
+        if np.isfinite(max_edge_ratio) and max_edge_ratio > 0:
+            if np.isfinite(edge_ratio) and edge_ratio > max_edge_ratio:
+                reasons.append("edge_resid")
+
+        max_center_off = float(getattr(self.params.P, "wcs_qc_max_center_offset_arcsec", 0.0))
+        center_off = _num("center_offset_arcsec")
+        if np.isfinite(max_center_off) and max_center_off > 0:
+            if (not np.isfinite(center_off)) or (center_off > max_center_off):
+                reasons.append("center_offset")
+
+        return len(reasons) == 0, reasons
 
     def _load_gaia_cache_if_ok(self, path: Path):
         if not path.exists():
@@ -354,6 +993,8 @@ class WcsWorker(QThread):
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
             raise RuntimeError("astroquery.gaia not available")
+        if self._stop_requested:
+            raise RuntimeError("stopped")
         adql = f"""
     SELECT
       source_id, ra, dec,
@@ -367,8 +1008,38 @@ class WcsWorker(QThread):
     )
         """.strip()
         Gaia.ROW_LIMIT = -1
-        job = Gaia.launch_job_async(adql, dump_to_file=False)
-        tab = job.get_results()
+        def _run_async():
+            job_a = Gaia.launch_job_async(adql, dump_to_file=False)
+            return job_a.get_results()
+
+        tab = None
+        sync_err = None
+        try:
+            # Sync can be faster, but some TAP servers may cap rows near ~2000.
+            job = Gaia.launch_job(adql, dump_to_file=False)
+            tab = job.get_results()
+            try:
+                if int(len(tab)) >= 1900:
+                    tab_async = _run_async()
+                    if int(len(tab_async)) > int(len(tab)):
+                        tab = tab_async
+            except Exception:
+                pass
+        except Exception as e:
+            sync_err = e
+
+        if tab is None:
+            if self._stop_requested:
+                raise RuntimeError("stopped")
+            try:
+                tab = _run_async()
+            except Exception as async_err:
+                if sync_err is not None:
+                    raise RuntimeError(
+                        "Gaia TAP query failed "
+                        f"(sync={_exc_brief(sync_err)}, async={_exc_brief(async_err)})"
+                    ) from async_err
+                raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(async_err)}") from async_err
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
         return tab.to_pandas()
@@ -393,6 +1064,71 @@ class WcsWorker(QThread):
         mag_max = float(getattr(self.params.P, "gaia_mag_max", 18.0))
         allow_no_cache = bool(getattr(self.params.P, "gaia_allow_no_cache", True))
 
+        def _cache_mag_max(df_in: pd.DataFrame, meta_in: dict | None) -> float:
+            try:
+                if isinstance(meta_in, dict) and ("mag_max" in meta_in):
+                    v = float(meta_in.get("mag_max"))
+                    if np.isfinite(v):
+                        return v
+            except Exception:
+                pass
+            try:
+                if "phot_g_mean_mag" in df_in.columns:
+                    g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+                    if g.notna().any():
+                        return float(g.max())
+            except Exception:
+                pass
+            return np.nan
+
+        def _filter_cache_by_mag(df_in: pd.DataFrame) -> pd.DataFrame:
+            if not np.isfinite(mag_max):
+                return df_in
+            if "phot_g_mean_mag" not in df_in.columns:
+                return df_in
+            g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+            keep = g.notna() & (g <= float(mag_max))
+            return df_in.loc[keep].copy()
+
+        def _cache_covers_field(df_in: pd.DataFrame, ctr: SkyCoord, rad_deg: float) -> bool:
+            # Guard against stale/misaligned Gaia caches that cover only part of the requested field.
+            try:
+                ra = pd.to_numeric(df_in.get("ra"), errors="coerce")
+                dec = pd.to_numeric(df_in.get("dec"), errors="coerce")
+            except Exception:
+                return False
+            m = ra.notna() & dec.notna()
+            n = int(m.sum())
+            if n <= 0:
+                return False
+            if n < 50:
+                return True
+            ra_v = ra[m].to_numpy(float)
+            dec_v = dec[m].to_numpy(float)
+            cos_dec = float(np.cos(np.deg2rad(float(ctr.dec.deg))))
+            if not np.isfinite(cos_dec) or cos_dec <= 0:
+                cos_dec = 1.0
+            dx = (ra_v - float(ctr.ra.deg)) * cos_dec
+            dy = dec_v - float(ctr.dec.deg)
+            if dx.size == 0 or dy.size == 0:
+                return False
+            side_frac = 0.60 if n >= 200 else 0.45
+            need = float(rad_deg) * side_frac
+            min_x = float(np.nanmin(dx))
+            max_x = float(np.nanmax(dx))
+            min_y = float(np.nanmin(dy))
+            max_y = float(np.nanmax(dy))
+            return bool(
+                np.isfinite(min_x)
+                and np.isfinite(max_x)
+                and np.isfinite(min_y)
+                and np.isfinite(max_y)
+                and (min_x <= -need)
+                and (max_x >= need)
+                and (min_y <= -need)
+                and (max_y >= need)
+            )
+
         # 캐시 유효성 체크 - 좌표가 맞는지 확인
         cache_valid = False
         df_cache = None
@@ -409,18 +1145,30 @@ class WcsWorker(QThread):
                 cached_ra = float(meta.get("center_ra_deg", 0))
                 cached_dec = float(meta.get("center_dec_deg", 0))
                 cached_radius = float(meta.get("radius_deg", 0))
+                cached_mag_max = _cache_mag_max(df_cache, meta)
                 # 중심 좌표가 0.1도 이내이고 반경이 비슷하면 캐시 사용
                 dist_deg = np.hypot(center.ra.deg - cached_ra, center.dec.deg - cached_dec)
-                if dist_deg < 0.1 and cached_radius >= radius_deg * 0.9:
+                same_field = bool(dist_deg < 0.03 and cached_radius >= radius_deg * 0.9)
+                mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+                coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+                if same_field and mag_ok and coverage_ok:
                     cache_valid = True
+                elif same_field and mag_ok and (not coverage_ok):
+                    self._log("[Gaia] cache rejected: field coverage mismatch; re-querying Gaia.")
             except Exception:
                 pass
         elif df_cache is not None:
             # 메타 파일이 없으면 일단 캐시 사용 (이전 버전 호환)
-            cache_valid = True
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+            if mag_ok and coverage_ok:
+                cache_valid = True
+            elif mag_ok and (not coverage_ok):
+                self._log("[Gaia] legacy cache rejected: field coverage mismatch; re-querying Gaia.")
 
         if cache_valid and df_cache is not None:
-            return df_cache, "cache"
+            return _filter_cache_by_mag(df_cache), "cache"
         if not _HAS_GAIA:
             if allow_no_cache:
                 return pd.DataFrame(), "no_gaia_module"
@@ -428,6 +1176,8 @@ class WcsWorker(QThread):
 
         last_err = None
         for att in range(1, max(1, retry) + 1):
+            if self._stop_requested:
+                raise RuntimeError("stopped")
             try:
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
@@ -445,15 +1195,43 @@ class WcsWorker(QThread):
                     pass
                 return df, "query"
             except Exception as e:
+                if self._stop_requested:
+                    raise RuntimeError("stopped")
                 last_err = e
                 if att < retry:
-                    time.sleep(backoff_s)
+                    slept = 0.0
+                    while slept < backoff_s:
+                        if self._stop_requested:
+                            raise RuntimeError("stopped")
+                        dt = min(0.25, backoff_s - slept)
+                        time.sleep(dt)
+                        slept += dt
 
         df_cache = self._load_gaia_cache_if_ok(cache_path)
         if df_cache is not None:
-            return df_cache, "cache(after_fail)"
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            if mag_ok:
+                return _filter_cache_by_mag(df_cache), "cache(after_fail)"
+            if allow_no_cache:
+                if last_err is None:
+                    return pd.DataFrame(), f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f}"
+                return pd.DataFrame(), (
+                    f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f};"
+                    f"query_failed:{_exc_brief(last_err, limit=140)}"
+                )
+            if last_err is None:
+                raise RuntimeError(
+                    f"Gaia cache too shallow (cache_mag_max={cached_mag_max:.2f}, required={mag_max:.2f})"
+                )
+            raise RuntimeError(
+                f"Gaia query failed and cache too shallow "
+                f"(cache_mag_max={cached_mag_max:.2f}, required={mag_max:.2f}): {last_err}"
+            )
         if allow_no_cache:
-            return pd.DataFrame(), f"fail_no_cache:{type(last_err).__name__}"
+            if last_err is None:
+                return pd.DataFrame(), "fail_no_cache:unknown"
+            return pd.DataFrame(), f"fail_no_cache:{_exc_brief(last_err, limit=180)}"
         raise RuntimeError(f"Gaia query failed: {last_err}")
 
     def _refine_crpix_by_match(self, w: WCS, hdr: fits.Header, det_xy: np.ndarray,
@@ -540,12 +1318,70 @@ class WcsWorker(QThread):
             cmd += ["-D", db]
         try:
             start = time.time()
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout_s = ""
+            stderr_s = ""
+            while True:
+                if self._stop_requested:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        out_s, err_s = proc.communicate(timeout=0.5)
+                        stdout_s = out_s or ""
+                        stderr_s = err_s or ""
+                    except Exception:
+                        pass
+                    err_msg = "stopped"
+                    err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
+                    if err_tail:
+                        err_msg = f"stopped | {err_tail}"
+                    return False, -997, time.time() - start, stdout_s, err_msg, cmd
+
+                elapsed = time.time() - start
+                if elapsed >= timeout_s:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        out_s, err_s = proc.communicate(timeout=0.5)
+                        stdout_s = out_s or ""
+                        stderr_s = err_s or ""
+                    except Exception:
+                        pass
+                    err_msg = "timeout"
+                    err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
+                    if err_tail:
+                        err_msg = f"timeout | {err_tail}"
+                    return False, -999, timeout_s, stdout_s, err_msg, cmd
+
+                try:
+                    out_s, err_s = proc.communicate(timeout=0.2)
+                    stdout_s = out_s or ""
+                    stderr_s = err_s or ""
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
             dt = time.time() - start
-            ok = (cp.returncode == 0)
-            return ok, cp.returncode, dt, cp.stdout, cp.stderr, cmd
-        except subprocess.TimeoutExpired:
-            return False, -999, timeout_s, "", "timeout", cmd
+            rc = int(proc.returncode if proc.returncode is not None else -998)
+            ok = (rc == 0)
+            return ok, rc, dt, stdout_s, stderr_s, cmd
         except Exception as e:
             return False, -998, 0.0, "", str(e), cmd
 
@@ -584,6 +1420,7 @@ class WcsWorker(QThread):
             astap_radius = float(getattr(self.params.P, "astap_search_radius_deg", 8.0))
             astap_db = str(getattr(self.params.P, "astap_database", "D50") or "").strip()
             astap_fov_fudge = float(getattr(self.params.P, "astap_fov_fudge", 1.0))
+            astnet_local_enable = bool(getattr(self.params.P, "astnet_local_enable", False))
             astnet_use_wsl = bool(getattr(self.params.P, "astnet_local_use_wsl", True))
             astnet_timeout_s = float(getattr(self.params.P, "astnet_local_timeout_s", 300.0))
             astnet_downsample = int(getattr(self.params.P, "astnet_local_downsample", 2))
@@ -599,18 +1436,36 @@ class WcsWorker(QThread):
             log_path = self.cache_dir / "wcs_solve.log"
 
             def L(msg):
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                line = f"{ts} {msg}"
                 try:
                     with open(log_path, "a", encoding="utf-8") as fh:
-                        fh.write(msg + "\n")
+                        fh.write(line + "\n")
                 except Exception:
                     pass
 
-            L(f"[WCS] astap_timeout_s={astap_timeout} astap_radius_deg={astap_radius} astap_db={astap_db or 'default'} astap_fov_fudge={astap_fov_fudge}")
-            L(f"[WCS] astnet_local_use_wsl={astnet_use_wsl} timeout_s={astnet_timeout_s} downsample={astnet_downsample}")
+            def log_cmd_failure(tag, fname, reason, cmd=None, stdout=None, stderr=None):
+                L(f"{fname}: {tag} fail reason={reason}")
+                if cmd:
+                    L(f"{fname}: {tag} cmd={' '.join(str(c) for c in cmd)}")
+                out_tail = _tail_text(stdout, limit=1600, max_lines=12)
+                err_tail = _tail_text(stderr, limit=1600, max_lines=12)
+                if out_tail:
+                    L(f"{fname}: {tag} stdout_tail={out_tail}")
+                if err_tail:
+                    L(f"{fname}: {tag} stderr_tail={err_tail}")
 
-            # Determine Gaia center
-            # For multi-night/offset observations, use project target coordinates first.
-            # FITS OBJCTRA/OBJCTDEC is used only as a fallback when project target is missing.
+            L("=" * 60)
+            L(f"[WCS] start files={len(files)} use_cropped={self.use_cropped} cache_dir={self.cache_dir}")
+            L(f"[WCS] astap_timeout_s={astap_timeout} astap_radius_deg={astap_radius} astap_db={astap_db or 'default'} astap_fov_fudge={astap_fov_fudge}")
+            L(
+                f"[WCS] astnet_local_enable={astnet_local_enable} use_wsl={astnet_use_wsl} "
+                f"timeout_s={astnet_timeout_s} downsample={astnet_downsample} "
+                f"scale=[{astnet_scale_low:.5f},{astnet_scale_high:.5f}] radius_deg={astnet_radius_deg}"
+            )
+
+            # Determine Gaia center - PRIORITY: FITS header > project_state
+            # FITS header OBJCTRA/OBJCTDEC is more reliable as it comes from the actual observation
             header_coord = None
             try:
                 sample = files[0]
@@ -629,38 +1484,28 @@ class WcsWorker(QThread):
 
             # Decide which coordinate to use
             center_coord = None
-            max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
-            warn_sep_deg = float(getattr(self.params.P, "wcs_header_coord_warn_sep_deg", 0.5))
             if header_coord is not None and self.target_coord is not None:
-                try:
-                    sep_deg = float(header_coord.separation(self.target_coord).deg)
-                except Exception:
-                    sep_deg = np.nan
-                if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
-                    center_coord = self.target_coord
-                    L(
-                        f"[WCS] WARNING: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg; "
-                        f"using project target."
-                    )
-                else:
+                # Both available - check if they match
+                sep_deg = float(header_coord.separation(self.target_coord).deg)
+                if sep_deg > 5.0:
+                    L(f"[WCS] WARNING: FITS header coords differ by {sep_deg:.2f}deg from project_state, using header")
                     center_coord = header_coord
-                    if np.isfinite(sep_deg) and sep_deg > warn_sep_deg:
-                        L(
-                            f"[WCS] INFO: header/project offset={sep_deg:.3f}deg; "
-                            f"using header center."
-                        )
+                else:
+                    center_coord = self.target_coord
             elif header_coord is not None:
                 center_coord = header_coord
-                L("[WCS] Using FITS OBJCTRA/OBJCTDEC center (project target unavailable).")
             elif self.target_coord is not None:
                 center_coord = self.target_coord
-                L("[WCS] Using project target center (header center unavailable).")
 
             if center_coord is None:
                 raise RuntimeError("Target coordinate not set (SIMBAD/OBJCTRA/OBJCTDEC missing).")
 
             # Gaia query/cache
+            if self._stop_requested:
+                self.finished.emit({"stopped": True, "total": 0, "ok": 0, "wcs_qc_pass": 0})
+                return
             gaia_fudge = float(getattr(self.params.P, "gaia_radius_fudge", 1.35))
+            gaia_mag_max = float(getattr(self.params.P, "gaia_mag_max", 18.0))
             sample = files[0]
             if self.use_cropped:
                 sample_path = step2_cropped_dir(self.result_dir) / sample
@@ -675,8 +1520,27 @@ class WcsWorker(QThread):
             fov_h = (ny0 * pix_arc) / 3600.0
             diag_deg = float(np.hypot(fov_w, fov_h))
             gaia_r = float(0.5 * diag_deg * gaia_fudge)
+            L(
+                f"[WCS] sample={sample} shape={nx0}x{ny0} pix_arcsec={pix_arc:.5f} "
+                f"fov_w={fov_w:.5f}deg fov_h={fov_h:.5f}deg diag={diag_deg:.5f}deg "
+                f"gaia_r={gaia_r:.5f}deg"
+            )
             gaia_df, gaia_src = self._load_or_query_gaia(center_coord, gaia_r)
-            L(f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) r={gaia_r:.4f}deg source={gaia_src} N={len(gaia_df)}")
+            if self._stop_requested:
+                self.finished.emit({"stopped": True, "total": 0, "ok": 0, "wcs_qc_pass": 0})
+                return
+            L(
+                f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) "
+                f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} source={gaia_src} N={len(gaia_df)}"
+            )
+            gaia_ra_vals = np.array([], dtype=float)
+            gaia_dec_vals = np.array([], dtype=float)
+            if isinstance(gaia_df, pd.DataFrame) and (not gaia_df.empty) and {"ra", "dec"} <= set(gaia_df.columns):
+                gaia_ra_vals = pd.to_numeric(gaia_df["ra"], errors="coerce").to_numpy(float)
+                gaia_dec_vals = pd.to_numeric(gaia_df["dec"], errors="coerce").to_numpy(float)
+                ok_rd = np.isfinite(gaia_ra_vals) & np.isfinite(gaia_dec_vals)
+                gaia_ra_vals = gaia_ra_vals[ok_rd]
+                gaia_dec_vals = gaia_dec_vals[ok_rd]
 
             def solve_one(filename):
                 if self._stop_requested:
@@ -686,72 +1550,102 @@ class WcsWorker(QThread):
                     fits_path = step2_cropped_dir(self.result_dir) / filename
                 else:
                     fits_path = self.params.get_file_path(filename)
+                source_sig = _build_source_signature(Path(fits_path), use_cropped=bool(self.use_cropped))
 
                 status = "fail"
+                fail_reason = ""
                 pix_fit = np.nan
                 wcs_ok = False
                 refine_note = ""
                 resid_med = np.nan
                 resid_max = np.nan
                 match_n = 0
+                rc = -998
+                dt_astap = 0.0
+                ok_astap = False
+                astap_cmd = []
+                astap_stdout = ""
+                astap_stderr = ""
+                astnet_reason = ""
+                det_xy = self._load_detect_xy(filename)
+                qc_metrics = self._empty_wcs_qc_metrics(n_detect=len(det_xy))
+                qc_metrics["pix_scale_input_arcsec"] = float(pix_arc) if np.isfinite(pix_arc) else np.nan
 
                 with fits.open(fits_path, memmap=False, ignore_missing_simple=True) as hdul:
                     hdr = hdul[0].header
                     data = hdul[0].data
                     if data is None:
-                        return filename, {"ok": False, "status": "data_none"}
+                        return filename, {
+                            "fname": filename,
+                            "ok": False,
+                            "status": "data_none",
+                            "wcs_ok": False,
+                            "pix_fit": None,
+                            "elapsed": 0.0,
+                            "fail_reason": "data_none",
+                            "refine": "",
+                            "solver": "astap",
+                            "wcs_qc_pass": False,
+                            "wcs_qc_reason": "data_none,wcs_fail",
+                            **source_sig,
+                            **qc_metrics,
+                        }
                     ny, nx = data.shape
 
-                # Per-frame center for solve-field:
-                # header first, then project target. If they disagree too much, use target.
-                solve_center_coord = None
-                header_frame_coord = None
-                try:
-                    ra_h = hdr.get("OBJCTRA", None)
-                    dec_h = hdr.get("OBJCTDEC", None)
-                    if ra_h is not None and dec_h is not None:
-                        header_frame_coord = SkyCoord(str(ra_h), str(dec_h), unit=(u.hourangle, u.deg))
-                except Exception:
-                    header_frame_coord = None
-
-                max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
-                if header_frame_coord is not None and self.target_coord is not None:
-                    try:
-                        sep_deg = float(header_frame_coord.separation(self.target_coord).deg)
-                    except Exception:
-                        sep_deg = np.nan
-                    if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
-                        solve_center_coord = self.target_coord
-                        L(
-                            f"{filename}: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg; "
-                            f"using project target."
-                        )
-                    else:
-                        solve_center_coord = header_frame_coord
-                elif header_frame_coord is not None:
-                    solve_center_coord = header_frame_coord
-                elif self.target_coord is not None:
-                    solve_center_coord = self.target_coord
-                else:
-                    solve_center_coord = center_coord
-
+                if self._stop_requested:
+                    return filename, None
                 fov_w_deg = (nx * pix_arc) / 3600.0 * astap_fov_fudge
                 fov_h_deg = (ny * pix_arc) / 3600.0 * astap_fov_fudge
                 fov_deg = float(max(fov_w_deg, fov_h_deg))
 
-                ok_astap, rc, dt_astap, out_s, err_s, cmd = self._run_astap(
+                ok_astap, rc, dt_astap, astap_stdout, astap_stderr, astap_cmd = self._run_astap(
                     fits_path, fov_deg=fov_deg, radius_deg=astap_radius, timeout_s=astap_timeout
                 )
-                cmd_str = " ".join(str(c) for c in cmd)
+                if self._stop_requested:
+                    return filename, None
+                astap_cmd_str = " ".join(str(c) for c in astap_cmd)
                 if not ok_astap:
-                    L(f"{filename}: ASTAP fail rc={rc} dt={dt_astap:.1f}s err={str(err_s)[:120]}")
-                    L(f"{filename}: ASTAP cmd={cmd_str}")
+                    if rc == -999 or "timeout" in str(astap_stderr).lower():
+                        fail_reason = "astap_timeout"
+                    elif rc == -997 or "stopped" in str(astap_stderr).lower():
+                        fail_reason = "astap_stopped"
+                    else:
+                        fail_reason = f"astap_rc_{rc}"
+                    log_cmd_failure(
+                        "ASTAP",
+                        filename,
+                        f"{fail_reason}, dt={dt_astap:.1f}s",
+                        cmd=astap_cmd,
+                        stdout=astap_stdout,
+                        stderr=astap_stderr,
+                    )
+                    if not astnet_local_enable:
+                        qc_metrics["pix_scale_fit_arcsec"] = np.nan
+                        return filename, {
+                            "fname": filename,
+                            "ok": False,
+                            "status": f"astap_fail rc={rc}",
+                            "wcs_ok": False,
+                            "pix_fit": pix_fit,
+                            "elapsed": float(dt_astap),
+                            "fail_reason": fail_reason,
+                            "refine": refine_note,
+                            "solver": "astap",
+                            "astap_cmd": astap_cmd_str,
+                            "astap_stdout": _tail_text(astap_stdout, limit=2000, max_lines=12),
+                            "astap_stderr": _tail_text(astap_stderr, limit=2000, max_lines=12),
+                            "wcs_qc_pass": False,
+                            "wcs_qc_reason": "astap_fail,wcs_fail",
+                            **source_sig,
+                            **qc_metrics,
+                        }
 
                 astnet_ok = False
                 astnet_dt = np.nan
                 astnet_stdout = ""
                 astnet_stderr = ""
                 astnet_cmd = []
+                astnet_cmd_str = ""
                 astnet_new_path = None
                 solver = "astap"
                 used_elapsed = float(dt_astap)
@@ -760,6 +1654,7 @@ class WcsWorker(QThread):
                 with fits.open(fits_path, memmap=False, ignore_missing_simple=True) as hdul:
                     hdr = hdul[0].header
                     data = hdul[0].data
+                    w_final = None
                     wcs_ok = False
                     if ok_astap:
                         try:
@@ -771,7 +1666,7 @@ class WcsWorker(QThread):
                         if not wcs_ok:
                             wcs_ok = self._try_ingest_wcs(fits_path, hdr)
 
-                    if (not ok_astap or not wcs_ok):
+                    if (not ok_astap or not wcs_ok) and astnet_local_enable:
                         scale_low = astnet_scale_low
                         scale_high = astnet_scale_high
                         if scale_low <= 0 or scale_high <= 0:
@@ -782,7 +1677,7 @@ class WcsWorker(QThread):
                         astnet_ok, astnet_dt, astnet_stdout, astnet_stderr, astnet_cmd, astnet_new_path = (
                             self._run_solve_field(
                                 fits_path,
-                                center_coord=solve_center_coord,
+                                center_coord=center_coord,
                                 scale_low=scale_low,
                                 scale_high=scale_high,
                                 radius_deg=astnet_radius_deg,
@@ -795,44 +1690,41 @@ class WcsWorker(QThread):
                                 cpulimit_s=astnet_cpulimit_s,
                             )
                         )
-                        if (not astnet_ok) and (solve_center_coord is not None):
-                            L(f"[ASTNET_WSL] {filename} constrained solve failed; retrying blind.")
-                            astnet_ok2, astnet_dt2, astnet_stdout2, astnet_stderr2, astnet_cmd2, astnet_new_path2 = (
-                                self._run_solve_field(
-                                    fits_path,
-                                    center_coord=None,
-                                    scale_low=scale_low,
-                                    scale_high=scale_high,
-                                    radius_deg=astnet_radius_deg,
-                                    downsample=astnet_downsample,
-                                    timeout_s=max(astnet_timeout_s, 120.0),
-                                    outdir=outdir,
-                                    use_wsl=astnet_use_wsl,
-                                    use_cache=False,
-                                    max_objs=astnet_max_objs,
-                                    cpulimit_s=max(astnet_cpulimit_s, 60.0),
+                        astnet_cmd_str = " ".join(str(c) for c in astnet_cmd)
+                        if astnet_ok:
+                            L(f"[ASTNET_WSL] {filename} success dt={astnet_dt:.1f}s")
+                            if astnet_stderr:
+                                L(f"{filename}: ASTNET_WSL stderr_tail={_tail_text(astnet_stderr, limit=600, max_lines=6)}")
+                        else:
+                            if "timeout" in str(astnet_stderr).lower():
+                                astnet_reason = "astnet_timeout"
+                            elif "stopped" in str(astnet_stderr).lower():
+                                astnet_reason = "astnet_stopped"
+                            elif (
+                                "wsl_path_unavailable" in str(astnet_stderr).lower()
+                                or "wsl_not_found" in str(astnet_stderr).lower()
+                                or "wsl_input_missing" in str(astnet_stderr).lower()
+                                or "input_missing:" in str(astnet_stderr).lower()
+                                or (
+                                    "cannot open `" in str(astnet_stderr).lower()
+                                    and "no such file or directory" in str(astnet_stderr).lower()
                                 )
-                            )
-                            astnet_dt = float(astnet_dt) + float(astnet_dt2)
-                            if astnet_ok2:
-                                astnet_ok = astnet_ok2
-                                astnet_stdout = astnet_stdout2
-                                astnet_stderr = astnet_stderr2
-                                astnet_cmd = astnet_cmd2
-                                astnet_new_path = astnet_new_path2
-                                L(f"[ASTNET_WSL] {filename} blind retry solved.")
+                            ):
+                                astnet_reason = "astnet_wsl_path_unavailable"
+                            elif "cache_hit" in str(astnet_stdout):
+                                astnet_reason = "astnet_cache_miss_solved_marker_missing"
                             else:
-                                if str(astnet_stderr2).strip():
-                                    astnet_stderr = astnet_stderr2
-                                if astnet_cmd2:
-                                    astnet_cmd = astnet_cmd2
-                        cmd_wsl = " ".join(str(c) for c in astnet_cmd)
-                        L(f"[ASTNET_WSL] {filename} ok={astnet_ok} dt={astnet_dt:.1f}s")
-                        L(f"[ASTNET_WSL] cmd={cmd_wsl}")
-                        if astnet_stdout:
-                            L(f"[ASTNET_WSL] stdout={str(astnet_stdout)[:200]}")
-                        if astnet_stderr:
-                            L(f"[ASTNET_WSL] stderr={str(astnet_stderr)[:200]}")
+                                astnet_reason = "astnet_fail_no_solution"
+                            if not fail_reason:
+                                fail_reason = astnet_reason
+                            log_cmd_failure(
+                                "ASTNET_WSL",
+                                filename,
+                                f"{astnet_reason}, dt={astnet_dt:.1f}s",
+                                cmd=astnet_cmd,
+                                stdout=astnet_stdout,
+                                stderr=astnet_stderr,
+                            )
 
                         if astnet_ok and astnet_new_path is not None and astnet_new_path.exists():
                             try:
@@ -861,16 +1753,7 @@ class WcsWorker(QThread):
                         pix_fit = self._pixscale_from_wcs(w)
 
                         refine_enable = bool(getattr(self.params.P, "wcs_refine_enable", True))
-                        if refine_enable and gaia_df is not None:
-                            det_csv = self.cache_dir / f"detect_{filename}.csv"
-                            if det_csv.exists():
-                                try:
-                                    det_xy = pd.read_csv(det_csv)[["x", "y"]].to_numpy(float)
-                                except Exception:
-                                    det_xy = np.zeros((0, 2), float)
-                            else:
-                                det_xy = np.zeros((0, 2), float)
-
+                        if refine_enable and gaia_df is not None and len(gaia_df) > 0 and len(det_xy) > 0:
                             fwhm_px, _ = self._load_fwhm_for_frame(filename)
                             ok_ref, note, rmed, rmax, nmatch = self._refine_crpix_by_match(
                                 w, hdr, det_xy, gaia_df,
@@ -887,6 +1770,17 @@ class WcsWorker(QThread):
 
                         # Use final WCS (refined if available)
                         w_final = WCS(hdr, relax=True)
+                        qc_metrics = self._compute_wcs_qc_metrics(
+                            w=w_final,
+                            det_xy=det_xy,
+                            nx=int(hdr.get("NAXIS1", nx)),
+                            ny=int(hdr.get("NAXIS2", ny)),
+                            gaia_ra_deg=gaia_ra_vals,
+                            gaia_dec_deg=gaia_dec_vals,
+                            pix_input_arcsec=float(pix_arc),
+                            pix_fit_arcsec=float(pix_fit) if np.isfinite(pix_fit) else np.nan,
+                            center_coord=center_coord,
+                        )
 
                         hdr["WCS_OK"] = (True, "WCS solve success")
                         hdr["WCSPIXI"] = (float(pix_arc), "pixscale input (arcsec/pix)")
@@ -919,19 +1813,41 @@ class WcsWorker(QThread):
                     else:
                         hdr["WCS_OK"] = (False, "WCS solve failed")
                         status = f"astap_fail rc={rc}" if not ok_astap else "wcs_missing"
+                        if not fail_reason:
+                            if not ok_astap:
+                                fail_reason = f"astap_rc_{rc}"
+                            elif astnet_local_enable and astnet_reason:
+                                fail_reason = astnet_reason
+                            elif astnet_local_enable:
+                                fail_reason = "astnet_ran_but_wcs_missing"
+                            else:
+                                fail_reason = "wcs_keywords_missing_after_astap"
+                        L(
+                            f"{filename}: final_wcs_fail status={status} fail_reason={fail_reason} "
+                            f"solver={solver} astap_ok={ok_astap} astnet_ok={astnet_ok}"
+                        )
                         # Set defaults for failed WCS
                         wcs_rot_deg = np.nan
                         center_ra = np.nan
                         center_dec = np.nan
                         sip_order = 0
 
+                    qc_pass, qc_reasons = self._evaluate_wcs_qc_pass(qc_metrics, wcs_ok=bool(wcs_ok))
+                    qc_reason = ",".join(qc_reasons)
+
+                if self._stop_requested:
+                    return filename, None
                 # writeto로 확실하게 저장 (Windows 호환)
                 fits.writeto(fits_path, data, hdr, overwrite=True)
+                if self._stop_requested:
+                    return filename, None
 
                 meta = {
                     "fname": filename,
                     "ok": bool(wcs_ok),
+                    "wcs_ok": bool(wcs_ok),
                     "status": status,
+                    "fail_reason": fail_reason,
                     "pix_fit": float(pix_fit) if np.isfinite(pix_fit) else None,
                     "elapsed": float(used_elapsed),
                     "refine": refine_note,
@@ -949,28 +1865,52 @@ class WcsWorker(QThread):
                     "astap_ok": bool(ok_astap),
                     "astap_rc": int(rc),
                     "astap_elapsed": float(dt_astap),
+                    "astap_cmd": astap_cmd_str,
+                    "astap_stdout": _tail_text(astap_stdout, limit=2000, max_lines=12),
+                    "astap_stderr": _tail_text(astap_stderr, limit=2000, max_lines=12),
                     "astnet_wsl_ok": bool(astnet_ok),
                     "astnet_wsl_elapsed": float(astnet_dt) if np.isfinite(astnet_dt) else None,
-                    "astnet_wsl_cmd": " ".join(str(c) for c in astnet_cmd) if astnet_cmd else "",
-                    "astnet_wsl_stdout": str(astnet_stdout)[:2000],
-                    "astnet_wsl_stderr": str(astnet_stderr)[:2000],
+                    "astnet_wsl_fail_reason": astnet_reason,
+                    "astnet_wsl_cmd": astnet_cmd_str,
+                    "astnet_wsl_stdout": _tail_text(astnet_stdout, limit=2000, max_lines=12),
+                    "astnet_wsl_stderr": _tail_text(astnet_stderr, limit=2000, max_lines=12),
+                    "wcs_qc_pass": bool(qc_pass),
+                    "wcs_qc_reason": qc_reason,
+                    **source_sig,
                 }
+                meta.update(qc_metrics)
+                rms_px_val = qc_metrics.get("rms_px", np.nan)
+                try:
+                    rms_px_val = float(rms_px_val)
+                except Exception:
+                    rms_px_val = np.nan
+                rms_px_str = f"{rms_px_val:.3f}" if np.isfinite(rms_px_val) else "-"
                 L(
                     f"{filename}: {status} pix_fit={pix_fit:.4f} dt={used_elapsed:.1f}s "
                     f"refine={refine_note or '-'} resid_med={resid_med if np.isfinite(resid_med) else '-'} "
-                    f"match_n={match_n}"
+                    f"match_n={match_n} wcs_qc={'PASS' if qc_pass else 'FAIL'} "
+                    f"n_det={int(qc_metrics.get('n_detect', 0) or 0)} "
+                    f"n_match={int(qc_metrics.get('n_match', 0) or 0)} "
+                    f"rms_px={rms_px_str} "
+                    f"reason={qc_reason or '-'} "
+                    f"fail_reason={fail_reason or '-'}"
                 )
+                if self._stop_requested:
+                    return filename, None
                 (meta_dir / f"wcs_{filename}.json").write_text(
                     json.dumps(meta, indent=2), encoding="utf-8"
                 )
                 return filename, meta
 
             completed = 0
-            max_workers = get_parallel_workers(self.params)
-            with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+            _default_workers = get_parallel_workers(self.params)
+            max_workers = int(getattr(self.params.P, "wcs_max_workers", _default_workers))
+            with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
                 futures = {ex.submit(solve_one, f): f for f in files}
                 for fut in as_completed(futures):
                     if self._stop_requested:
+                        for f_cancel in futures:
+                            f_cancel.cancel()
                         break
                     fname = futures[fut]
                     completed += 1
@@ -982,6 +1922,7 @@ class WcsWorker(QThread):
                         else:
                             self.error.emit(fname, "stopped")
                     except Exception as e:
+                        L(f"{fname}: worker_exception={_exc_brief(e)}")
                         self.error.emit(fname, str(e))
                     self.progress.emit(completed, len(files), fname)
 
@@ -991,12 +1932,61 @@ class WcsWorker(QThread):
                 step5_out = step5_dir(self.result_dir)
                 step5_out.mkdir(parents=True, exist_ok=True)
                 df.to_csv(step5_out / "wcs_solve_summary.csv", index=False)
+                qc_cols = [
+                    "fname",
+                    "status",
+                    "fail_reason",
+                    "ok",
+                    "wcs_ok",
+                    "solver",
+                    "elapsed",
+                    "source_path",
+                    "source_use_cropped",
+                    "source_size",
+                    "source_mtime_ns",
+                    "n_detect",
+                    "n_catalog_in_fov",
+                    "n_match",
+                    "n_inlier",
+                    "match_rate",
+                    "match_rate_cat",
+                    "match_rate_eff",
+                    "match_radius_arcsec",
+                    "match_radius_px",
+                    "dx_med_px",
+                    "dy_med_px",
+                    "resid_med_px",
+                    "resid_mad_px",
+                    "resid_p99_px",
+                    "resid_peak_px",
+                    "rms_px",
+                    "inlier_rate",
+                    "resid_vs_radius_slope",
+                    "edge_resid_ratio",
+                    "pix_scale_input_arcsec",
+                    "pix_scale_fit_arcsec",
+                    "scale_delta_pct",
+                    "wcs_rot_deg",
+                    "center_ra_deg",
+                    "center_dec_deg",
+                    "center_offset_arcsec",
+                    "sip_order",
+                    "wcs_qc_pass",
+                    "wcs_qc_reason",
+                ]
+                qc_df = df[[c for c in qc_cols if c in df.columns]].copy()
+                if "fname" in qc_df.columns and "file" not in qc_df.columns:
+                    qc_df = qc_df.rename(columns={"fname": "file"})
+                qc_df.to_csv(step5_out / "frame_wcs_qc.csv", index=False)
             except Exception:
                 pass
 
+            n_qc_pass = sum(1 for r in results if bool(r.get("wcs_qc_pass", False)))
             summary = {
                 "total": len(results),
                 "ok": sum(1 for r in results if r.get("ok")),
+                "wcs_qc_pass": int(n_qc_pass),
+                "stopped": bool(self._stop_requested),
             }
             self.finished.emit(summary)
         except Exception as e:
@@ -1024,6 +2014,8 @@ class AstrometryNetWorker(QThread):
         self.use_cropped = use_cropped
         self.target_coord = target_coord
         self._stop_requested = False
+        self._legacy_detect_warned = set()
+        self._detect_csv_fallback_warned = set()
 
     def stop(self):
         self._stop_requested = True
@@ -1052,6 +2044,8 @@ class AstrometryNetWorker(QThread):
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
             raise RuntimeError("astroquery.gaia not available")
+        if self._stop_requested:
+            raise RuntimeError("stopped")
         adql = f"""
     SELECT
       source_id, ra, dec,
@@ -1065,8 +2059,38 @@ class AstrometryNetWorker(QThread):
     )
         """.strip()
         Gaia.ROW_LIMIT = -1
-        job = Gaia.launch_job_async(adql, dump_to_file=False)
-        tab = job.get_results()
+        def _run_async():
+            job_a = Gaia.launch_job_async(adql, dump_to_file=False)
+            return job_a.get_results()
+
+        tab = None
+        sync_err = None
+        try:
+            # Sync can be faster, but some TAP servers may cap rows near ~2000.
+            job = Gaia.launch_job(adql, dump_to_file=False)
+            tab = job.get_results()
+            try:
+                if int(len(tab)) >= 1900:
+                    tab_async = _run_async()
+                    if int(len(tab_async)) > int(len(tab)):
+                        tab = tab_async
+            except Exception:
+                pass
+        except Exception as e:
+            sync_err = e
+
+        if tab is None:
+            if self._stop_requested:
+                raise RuntimeError("stopped")
+            try:
+                tab = _run_async()
+            except Exception as async_err:
+                if sync_err is not None:
+                    raise RuntimeError(
+                        "Gaia TAP query failed "
+                        f"(sync={_exc_brief(sync_err)}, async={_exc_brief(async_err)})"
+                    ) from async_err
+                raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(async_err)}") from async_err
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
         return tab.to_pandas()
@@ -1091,6 +2115,71 @@ class AstrometryNetWorker(QThread):
         mag_max = float(getattr(self.params.P, "gaia_mag_max", 18.0))
         allow_no_cache = bool(getattr(self.params.P, "gaia_allow_no_cache", True))
 
+        def _cache_mag_max(df_in: pd.DataFrame, meta_in: dict | None) -> float:
+            try:
+                if isinstance(meta_in, dict) and ("mag_max" in meta_in):
+                    v = float(meta_in.get("mag_max"))
+                    if np.isfinite(v):
+                        return v
+            except Exception:
+                pass
+            try:
+                if "phot_g_mean_mag" in df_in.columns:
+                    g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+                    if g.notna().any():
+                        return float(g.max())
+            except Exception:
+                pass
+            return np.nan
+
+        def _filter_cache_by_mag(df_in: pd.DataFrame) -> pd.DataFrame:
+            if not np.isfinite(mag_max):
+                return df_in
+            if "phot_g_mean_mag" not in df_in.columns:
+                return df_in
+            g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+            keep = g.notna() & (g <= float(mag_max))
+            return df_in.loc[keep].copy()
+
+        def _cache_covers_field(df_in: pd.DataFrame, ctr: SkyCoord, rad_deg: float) -> bool:
+            # Guard against stale/misaligned Gaia caches that cover only part of the requested field.
+            try:
+                ra = pd.to_numeric(df_in.get("ra"), errors="coerce")
+                dec = pd.to_numeric(df_in.get("dec"), errors="coerce")
+            except Exception:
+                return False
+            m = ra.notna() & dec.notna()
+            n = int(m.sum())
+            if n <= 0:
+                return False
+            if n < 50:
+                return True
+            ra_v = ra[m].to_numpy(float)
+            dec_v = dec[m].to_numpy(float)
+            cos_dec = float(np.cos(np.deg2rad(float(ctr.dec.deg))))
+            if not np.isfinite(cos_dec) or cos_dec <= 0:
+                cos_dec = 1.0
+            dx = (ra_v - float(ctr.ra.deg)) * cos_dec
+            dy = dec_v - float(ctr.dec.deg)
+            if dx.size == 0 or dy.size == 0:
+                return False
+            side_frac = 0.60 if n >= 200 else 0.45
+            need = float(rad_deg) * side_frac
+            min_x = float(np.nanmin(dx))
+            max_x = float(np.nanmax(dx))
+            min_y = float(np.nanmin(dy))
+            max_y = float(np.nanmax(dy))
+            return bool(
+                np.isfinite(min_x)
+                and np.isfinite(max_x)
+                and np.isfinite(min_y)
+                and np.isfinite(max_y)
+                and (min_x <= -need)
+                and (max_x >= need)
+                and (min_y <= -need)
+                and (max_y >= need)
+            )
+
         cache_valid = False
         df_cache = None
         meta_probe = None
@@ -1106,16 +2195,28 @@ class AstrometryNetWorker(QThread):
                 cached_ra = float(meta.get("center_ra_deg", 0))
                 cached_dec = float(meta.get("center_dec_deg", 0))
                 cached_radius = float(meta.get("radius_deg", 0))
+                cached_mag_max = _cache_mag_max(df_cache, meta)
                 dist_deg = np.hypot(center.ra.deg - cached_ra, center.dec.deg - cached_dec)
-                if dist_deg < 0.1 and cached_radius >= radius_deg * 0.9:
+                same_field = bool(dist_deg < 0.03 and cached_radius >= radius_deg * 0.9)
+                mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+                coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+                if same_field and mag_ok and coverage_ok:
                     cache_valid = True
+                elif same_field and mag_ok and (not coverage_ok):
+                    self._log("[Gaia] cache rejected: field coverage mismatch; re-querying Gaia.")
             except Exception:
                 pass
         elif df_cache is not None:
-            cache_valid = True
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+            if mag_ok and coverage_ok:
+                cache_valid = True
+            elif mag_ok and (not coverage_ok):
+                self._log("[Gaia] legacy cache rejected: field coverage mismatch; re-querying Gaia.")
 
         if cache_valid and df_cache is not None:
-            return df_cache, "cache"
+            return _filter_cache_by_mag(df_cache), "cache"
         if not _HAS_GAIA:
             if allow_no_cache:
                 return pd.DataFrame(), "no_gaia_module"
@@ -1123,6 +2224,8 @@ class AstrometryNetWorker(QThread):
 
         last_err = None
         for att in range(1, max(1, retry) + 1):
+            if self._stop_requested:
+                raise RuntimeError("stopped")
             try:
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
@@ -1139,26 +2242,117 @@ class AstrometryNetWorker(QThread):
                     pass
                 return df, "query"
             except Exception as e:
+                if self._stop_requested:
+                    raise RuntimeError("stopped")
                 last_err = e
                 if att < retry:
-                    time.sleep(backoff_s)
+                    slept = 0.0
+                    while slept < backoff_s:
+                        if self._stop_requested:
+                            raise RuntimeError("stopped")
+                        dt = min(0.25, backoff_s - slept)
+                        time.sleep(dt)
+                        slept += dt
 
         df_cache = self._load_gaia_cache_if_ok(cache_path)
         if df_cache is not None:
-            return df_cache, "cache(after_fail)"
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            if mag_ok:
+                return _filter_cache_by_mag(df_cache), "cache(after_fail)"
+            if allow_no_cache:
+                if last_err is None:
+                    return pd.DataFrame(), f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f}"
+                return pd.DataFrame(), (
+                    f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f};"
+                    f"query_failed:{_exc_brief(last_err, limit=140)}"
+                )
+            if last_err is None:
+                raise RuntimeError(
+                    f"Gaia cache too shallow (cache_mag_max={cached_mag_max:.2f}, required={mag_max:.2f})"
+                )
+            raise RuntimeError(
+                f"Gaia query failed and cache too shallow "
+                f"(cache_mag_max={cached_mag_max:.2f}, required={mag_max:.2f}): {last_err}"
+            )
         if allow_no_cache:
-            return pd.DataFrame(), f"fail_no_cache:{type(last_err).__name__}"
+            if last_err is None:
+                return pd.DataFrame(), "fail_no_cache:unknown"
+            return pd.DataFrame(), f"fail_no_cache:{_exc_brief(last_err, limit=180)}"
         raise RuntimeError(f"Gaia query failed: {last_err}")
 
+    def _resolve_source_fits_path(self, fname: str) -> Path | None:
+        if self.use_cropped:
+            cand = step2_cropped_dir(self.result_dir) / fname
+            if cand.exists():
+                return cand
+            legacy = self.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        try:
+            orig = Path(self.params.get_file_path(fname))
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        return None
+
+    def _compatible_detect_signature(self, fname: str) -> dict | None:
+        src = self._resolve_source_fits_path(fname)
+        if src is None or not src.exists():
+            return None
+        return _build_source_signature(src, use_cropped=bool(self.use_cropped))
+
+    def _detect_meta_matches(self, payload: dict, sig_now: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict) or not isinstance(sig_now, dict):
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return False
+        if not _source_signature_detection_compatible(payload, sig_now):
+            return False
+        return True
+
+    def _legacy_detect_cache_allowed(self, marker_path: Path) -> bool:
+        try:
+            marker_mtime = int(marker_path.stat().st_mtime_ns)
+        except Exception:
+            return False
+        if self.use_cropped:
+            rect_path = crop_rect_path(self.result_dir)
+            if rect_path.exists():
+                try:
+                    rect_mtime = int(rect_path.stat().st_mtime_ns)
+                    if marker_mtime < rect_mtime:
+                        return False
+                except Exception:
+                    return False
+        return True
+
     def _load_fwhm_for_frame(self, fname: str):
-        meta_json = self.cache_dir / f"detect_{fname}.json"
-        if not meta_json.exists():
-            fallback = step4_dir(self.result_dir) / f"detect_{fname}.json"
-            if fallback.exists():
-                meta_json = fallback
-        if meta_json.exists():
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
+            return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
+        candidates = [
+            self.cache_dir / f"detect_{fname}.json",
+            step4_dir(self.result_dir) / f"detect_{fname}.json",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
+        fallback_meta = None
+        for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if fallback_meta is None:
+                fallback_meta = meta
+            if not self._detect_meta_matches(meta, sig_now, meta_json):
+                continue
+            try:
                 fpx = float(
                     meta.get(
                         "fwhm_med_rad_px",
@@ -1173,23 +2367,399 @@ class AstrometryNetWorker(QThread):
                 )
                 return fpx, farc
             except Exception:
+                continue
+        if fallback_meta is not None:
+            try:
+                fpx = float(
+                    fallback_meta.get(
+                        "fwhm_med_rad_px",
+                        fallback_meta.get("fwhm_med_px", fallback_meta.get("fwhm_px", np.nan)),
+                    )
+                )
+                farc = float(
+                    fallback_meta.get(
+                        "fwhm_med_rad_arcsec",
+                        fallback_meta.get("fwhm_med_arc", fallback_meta.get("fwhm_arcsec", np.nan)),
+                    )
+                )
+                return fpx, farc
+            except Exception:
                 pass
+        for meta_json in candidates:
+            try:
+                meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            try:
+                schema = int(meta.get("cache_schema", 0) or 0)
+            except Exception:
+                schema = 0
+            if schema >= 2:
+                continue
+            if not self._legacy_detect_cache_allowed(meta_json):
+                continue
+            try:
+                fpx = float(
+                    meta.get(
+                        "fwhm_med_rad_px",
+                        meta.get("fwhm_med_px", meta.get("fwhm_px", np.nan)),
+                    )
+                )
+                farc = float(
+                    meta.get(
+                        "fwhm_med_rad_arcsec",
+                        meta.get("fwhm_med_arc", meta.get("fwhm_arcsec", np.nan)),
+                    )
+                )
+                return fpx, farc
+            except Exception:
+                continue
         return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
 
     def _load_detect_xy(self, fname: str):
-        csv_path = self.cache_dir / f"detect_{fname}.csv"
-        if not csv_path.exists():
-            fallback = step4_dir(self.result_dir) / f"detect_{fname}.csv"
-            if fallback.exists():
-                csv_path = fallback
-            else:
-                return np.empty((0, 2)), None
-        try:
-            df = pd.read_csv(csv_path)
-            xy = df[["x", "y"]].values
-            return xy, df
-        except Exception:
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
             return np.empty((0, 2)), None
+        candidates = [
+            self.cache_dir / f"detect_{fname}.csv",
+            step4_dir(self.result_dir) / f"detect_{fname}.csv",
+        ]
+        fallback_candidate = None
+        for csv_path in candidates:
+            if not csv_path.exists():
+                continue
+            if fallback_candidate is None and csv_path.stat().st_size > 0:
+                fallback_candidate = csv_path
+            meta_path = csv_path.with_suffix(".json")
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._detect_meta_matches(payload, sig_now, meta_path):
+                continue
+            try:
+                df = pd.read_csv(csv_path)
+                if not {"x", "y"} <= set(df.columns):
+                    continue
+                xy = df[["x", "y"]].to_numpy(float)
+                xy = xy[np.isfinite(xy).all(axis=1)]
+                return xy, df
+            except Exception:
+                continue
+        for csv_path in candidates:
+            if not csv_path.exists():
+                continue
+            meta_path = csv_path.with_suffix(".json")
+            schema = 0
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                    schema = int(payload.get("cache_schema", 0) or 0)
+                except Exception:
+                    continue
+            if schema >= 2:
+                continue
+            marker_path = meta_path if meta_path.exists() else csv_path
+            if not self._legacy_detect_cache_allowed(marker_path):
+                continue
+            try:
+                df = pd.read_csv(csv_path)
+                if not {"x", "y"} <= set(df.columns):
+                    continue
+                xy = df[["x", "y"]].to_numpy(float)
+                xy = xy[np.isfinite(xy).all(axis=1)]
+                try:
+                    if fname not in self._legacy_detect_warned:
+                        self._legacy_detect_warned.add(str(fname))
+                        self.log_message.emit(
+                            f"[Refine] {fname}: using legacy detection cache (re-run Step4 recommended)."
+                        )
+                except Exception:
+                    pass
+                return xy, df
+            except Exception:
+                continue
+        if fallback_candidate is not None:
+            try:
+                df = pd.read_csv(fallback_candidate)
+                if {"x", "y"} <= set(df.columns):
+                    xy = df[["x", "y"]].to_numpy(float)
+                    xy = xy[np.isfinite(xy).all(axis=1)]
+                    if fname not in self._detect_csv_fallback_warned:
+                        self._detect_csv_fallback_warned.add(str(fname))
+                        self.log_message.emit(
+                            f"[Refine] {fname}: using detection CSV despite incompatible meta "
+                            f"(cache signature drift; re-run Step4 recommended)."
+                        )
+                    return xy, df
+            except Exception:
+                pass
+        return np.empty((0, 2)), None
+
+    def _wcs_rotation_deg(self, w: WCS) -> float:
+        try:
+            if not w.has_celestial:
+                return float("nan")
+            if hasattr(w.wcs, "cd") and w.wcs.cd is not None:
+                cd = w.wcs.cd
+            elif hasattr(w.wcs, "pc") and w.wcs.pc is not None:
+                pc = w.wcs.pc
+                cdelt = w.wcs.cdelt
+                cd = pc * cdelt[:, np.newaxis]
+            else:
+                return float("nan")
+            rot_rad = np.arctan2(-cd[0, 1], cd[1, 1])
+            return float(np.degrees(rot_rad))
+        except Exception:
+            return float("nan")
+
+    def _wcs_center_coords(self, w: WCS, nx: int, ny: int) -> tuple:
+        try:
+            if not w.has_celestial:
+                return (float("nan"), float("nan"))
+            cx, cy = nx / 2.0, ny / 2.0
+            sky = w.pixel_to_world(cx, cy)
+            return (float(sky.ra.deg), float(sky.dec.deg))
+        except Exception:
+            return (float("nan"), float("nan"))
+
+    def _empty_wcs_qc_metrics(self, n_detect: int = 0) -> dict:
+        return {
+            "n_detect": int(max(0, n_detect)),
+            "n_catalog_in_fov": 0,
+            "n_match": 0,
+            "n_inlier": 0,
+            "match_rate": np.nan,
+            "match_rate_cat": np.nan,
+            "match_rate_eff": np.nan,
+            "match_radius_arcsec": np.nan,
+            "match_radius_px": np.nan,
+            "dx_med_px": np.nan,
+            "dy_med_px": np.nan,
+            "resid_med_px": np.nan,
+            "resid_mad_px": np.nan,
+            "resid_peak_px": np.nan,
+            "resid_p99_px": np.nan,
+            "rms_px": np.nan,
+            "inlier_rate": np.nan,
+            "resid_vs_radius_slope": np.nan,
+            "edge_resid_ratio": np.nan,
+            "center_offset_arcsec": np.nan,
+            "pix_scale_input_arcsec": np.nan,
+            "pix_scale_fit_arcsec": np.nan,
+            "scale_delta_pct": np.nan,
+        }
+
+    def _compute_wcs_qc_metrics(
+        self,
+        *,
+        w: WCS | None,
+        det_xy: np.ndarray,
+        nx: int,
+        ny: int,
+        gaia_ra_deg: np.ndarray,
+        gaia_dec_deg: np.ndarray,
+        pix_input_arcsec: float,
+        pix_fit_arcsec: float,
+        center_coord: SkyCoord | None,
+    ) -> dict:
+        out = self._empty_wcs_qc_metrics(n_detect=len(det_xy))
+        if np.isfinite(pix_input_arcsec):
+            out["pix_scale_input_arcsec"] = float(pix_input_arcsec)
+        if np.isfinite(pix_fit_arcsec):
+            out["pix_scale_fit_arcsec"] = float(pix_fit_arcsec)
+        if np.isfinite(pix_input_arcsec) and pix_input_arcsec > 0 and np.isfinite(pix_fit_arcsec):
+            out["scale_delta_pct"] = float((pix_fit_arcsec - pix_input_arcsec) / pix_input_arcsec * 100.0)
+
+        if w is not None and w.has_celestial and center_coord is not None:
+            try:
+                c_ra, c_dec = self._wcs_center_coords(w, nx, ny)
+                if np.isfinite(c_ra) and np.isfinite(c_dec):
+                    c_sky = SkyCoord(c_ra * u.deg, c_dec * u.deg, frame="icrs")
+                    out["center_offset_arcsec"] = float(c_sky.separation(center_coord).arcsec)
+            except Exception:
+                pass
+
+        if w is None or (not w.has_celestial):
+            return out
+        if len(det_xy) == 0:
+            return out
+        if gaia_ra_deg.size == 0 or gaia_dec_deg.size == 0:
+            return out
+
+        try:
+            xg, yg = w.celestial.all_world2pix(gaia_ra_deg, gaia_dec_deg, 0)
+            xg = np.asarray(xg, float)
+            yg = np.asarray(yg, float)
+        except Exception:
+            return out
+
+        ok_g = (
+            np.isfinite(xg)
+            & np.isfinite(yg)
+            & (xg >= 0.0)
+            & (xg < float(nx))
+            & (yg >= 0.0)
+            & (yg < float(ny))
+        )
+        if not np.any(ok_g):
+            return out
+
+        gaia_xy = np.column_stack((xg[ok_g], yg[ok_g]))
+        out["n_catalog_in_fov"] = int(len(gaia_xy))
+
+        pix_use = pix_fit_arcsec if np.isfinite(pix_fit_arcsec) and pix_fit_arcsec > 0 else pix_input_arcsec
+        match_r_arcsec = float(getattr(self.params.P, "wcs_qc_match_radius_arcsec", 2.0))
+        if not np.isfinite(match_r_arcsec) or match_r_arcsec <= 0:
+            match_r_arcsec = 2.0
+        if np.isfinite(pix_use) and pix_use > 0:
+            match_r_px = float(match_r_arcsec / pix_use)
+        else:
+            match_r_px = float(getattr(self.params.P, "wcs_qc_match_radius_px", 2.5))
+        match_r_px = float(np.clip(match_r_px, 1.0, 25.0))
+        out["match_radius_arcsec"] = float(match_r_arcsec)
+        out["match_radius_px"] = float(match_r_px)
+
+        tree = KDTree(gaia_xy)
+        d, j = tree.query(det_xy, k=1)
+        d = np.asarray(d, float)
+        j = np.asarray(j, int)
+        ok = np.isfinite(d) & (d <= match_r_px) & (j >= 0) & (j < len(gaia_xy))
+        if not np.any(ok):
+            return out
+
+        det_candidates = np.where(ok)[0]
+        order = np.argsort(d[det_candidates])
+        used_gaia = set()
+        keep_det = []
+        keep_gaia = []
+        for ord_idx in order:
+            det_i = int(det_candidates[ord_idx])
+            gaia_i = int(j[det_i])
+            if gaia_i in used_gaia:
+                continue
+            used_gaia.add(gaia_i)
+            keep_det.append(det_i)
+            keep_gaia.append(gaia_i)
+        if not keep_det:
+            return out
+
+        det_keep = np.asarray(keep_det, dtype=int)
+        gaia_keep = np.asarray(keep_gaia, dtype=int)
+        dx = det_xy[det_keep, 0] - gaia_xy[gaia_keep, 0]
+        dy = det_xy[det_keep, 1] - gaia_xy[gaia_keep, 1]
+        r = np.hypot(dx, dy)
+        finite_r = np.isfinite(r)
+        if not np.any(finite_r):
+            return out
+        if not np.all(finite_r):
+            dx = dx[finite_r]
+            dy = dy[finite_r]
+            r = r[finite_r]
+            gaia_keep = gaia_keep[finite_r]
+
+        n_match = int(len(r))
+        out["n_match"] = n_match
+        out["match_rate"] = float(n_match / max(int(len(det_xy)), 1))
+        out["match_rate_cat"] = float(n_match / max(int(len(gaia_xy)), 1))
+        out["match_rate_eff"] = float(max(out["match_rate"], out["match_rate_cat"]))
+        if n_match == 0:
+            return out
+
+        out["dx_med_px"] = float(np.nanmedian(dx)) if len(dx) else np.nan
+        out["dy_med_px"] = float(np.nanmedian(dy)) if len(dy) else np.nan
+        resid_med = float(np.nanmedian(r))
+        resid_mad = float(1.4826 * np.nanmedian(np.abs(r - resid_med)))
+        out["resid_med_px"] = resid_med
+        out["resid_mad_px"] = resid_mad
+        out["resid_p99_px"] = float(np.nanpercentile(r, 99))
+        out["resid_peak_px"] = out["resid_p99_px"]
+
+        clip_sigma = float(getattr(self.params.P, "wcs_qc_clip_sigma", 3.0))
+        if not np.isfinite(clip_sigma) or clip_sigma <= 0:
+            clip_sigma = 3.0
+        if np.isfinite(resid_mad) and resid_mad > 0:
+            inlier = np.abs(r - resid_med) <= clip_sigma * resid_mad
+        else:
+            rstd = float(np.nanstd(r))
+            inlier = np.abs(r - float(np.nanmean(r))) <= clip_sigma * rstd if np.isfinite(rstd) and rstd > 0 else np.ones(len(r), dtype=bool)
+        n_inlier = int(np.sum(inlier))
+        r_in = r[inlier] if n_inlier > 0 else r
+        out["n_inlier"] = n_inlier
+        out["inlier_rate"] = float(n_inlier / max(n_match, 1))
+        out["rms_px"] = float(np.sqrt(np.nanmean(r_in ** 2))) if len(r_in) else np.nan
+
+        if len(det_keep) >= 8:
+            cx = float(nx) / 2.0
+            cy = float(ny) / 2.0
+            rr = np.hypot(gaia_xy[gaia_keep, 0] - cx, gaia_xy[gaia_keep, 1] - cy)
+            max_rr = max(float(np.hypot(max(cx, 1.0), max(cy, 1.0))), 1.0)
+            rho = rr / max_rr
+            if np.isfinite(np.nanstd(rho)) and float(np.nanstd(rho)) > 1e-6:
+                try:
+                    out["resid_vs_radius_slope"] = float(np.polyfit(rho, r, 1)[0])
+                except Exception:
+                    out["resid_vs_radius_slope"] = np.nan
+            core = r[rho <= 0.4]
+            edge = r[rho >= 0.8]
+            if len(core) >= 3 and len(edge) >= 3:
+                core_med = float(np.nanmedian(core))
+                if np.isfinite(core_med) and core_med > 1e-9:
+                    out["edge_resid_ratio"] = float(np.nanmedian(edge) / core_med)
+
+        return out
+
+    def _evaluate_wcs_qc_pass(self, metrics: dict, *, wcs_ok: bool) -> tuple[bool, list[str]]:
+        def _num(key: str) -> float:
+            try:
+                return float(metrics.get(key, np.nan))
+            except Exception:
+                return np.nan
+
+        reasons: list[str] = []
+        if bool(getattr(self.params.P, "wcs_qc_require_wcs_ok", True)) and not wcs_ok:
+            reasons.append("wcs_fail")
+        n_detect = int(metrics.get("n_detect", 0) or 0)
+        n_match = int(metrics.get("n_match", 0) or 0)
+        if n_detect <= 0:
+            reasons.append("no_detect_data")
+        if int(getattr(self.params.P, "wcs_qc_min_match_n", 20)) > 0 and n_match < int(getattr(self.params.P, "wcs_qc_min_match_n", 20)):
+            reasons.append("low_match_n")
+        mrate_det = _num("match_rate")
+        mrate_cat = _num("match_rate_cat")
+        mrate_eff = _num("match_rate_eff")
+        if not np.isfinite(mrate_eff):
+            if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
+                mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
+        min_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
+        if np.isfinite(min_rate) and min_rate > 0 and ((not np.isfinite(mrate_eff)) or (mrate_eff < min_rate)):
+            reasons.append("low_match_rate")
+        max_rms = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
+        if n_match > 0 and np.isfinite(max_rms) and max_rms > 0:
+            rms_px = _num("rms_px")
+            if (not np.isfinite(rms_px)) or (rms_px > max_rms):
+                reasons.append("high_rms")
+        max_p99 = float(getattr(self.params.P, "wcs_qc_max_p99_px", 5.0))
+        if n_match > 0 and np.isfinite(max_p99) and max_p99 > 0:
+            p99_px = _num("resid_p99_px")
+            if (not np.isfinite(p99_px)) or (p99_px > max_p99):
+                reasons.append("high_p99")
+        min_inlier = float(getattr(self.params.P, "wcs_qc_min_inlier_rate", 0.50))
+        if n_match > 0 and np.isfinite(min_inlier) and min_inlier > 0:
+            inlier = _num("inlier_rate")
+            if (not np.isfinite(inlier)) or (inlier < min_inlier):
+                reasons.append("low_inlier")
+        edge_ratio = _num("edge_resid_ratio")
+        max_edge = float(getattr(self.params.P, "wcs_qc_max_edge_ratio", 0.0))
+        if np.isfinite(max_edge) and max_edge > 0 and np.isfinite(edge_ratio) and edge_ratio > max_edge:
+            reasons.append("edge_resid")
+        center_off = _num("center_offset_arcsec")
+        max_center = float(getattr(self.params.P, "wcs_qc_max_center_offset_arcsec", 0.0))
+        if np.isfinite(max_center) and max_center > 0 and ((not np.isfinite(center_off)) or (center_off > max_center)):
+            reasons.append("center_offset")
+        return len(reasons) == 0, reasons
 
     def _refine_crpix_by_match(self, w: WCS, hdr: fits.Header, det_xy: np.ndarray,
                                gaia_df: pd.DataFrame, fwhm_px: float, max_match: int):
@@ -1260,7 +2830,8 @@ class AstrometryNetWorker(QThread):
 
     def _win_to_wsl_path(self, path: Path) -> str:
         try:
-            wp = PureWindowsPath(str(path))
+            canon = _canonicalize_windows_path_case(path)
+            wp = PureWindowsPath(str(canon))
             if wp.drive:
                 drive = wp.drive.rstrip(":").lower()
                 parts = "/".join(wp.parts[1:])
@@ -1289,15 +2860,26 @@ class AstrometryNetWorker(QThread):
         stem = fits_path.stem
         new_path = outdir / f"{stem}.new"
         solved_path = outdir / f"{stem}.solved"
-        if use_cache and new_path.exists() and solved_path.exists():
-            return True, 0.0, "cache_hit", "", [], new_path
+        wcs_path = outdir / f"{stem}.wcs"
+        sig_path = outdir / f"{stem}.input.json"
+        source_sig = _build_source_signature(fits_path, use_cropped=bool(self.use_cropped))
+        if use_cache and new_path.exists() and (solved_path.exists() or wcs_path.exists()):
+            cache_ok = False
+            try:
+                if sig_path.exists():
+                    saved_sig = json.loads(sig_path.read_text(encoding="utf-8"))
+                    cache_ok = _source_signature_detection_compatible(saved_sig, source_sig)
+            except Exception:
+                cache_ok = False
+            if cache_ok:
+                return True, 0.0, "cache_hit", "", [], new_path
         for p in outdir.glob(f"{stem}.*"):
             try:
                 p.unlink()
             except Exception:
                 pass
         staged_path = fits_path
-        if stage_in_outdir:
+        if stage_in_outdir and (not use_wsl):
             try:
                 staged_path = outdir / fits_path.name
                 if staged_path != fits_path:
@@ -1314,6 +2896,34 @@ class AstrometryNetWorker(QThread):
 
         outdir_arg = self._win_to_wsl_path(outdir) if use_wsl else str(outdir)
         fits_arg = self._win_to_wsl_path(staged_path) if use_wsl else str(staged_path)
+        if not staged_path.exists():
+            return False, 0.0, "", f"input_missing:{staged_path}", cmd, None
+        if use_wsl and cmd and str(cmd[0]).lower() == "wsl":
+            try:
+                chk = subprocess.run(
+                    ["wsl", "test", "-f", fits_arg],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if chk.returncode != 0:
+                    err_msg = (
+                        f"wsl_path_unavailable:{fits_arg} | "
+                        "WSL cannot read this file path. Use ASTAP solver or move data to a local "
+                        "drive/folder that WSL can access (e.g. C:) and rerun."
+                    )
+                    return False, 0.0, "", err_msg, cmd, None
+            except FileNotFoundError:
+                return (
+                    False,
+                    0.0,
+                    "",
+                    "wsl_not_found: WSL command not available. Disable WSL solve and use ASTAP.",
+                    cmd,
+                    None,
+                )
+            except Exception:
+                pass
 
         cmd += [
             "--dir", outdir_arg,
@@ -1340,17 +2950,93 @@ class AstrometryNetWorker(QThread):
 
         try:
             start = time.time()
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout_s = ""
+            stderr_s = ""
+            while True:
+                if self._stop_requested:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        out_s, err_s = proc.communicate(timeout=0.5)
+                        stdout_s = out_s or ""
+                        stderr_s = err_s or ""
+                    except Exception:
+                        pass
+                    if staged_path != fits_path:
+                        try:
+                            staged_path.unlink()
+                        except Exception:
+                            pass
+                    err_msg = "stopped"
+                    err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
+                    if err_tail:
+                        err_msg = f"stopped | {err_tail}"
+                    return False, time.time() - start, stdout_s, err_msg, cmd, None
+
+                elapsed = time.time() - start
+                if elapsed >= timeout_s:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        out_s, err_s = proc.communicate(timeout=0.5)
+                        stdout_s = out_s or ""
+                        stderr_s = err_s or ""
+                    except Exception:
+                        pass
+                    if staged_path != fits_path:
+                        try:
+                            staged_path.unlink()
+                        except Exception:
+                            pass
+                    err_msg = "timeout"
+                    err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
+                    if err_tail:
+                        err_msg = f"timeout | {err_tail}"
+                    return False, timeout_s, stdout_s, err_msg, cmd, None
+
+                try:
+                    out_s, err_s = proc.communicate(timeout=0.2)
+                    stdout_s = out_s or ""
+                    stderr_s = err_s or ""
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
             dt = time.time() - start
-            ok = (cp.returncode == 0 and new_path.exists() and solved_path.exists())
+            rc = int(proc.returncode if proc.returncode is not None else -998)
+            # Some solve-field builds can return non-zero even when solution artifacts are created.
+            # Prefer artifact existence over process return code.
+            wcs_path = outdir / f"{stem}.wcs"
+            ok = bool(new_path.exists() and (solved_path.exists() or wcs_path.exists()))
+            if ok:
+                try:
+                    sig_path.write_text(json.dumps(source_sig, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             if staged_path != fits_path:
                 try:
                     staged_path.unlink()
                 except Exception:
                     pass
-            return ok, dt, cp.stdout, cp.stderr, cmd, new_path
-        except subprocess.TimeoutExpired:
-            return False, timeout_s, "", "timeout", cmd, None
+            return ok, dt, stdout_s, stderr_s, cmd, new_path
         except Exception as e:
             return False, 0.0, "", str(e), cmd, None
 
@@ -1396,36 +3082,60 @@ class AstrometryNetWorker(QThread):
         keep_outputs = bool(getattr(self.params.P, "astnet_local_keep_outputs", True))
         use_cache = bool(getattr(self.params.P, "astnet_local_use_cache", True))
         cpulimit_s = float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0))
-        max_workers = max(1, int(get_parallel_workers(self.params)))
+        max_workers = get_parallel_workers(self.params)
 
         if scale_low <= 0 or scale_high <= 0:
             scale_low = float(pix_arc) * 0.85
             scale_high = float(pix_arc) * 1.15
 
         outdir = self.cache_dir / "wcs_solve" / "astnet_local"
+        log_path = self.cache_dir / "astnet_solve.log"
+
+        def LOG(msg, emit=False):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            line = f"{ts} {msg}"
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception:
+                pass
+            if emit:
+                self.log_message.emit(msg)
+
+        LOG("=" * 60)
+        LOG(
+            f"[ASTNET] start files={len(self.file_list)} use_cropped={self.use_cropped} "
+            f"workers={max_workers} outdir={outdir}"
+        )
+        LOG(
+            f"[ASTNET] scale=[{scale_low:.5f},{scale_high:.5f}] downsample={downsample} "
+            f"max_objs={max_objs} radius_deg={radius_deg} timeout_s={timeout_s} "
+            f"cpulimit_s={cpulimit_s} use_wsl={use_wsl} use_cache={use_cache}"
+        )
 
         self.log_message.emit(f"Starting parallel plate solving with {max_workers} workers...")
         self.log_message.emit(f"  Scale: {scale_low:.4f} - {scale_high:.4f} arcsec/px")
         self.log_message.emit(f"  Downsample: {downsample}, Max objs: {max_objs}")
+        self.log_message.emit(f"  Debug log: {log_path}")
 
         # 내부 함수: 단일 파일 처리 로직 (스레드에서 실행됨)
         def process_single_file(filename):
             if self._stop_requested:
-                return filename, {"ok": False, "status": "stopped"}
+                LOG(f"{filename}: stop_requested_before_start")
+                return filename, {"ok": False, "status": "stopped", "fail_reason": "stopped"}
 
             if self.use_cropped:
                 fits_path = step2_cropped_dir(self.result_dir) / filename
             else:
                 fits_path = self.params.get_file_path(filename)
+            source_sig = _build_source_signature(Path(fits_path), use_cropped=bool(self.use_cropped))
 
             if not fits_path.exists():
-                return filename, {"ok": False, "status": "file_not_found"}
+                LOG(f"{filename}: file_not_found path={fits_path}")
+                return filename, {"ok": False, "status": "file_not_found", "fail_reason": "file_not_found", **source_sig}
 
-            # Center coordinate selection:
-            # use per-frame header first, fallback to project target.
-            # if they disagree too much, trust project target.
+            # 헤더에서 중심 좌표 읽기
             center_coord = None
-            header_coord = None
             try:
                 # memmap=False로 읽어서 파일 핸들 즉시 반환 유도
                 with fits.open(fits_path, memmap=False) as hdul:
@@ -1433,27 +3143,11 @@ class AstrometryNetWorker(QThread):
                     ra0 = hdr0.get("OBJCTRA", None)
                     dec0 = hdr0.get("OBJCTDEC", None)
                     if ra0 is not None and dec0 is not None:
-                        header_coord = SkyCoord(str(ra0), str(dec0), unit=(u.hourangle, u.deg))
+                        center_coord = SkyCoord(str(ra0), str(dec0), unit=(u.hourangle, u.deg))
             except Exception:
-                header_coord = None
-
-            max_sep_deg = float(getattr(self.params.P, "wcs_header_coord_max_sep_deg", 5.0))
-            if header_coord is not None and self.target_coord is not None:
-                try:
-                    sep_deg = float(header_coord.separation(self.target_coord).deg)
-                except Exception:
-                    sep_deg = np.nan
-                if np.isfinite(sep_deg) and sep_deg > max_sep_deg:
-                    center_coord = self.target_coord
-                    self.log_message.emit(
-                        f"[WCS] {filename}: header/project offset={sep_deg:.3f}deg > {max_sep_deg:.3f}deg "
-                        f"(using project target)"
-                    )
-                else:
-                    center_coord = header_coord
-            elif header_coord is not None:
-                center_coord = header_coord
-            elif self.target_coord is not None:
+                center_coord = None
+            
+            if center_coord is None and self.target_coord is not None:
                 center_coord = self.target_coord
 
             # solve-field 실행
@@ -1461,31 +3155,44 @@ class AstrometryNetWorker(QThread):
                 fits_path, center_coord, scale_low, scale_high, radius_deg,
                 downsample, timeout_s, outdir, use_wsl, True, use_cache, max_objs, cpulimit_s
             )
-            if (not ok) and (center_coord is not None):
-                self.log_message.emit(f"[ASTNET] {filename}: constrained solve failed, retrying blind...")
-                ok2, dt2, out_s2, err_s2, cmd2, new_path2 = self._run_solve_field(
-                    fits_path, None, scale_low, scale_high, radius_deg,
-                    downsample, max(timeout_s, 120.0), outdir, use_wsl, True, False, max_objs, max(cpulimit_s, 60.0)
-                )
-                dt = float(dt) + float(dt2)
-                if ok2:
-                    ok, out_s, err_s, cmd, new_path = ok2, out_s2, err_s2, cmd2, new_path2
+            cmd_str = " ".join(str(c) for c in cmd) if cmd else ""
+            stdout_tail = _tail_text(out_s, limit=2000, max_lines=12)
+            stderr_tail = _tail_text(err_s, limit=2000, max_lines=12)
+            fail_reason = ""
+            if not ok:
+                err_l = str(err_s).lower()
+                if "timeout" in err_l:
+                    fail_reason = "astnet_timeout"
+                elif "stopped" in err_l:
+                    fail_reason = "astnet_stopped"
+                elif (
+                    "wsl_path_unavailable" in err_l
+                    or "wsl_not_found" in err_l
+                    or "wsl_input_missing" in err_l
+                    or "input_missing:" in err_l
+                    or ("cannot open `" in err_l and "no such file or directory" in err_l)
+                ):
+                    fail_reason = "astnet_wsl_path_unavailable"
+                elif "cache_hit" in str(out_s):
+                    fail_reason = "astnet_cache_hit_without_solution_marker"
                 else:
-                    if str(err_s2).strip():
-                        err_s = err_s2
-                    if cmd2:
-                        cmd = cmd2
+                    fail_reason = "astnet_fail_no_solution"
 
             result = {
+                "fname": filename,
+                "file": filename,
                 "ok": False,
-                "status": "solve_field_fail",
+                "wcs_ok": False,
+                "status": "fail",
+                "fail_reason": fail_reason,
                 "ra": 0.0, "dec": 0.0, "pixscale": 0.0,
                 "elapsed_s": float(dt),
+                "solver": "astnet_wsl",
+                "astnet_wsl_cmd": cmd_str,
+                "astnet_wsl_stdout": stdout_tail,
+                "astnet_wsl_stderr": stderr_tail,
+                **source_sig,
             }
-
-            if (not ok) and str(err_s).strip():
-                err_short = str(err_s).replace("\n", " ").strip()
-                result["status"] = f"solve_field_fail: {err_short[:120]}"
 
             if ok and new_path is not None and new_path.exists():
                 try:
@@ -1503,17 +3210,74 @@ class AstrometryNetWorker(QThread):
                             ra_dec = w.pixel_to_world(cx, cy)
                             
                             result = {
+                                "fname": filename,
+                                "file": filename,
                                 "ok": True,
+                                "wcs_ok": True,
                                 "status": "solved",
                                 "ra": float(ra_dec.ra.deg),
                                 "dec": float(ra_dec.dec.deg),
                                 "pixscale": pix_fit,
                                 "elapsed_s": float(dt),
+                                "solver": "astnet_wsl",
+                                "fail_reason": "",
+                                "astnet_wsl_cmd": cmd_str,
+                                "astnet_wsl_stdout": stdout_tail,
+                                "astnet_wsl_stderr": stderr_tail,
                                 "wcs_header": dict(new_hdr),
                                 "fits_path": str(fits_path),
+                                **source_sig,
                             }
+                            LOG(
+                                f"{filename}: solved dt={dt:.1f}s RA={result['ra']:.6f} "
+                                f"Dec={result['dec']:.6f} pix={pix_fit:.5f}"
+                            )
+                            if stderr_tail:
+                                LOG(f"{filename}: solver_stderr_tail={stderr_tail}")
+                        else:
+                            fail_reason = "wcs_header_not_celestial"
+                            result["status"] = "wcs_not_celestial"
+                            result["fail_reason"] = fail_reason
+                            LOG(f"{filename}: fail reason={fail_reason} dt={dt:.1f}s")
+                            if cmd_str:
+                                LOG(f"{filename}: cmd={cmd_str}")
+                            if stdout_tail:
+                                LOG(f"{filename}: stdout_tail={stdout_tail}")
+                            if stderr_tail:
+                                LOG(f"{filename}: stderr_tail={stderr_tail}")
                 except Exception as e:
-                    result = {"ok": False, "status": f"error: {e}", "elapsed_s": float(dt)}
+                    fail_reason = f"header_update_error:{_exc_brief(e, limit=160)}"
+                    result = {
+                        "fname": filename,
+                        "file": filename,
+                        "ok": False,
+                        "wcs_ok": False,
+                        "status": f"error: {e}",
+                        "fail_reason": fail_reason,
+                        "elapsed_s": float(dt),
+                        "solver": "astnet_wsl",
+                        "astnet_wsl_cmd": cmd_str,
+                        "astnet_wsl_stdout": stdout_tail,
+                        "astnet_wsl_stderr": stderr_tail,
+                    }
+                    LOG(f"{filename}: {fail_reason}")
+                    if cmd_str:
+                        LOG(f"{filename}: cmd={cmd_str}")
+                    if stdout_tail:
+                        LOG(f"{filename}: stdout_tail={stdout_tail}")
+                    if stderr_tail:
+                        LOG(f"{filename}: stderr_tail={stderr_tail}")
+            else:
+                if not fail_reason:
+                    fail_reason = "astnet_no_solution_file"
+                result["fail_reason"] = fail_reason
+                LOG(f"{filename}: fail reason={fail_reason} dt={dt:.1f}s")
+                if cmd_str:
+                    LOG(f"{filename}: cmd={cmd_str}")
+                if stdout_tail:
+                    LOG(f"{filename}: stdout_tail={stdout_tail}")
+                if stderr_tail:
+                    LOG(f"{filename}: stderr_tail={stderr_tail}")
 
             # 임시 파일 정리
             if not keep_outputs:
@@ -1531,6 +3295,8 @@ class AstrometryNetWorker(QThread):
             completed_count = 0
             for future in as_completed(future_to_file):
                 if self._stop_requested:
+                    for f_cancel in future_to_file:
+                        f_cancel.cancel()
                     break
 
                 fname = future_to_file[future]
@@ -1549,9 +3315,23 @@ class AstrometryNetWorker(QThread):
                         dec_val = res.get('dec', 0)
                         self.log_message.emit(f"[OK] {filename} (RA={ra_val:.4f}, Dec={dec_val:.4f})")
                     else:
-                        self.log_message.emit(f"[FAIL] {filename}: {res.get('status')}")
+                        status_txt = str(res.get("status", "fail"))
+                        fail_txt = str(res.get("fail_reason", "")).strip()
+                        if fail_txt:
+                            self.log_message.emit(f"[FAIL] {filename}: {status_txt} ({fail_txt})")
+                        else:
+                            self.log_message.emit(f"[FAIL] {filename}: {status_txt}")
+                        try:
+                            elapsed_val = float(res.get("elapsed_s", np.nan))
+                        except Exception:
+                            elapsed_val = np.nan
+                        LOG(
+                            f"{filename}: status={status_txt} fail_reason={fail_txt or '-'} "
+                            f"elapsed={elapsed_val:.1f}s"
+                        )
 
                 except Exception as e:
+                    LOG(f"{fname}: worker_exception={_exc_brief(e)}")
                     self.error.emit(fname, str(e))
 
                 completed_count += 1
@@ -1559,7 +3339,12 @@ class AstrometryNetWorker(QThread):
 
         # --- Gaia 쿼리 및 WCS Refine ---
         if self._stop_requested:
-            self.finished.emit({"total": len(results), "ok": sum(1 for r in results if r.get("ok"))})
+            self.finished.emit({
+                "total": len(results),
+                "ok": sum(1 for r in results if r.get("ok")),
+                "wcs_qc_pass": sum(1 for r in results if bool(r.get("wcs_qc_pass", False))),
+                "stopped": True,
+            })
             return
 
         # 성공한 프레임에서 중심 좌표 얻기
@@ -1590,12 +3375,18 @@ class AstrometryNetWorker(QThread):
                 fov_h = (ny * pix_arc) / 3600.0
                 diag_deg = float(np.hypot(fov_w, fov_h))
                 gaia_fudge = float(getattr(self.params.P, "gaia_radius_fudge", 1.35))
+                gaia_mag_max = float(getattr(self.params.P, "gaia_mag_max", 18.0))
                 gaia_r = float(0.5 * diag_deg * gaia_fudge)
 
                 gaia_df, gaia_src = self._load_or_query_gaia(center_coord, gaia_r)
-                self.log_message.emit(f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) r={gaia_r:.4f}deg source={gaia_src} N={len(gaia_df)}")
+                self.log_message.emit(
+                    f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) "
+                    f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} source={gaia_src} N={len(gaia_df)}"
+                )
             except Exception as e:
-                self.log_message.emit(f"[Gaia] Query error: {e}")
+                msg = _exc_brief(e, limit=240)
+                self.log_message.emit(f"[Gaia] Query error: {msg}")
+                LOG(f"[Gaia] Query error: {msg}")
                 gaia_df = pd.DataFrame()
 
         # WCS Refine 수행
@@ -1666,10 +3457,177 @@ class AstrometryNetWorker(QThread):
         else:
             self.log_message.emit("[Refine] Skipped - no Gaia data available")
 
+        gaia_ra_vals = np.array([], dtype=float)
+        gaia_dec_vals = np.array([], dtype=float)
+        if isinstance(gaia_df, pd.DataFrame) and (not gaia_df.empty) and {"ra", "dec"} <= set(gaia_df.columns):
+            gaia_ra_vals = pd.to_numeric(gaia_df["ra"], errors="coerce").to_numpy(float)
+            gaia_dec_vals = pd.to_numeric(gaia_df["dec"], errors="coerce").to_numpy(float)
+            ok_rd = np.isfinite(gaia_ra_vals) & np.isfinite(gaia_dec_vals)
+            gaia_ra_vals = gaia_ra_vals[ok_rd]
+            gaia_dec_vals = gaia_dec_vals[ok_rd]
+
+        for res in results:
+            filename = str(res.get("filename") or res.get("fname") or res.get("file") or "").strip()
+            if not filename:
+                continue
+
+            det_xy, _ = self._load_detect_xy(filename)
+            qc_metrics = self._empty_wcs_qc_metrics(n_detect=len(det_xy))
+            qc_metrics["pix_scale_input_arcsec"] = float(pix_arc) if np.isfinite(pix_arc) else np.nan
+
+            fits_path = None
+            fp = str(res.get("fits_path", "")).strip()
+            if fp:
+                fits_path = Path(fp)
+            if fits_path is None or not fits_path.exists():
+                if self.use_cropped:
+                    cp = step2_cropped_dir(self.result_dir) / filename
+                    if cp.exists():
+                        fits_path = cp
+                if (fits_path is None or not fits_path.exists()):
+                    try:
+                        op = Path(self.params.get_file_path(filename))
+                        if op.exists():
+                            fits_path = op
+                    except Exception:
+                        fits_path = None
+
+            w = None
+            wcs_ok = False
+            nx = 0
+            ny = 0
+            wcs_rot_deg = np.nan
+            center_ra = np.nan
+            center_dec = np.nan
+            pix_fit = float(res.get("pixscale", np.nan))
+            if fits_path is not None and fits_path.exists():
+                try:
+                    with fits.open(fits_path, memmap=False) as hdul:
+                        hdr = hdul[0].header
+                        nx = int(hdr.get("NAXIS1", 0))
+                        ny = int(hdr.get("NAXIS2", 0))
+                        w = WCS(hdr, relax=True)
+                    wcs_ok = bool(w is not None and w.has_celestial)
+                    if wcs_ok:
+                        pix_fit = self._pixscale_from_wcs(w)
+                        wcs_rot_deg = self._wcs_rotation_deg(w)
+                        center_ra, center_dec = self._wcs_center_coords(w, nx, ny)
+                except Exception:
+                    w = None
+                    wcs_ok = False
+
+            qc_metrics = self._compute_wcs_qc_metrics(
+                w=w,
+                det_xy=det_xy,
+                nx=nx,
+                ny=ny,
+                gaia_ra_deg=gaia_ra_vals,
+                gaia_dec_deg=gaia_dec_vals,
+                pix_input_arcsec=float(pix_arc),
+                pix_fit_arcsec=float(pix_fit) if np.isfinite(pix_fit) else np.nan,
+                center_coord=center_coord,
+            )
+            qc_pass, qc_reasons = self._evaluate_wcs_qc_pass(qc_metrics, wcs_ok=bool(wcs_ok))
+
+            elapsed_s = float(res.get("elapsed_s", np.nan))
+            elapsed = elapsed_s if np.isfinite(elapsed_s) else np.nan
+            res.update({
+                "fname": filename,
+                "file": filename,
+                "wcs_ok": bool(wcs_ok),
+                "pix_fit": float(pix_fit) if np.isfinite(pix_fit) else None,
+                "elapsed": float(elapsed) if np.isfinite(elapsed) else None,
+                "wcs_rot_deg": float(wcs_rot_deg) if np.isfinite(wcs_rot_deg) else None,
+                "center_ra_deg": float(center_ra) if np.isfinite(center_ra) else None,
+                "center_dec_deg": float(center_dec) if np.isfinite(center_dec) else None,
+                "wcs_qc_pass": bool(qc_pass),
+                "wcs_qc_reason": ",".join(qc_reasons),
+            })
+            res.update(qc_metrics)
+            try:
+                mr_eff = float(res.get("match_rate_eff", np.nan))
+            except Exception:
+                mr_eff = np.nan
+            try:
+                rms_px = float(res.get("rms_px", np.nan))
+            except Exception:
+                rms_px = np.nan
+            try:
+                n_det = int(res.get("n_detect", 0) or 0)
+            except Exception:
+                n_det = 0
+            try:
+                n_match = int(res.get("n_match", 0) or 0)
+            except Exception:
+                n_match = 0
+            qc_txt = "PASS" if qc_pass else f"FAIL({','.join(qc_reasons) or '-'})"
+            self.log_message.emit(
+                f"[WCS-QC] {filename}: n_det={n_det} n_match={n_match} "
+                f"rate_eff={mr_eff:.3f} rms_px={rms_px:.3f} qc={qc_txt}"
+            )
+            # Push finalized metrics so Astrometry table reflects QC columns, not only refine residue.
+            self.file_done.emit(filename, res)
+
+        try:
+            step5_out = step5_dir(self.result_dir)
+            step5_out.mkdir(parents=True, exist_ok=True)
+            df = pd.DataFrame(results)
+            df.to_csv(step5_out / "wcs_solve_summary.csv", index=False)
+            qc_cols = [
+                "file",
+                "status",
+                "fail_reason",
+                "ok",
+                "wcs_ok",
+                "solver",
+                "elapsed",
+                "elapsed_s",
+                "source_path",
+                "source_use_cropped",
+                "source_size",
+                "source_mtime_ns",
+                "n_detect",
+                "n_catalog_in_fov",
+                "n_match",
+                "n_inlier",
+                "match_rate",
+                "match_rate_cat",
+                "match_rate_eff",
+                "match_radius_arcsec",
+                "match_radius_px",
+                "dx_med_px",
+                "dy_med_px",
+                "resid_med_px",
+                "resid_mad_px",
+                "resid_p99_px",
+                "resid_peak_px",
+                "rms_px",
+                "inlier_rate",
+                "resid_vs_radius_slope",
+                "edge_resid_ratio",
+                "pix_scale_input_arcsec",
+                "pixscale",
+                "pix_fit",
+                "scale_delta_pct",
+                "wcs_rot_deg",
+                "center_ra_deg",
+                "center_dec_deg",
+                "center_offset_arcsec",
+                "wcs_qc_pass",
+                "wcs_qc_reason",
+            ]
+            qc_df = df[[c for c in qc_cols if c in df.columns]].copy()
+            qc_df.to_csv(step5_out / "frame_wcs_qc.csv", index=False)
+        except Exception as e:
+            self.log_message.emit(f"[WCS-QC] Failed to write QC CSV: {e}")
+
         # --- 마무리 ---
+        n_qc_pass = sum(1 for r in results if bool(r.get("wcs_qc_pass", False)))
         summary = {
             "total": len(results),
             "ok": sum(1 for r in results if r.get("ok")),
+            "wcs_qc_pass": int(n_qc_pass),
+            "stopped": bool(self._stop_requested),
         }
         self.finished.emit(summary)
 
@@ -1697,6 +3655,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
         self.setup_step_ui()
         self.restore_state()
+        self._load_existing_result_tables()
 
     def setup_step_ui(self):
         # Create tab widget
@@ -1768,9 +3727,11 @@ class WcsPlateSolvingWindow(StepWindowBase):
         results_layout = QVBoxLayout(results_group)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(6)
+        self.results_table.setColumnCount(13)
         self.results_table.setHorizontalHeaderLabels([
-            "File", "Status", "PixScale Fit", "Refine", "Resid Med", "Elapsed (s)"
+            "File", "Status", "Solver", "RA", "Dec", "PixScale",
+            "Refine", "Match N", "Match Rate Eff", "RMS(px)", "WCS QC",
+            "Fail Reason", "Elapsed (s)"
         ])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.results_table.horizontalHeader().setStretchLastSection(True)
@@ -1849,9 +3810,11 @@ class WcsPlateSolvingWindow(StepWindowBase):
         results_layout = QVBoxLayout(results_group)
 
         self.astrometrynet_results_table = QTableWidget()
-        self.astrometrynet_results_table.setColumnCount(8)
+        self.astrometrynet_results_table.setColumnCount(14)
         self.astrometrynet_results_table.setHorizontalHeaderLabels([
-            "File", "Status", "RA", "Dec", "PixScale", "Refine", "Resid(\")", "Elapsed (s)"
+            "File", "Status", "Solver", "RA", "Dec", "PixScale",
+            "Refine", "Resid(\")", "Match N", "Match Rate Eff",
+            "RMS(px)", "WCS QC", "Fail Reason", "Elapsed (s)"
         ])
         self.astrometrynet_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.astrometrynet_results_table.horizontalHeader().setStretchLastSection(True)
@@ -1941,6 +3904,9 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
     def stop_astrometrynet_solve(self):
         if self.astrometrynet_worker and self.astrometrynet_worker.isRunning():
+            self.btn_stop_astrometrynet.setEnabled(False)
+            self.astrometrynet_status.setText("Stopping...")
+            self.log("Astrometry.net stop requested...")
             self.astrometrynet_worker.stop()
 
     def on_astrometrynet_progress(self, current, total, status):
@@ -1948,26 +3914,66 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.astrometrynet_progress.setValue(pct)
         self.astrometrynet_status.setText(status)
 
-    def on_astrometrynet_file_done(self, filename, result):
-        row = self.astrometrynet_results_table.rowCount()
-        self.astrometrynet_results_table.insertRow(row)
-        self.astrometrynet_results_table.setItem(row, 0, QTableWidgetItem(filename))
-        self.astrometrynet_results_table.setItem(row, 1, QTableWidgetItem(result.get("status", "")))
-        ra = float(result.get("ra", 0.0))
-        dec = float(result.get("dec", 0.0))
-        pixscale = float(result.get("pixscale", 0.0))
-        refine = result.get("refine", "-")
-        resid_med = result.get("resid_med", np.nan)
-        elapsed = float(result.get("elapsed_s", 0.0))
-        self.astrometrynet_results_table.setItem(row, 2, QTableWidgetItem(f"{ra:.6f}" if np.isfinite(ra) else "-"))
-        self.astrometrynet_results_table.setItem(row, 3, QTableWidgetItem(f"{dec:.6f}" if np.isfinite(dec) else "-"))
-        self.astrometrynet_results_table.setItem(row, 4, QTableWidgetItem(f"{pixscale:.4f}" if np.isfinite(pixscale) and pixscale > 0 else "-"))
-        self.astrometrynet_results_table.setItem(row, 5, QTableWidgetItem(str(refine) if refine else "-"))
-        self.astrometrynet_results_table.setItem(row, 6, QTableWidgetItem(f"{resid_med:.2f}" if np.isfinite(resid_med) else "-"))
-        self.astrometrynet_results_table.setItem(row, 7, QTableWidgetItem(f"{elapsed:.1f}" if np.isfinite(elapsed) and elapsed > 0 else "-"))
+    def on_astrometrynet_file_done(self, filename, result, emit_log=True):
+        def _f(v):
+            try:
+                return float(v)
+            except Exception:
+                return float("nan")
 
-        if result.get("ok"):
-            self.results[filename] = result
+        row = -1
+        for i in range(self.astrometrynet_results_table.rowCount()):
+            item = self.astrometrynet_results_table.item(i, 0)
+            if item and item.text() == str(filename):
+                row = i
+                break
+        is_new_row = row < 0
+        if is_new_row:
+            row = self.astrometrynet_results_table.rowCount()
+            self.astrometrynet_results_table.insertRow(row)
+        self.astrometrynet_results_table.setItem(row, 0, QTableWidgetItem(str(filename)))
+        status = str(result.get("status", ""))
+        self.astrometrynet_results_table.setItem(row, 1, QTableWidgetItem(status))
+        solver = str(result.get("solver", "") or "astnet_wsl")
+        self.astrometrynet_results_table.setItem(row, 2, QTableWidgetItem(solver))
+
+        ra = _f(result.get("ra", result.get("center_ra_deg", np.nan)))
+        dec = _f(result.get("dec", result.get("center_dec_deg", np.nan)))
+        pixscale = _f(result.get("pixscale", result.get("pix_fit", np.nan)))
+        refine = str(result.get("refine", "-") or "-")
+        resid_med = _f(result.get("resid_med", np.nan))
+        n_match = int(result.get("n_match", result.get("match_n", 0)) or 0)
+        match_rate = _f(self._effective_match_rate(result))
+        rms_px = _f(result.get("rms_px", np.nan))
+        qc_pass = bool(result.get("wcs_qc_pass", False))
+        qc_reason = str(result.get("wcs_qc_reason", "") or "").strip()
+        fail_reason = self._text_or_dash(result.get("fail_reason", ""))
+        if fail_reason == "-" and (not bool(result.get("ok", False))):
+            fail_reason = self._text_or_dash(result.get("wcs_qc_reason", ""))
+            if fail_reason == "-":
+                fail_reason = self._text_or_dash(result.get("status", ""))
+        elapsed = _f(result.get("elapsed", result.get("elapsed_s", 0.0)) or 0.0)
+
+        self.astrometrynet_results_table.setItem(row, 3, QTableWidgetItem(f"{ra:.6f}" if np.isfinite(ra) else "-"))
+        self.astrometrynet_results_table.setItem(row, 4, QTableWidgetItem(f"{dec:.6f}" if np.isfinite(dec) else "-"))
+        self.astrometrynet_results_table.setItem(row, 5, QTableWidgetItem(f"{pixscale:.4f}" if np.isfinite(pixscale) and pixscale > 0 else "-"))
+        self.astrometrynet_results_table.setItem(row, 6, QTableWidgetItem(refine))
+        self.astrometrynet_results_table.setItem(row, 7, QTableWidgetItem(f"{resid_med:.2f}" if np.isfinite(resid_med) else "-"))
+        self.astrometrynet_results_table.setItem(row, 8, QTableWidgetItem(str(n_match)))
+        self.astrometrynet_results_table.setItem(row, 9, QTableWidgetItem(f"{match_rate:.3f}" if np.isfinite(match_rate) else "-"))
+        self.astrometrynet_results_table.setItem(row, 10, QTableWidgetItem(f"{rms_px:.3f}" if np.isfinite(rms_px) else "-"))
+        if qc_pass:
+            qc_txt = "PASS"
+        elif qc_reason:
+            qc_txt = f"FAIL ({qc_reason})"
+        else:
+            qc_txt = "-"
+        self.astrometrynet_results_table.setItem(row, 11, QTableWidgetItem(qc_txt))
+        self.astrometrynet_results_table.setItem(row, 12, QTableWidgetItem(fail_reason))
+        self.astrometrynet_results_table.setItem(row, 13, QTableWidgetItem(f"{elapsed:.1f}" if np.isfinite(elapsed) and elapsed > 0 else "-"))
+
+        self.results[filename] = result
+        if result.get("ok") and emit_log and is_new_row:
             self.log(f"Astrometry.net solved: {filename} (RA={result.get('ra', 0):.4f}, Dec={result.get('dec', 0):.4f})")
 
     def on_astrometrynet_error(self, filename, error):
@@ -1981,8 +3987,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
             if item and item.text() == filename:
                 refine = result.get("refine", "-")
                 resid_med = result.get("resid_med", np.nan)
-                self.astrometrynet_results_table.setItem(row, 5, QTableWidgetItem(str(refine) if refine else "-"))
-                self.astrometrynet_results_table.setItem(row, 6, QTableWidgetItem(f"{resid_med:.2f}" if np.isfinite(resid_med) else "-"))
+                self.astrometrynet_results_table.setItem(row, 6, QTableWidgetItem(str(refine) if refine else "-"))
+                self.astrometrynet_results_table.setItem(row, 7, QTableWidgetItem(f"{resid_med:.2f}" if np.isfinite(resid_med) else "-"))
                 # results에도 업데이트
                 if filename in self.results:
                     self.results[filename].update(result)
@@ -1991,11 +3997,18 @@ class WcsPlateSolvingWindow(StepWindowBase):
     def on_astrometrynet_finished(self, summary):
         self.btn_solve_astrometrynet.setEnabled(True)
         self.btn_stop_astrometrynet.setEnabled(False)
+        stopped = bool(summary.get("stopped")) if isinstance(summary, dict) else False
         n_ok = summary.get("ok", 0)
-        self.astrometrynet_progress.setValue(100)
-        self.astrometrynet_status.setText(f"Done: {n_ok}/{summary.get('total', 0)} solved")
+        n_qc = summary.get("wcs_qc_pass", 0)
+        if not stopped:
+            self.astrometrynet_progress.setValue(100)
+            self.astrometrynet_status.setText(f"Done: {n_ok}/{summary.get('total', 0)} solved")
+        else:
+            self.astrometrynet_status.setText(f"Stopped: {n_ok}/{summary.get('total', 0)} solved")
         if n_ok > 0:
-            self.log(f"Astrometry.net: {n_ok} frames solved successfully")
+            self.log(f"Astrometry.net: {n_ok} frames solved successfully | WCS-QC pass: {n_qc}")
+        if stopped:
+            self.log("Astrometry.net solve stopped by user")
         self.save_state()
         self.update_navigation_buttons()
 
@@ -2063,6 +4076,150 @@ class WcsPlateSolvingWindow(StepWindowBase):
                     pass
             self.ref_frame_list.addItem(item)
 
+    @staticmethod
+    def _csv_bool(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, (int, np.integer)):
+            return bool(v)
+        s = str(v).strip().lower()
+        return s in ("1", "true", "t", "yes", "y", "on")
+
+    @staticmethod
+    def _text_or_dash(v) -> str:
+        if v is None:
+            return "-"
+        try:
+            if isinstance(v, (float, np.floating)) and (not np.isfinite(v)):
+                return "-"
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none", "null"):
+            return "-"
+        return s
+
+    @staticmethod
+    def _effective_match_rate(result: dict) -> float:
+        rates = []
+        for key in ("match_rate_eff", "match_rate", "match_rate_cat"):
+            try:
+                v = float(result.get(key, np.nan))
+            except Exception:
+                v = np.nan
+            if np.isfinite(v):
+                rates.append(v)
+        if not rates:
+            return float("nan")
+        return float(max(rates))
+
+    def _resolve_source_path_for_file(self, filename: str) -> Path | None:
+        if self.use_cropped:
+            cand = step2_cropped_dir(self.params.P.result_dir) / filename
+            if cand.exists():
+                return cand
+            legacy = self.params.P.result_dir / "cropped" / filename
+            if legacy.exists():
+                return legacy
+        try:
+            orig = Path(self.params.get_file_path(filename))
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        return None
+
+    def _current_source_signature(self, filename: str) -> dict | None:
+        src = self._resolve_source_path_for_file(filename)
+        if src is None or not src.exists():
+            return None
+        try:
+            return _build_source_signature(src, use_cropped=bool(self.use_cropped))
+        except Exception:
+            return None
+
+    def _summary_row_compatible(self, filename: str, rec: dict, summary_path: Path) -> bool:
+        sig_now = self._current_source_signature(filename)
+        if sig_now is None:
+            return False
+        if not isinstance(rec, dict):
+            return False
+
+        # Preferred path: signature-compatible match from new cache schema.
+        src_path_val = rec.get("source_path")
+        src_path_txt = str(src_path_val).strip().lower() if src_path_val is not None else ""
+        if src_path_txt not in ("", "nan", "none", "null"):
+            return _source_signature_detection_compatible(rec, sig_now)
+
+        # Legacy path: allow only when saved fits_path matches current source.
+        fits_path = _norm_path_key(rec.get("fits_path", ""))
+        if not fits_path:
+            return False
+        if fits_path != _norm_path_key(sig_now.get("source_path", "")):
+            return False
+        return True
+
+    def _resolve_wcs_summary_path(self) -> Path | None:
+        candidates = [
+            step5_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
+            legacy_step7_wcs_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
+            self.params.P.result_dir / "wcs_solve_summary.csv",
+        ]
+        existing = [p for p in candidates if p.exists()]
+        existing.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
+        for p in existing:
+            if p.exists():
+                return p
+        return None
+
+    def _load_existing_result_tables(self):
+        summary_path = self._resolve_wcs_summary_path()
+        if summary_path is None:
+            return
+        try:
+            df = pd.read_csv(summary_path)
+        except Exception:
+            return
+        if df.empty:
+            return
+
+        self.results_table.setRowCount(0)
+        self.astrometrynet_results_table.setRowCount(0)
+        self.results = {}
+        ignored = 0
+        loaded = 0
+
+        for _, row in df.iterrows():
+            rec = row.to_dict()
+            fname = str(rec.get("file", rec.get("fname", "")) or "").strip()
+            if not fname:
+                continue
+            if not self._summary_row_compatible(fname, rec, summary_path):
+                ignored += 1
+                continue
+            rec["file"] = fname
+            rec["fname"] = fname
+            rec["ok"] = self._csv_bool(rec.get("ok"))
+            rec["wcs_qc_pass"] = self._csv_bool(rec.get("wcs_qc_pass"))
+            self.results[fname] = rec
+            loaded += 1
+
+            # Primary summary on ASTAP tab
+            self.on_file_done(fname, rec, emit_log=False)
+
+            # Show astrometry.net rows on its dedicated tab too
+            solver = str(rec.get("solver", "") or "").lower()
+            if "astnet" in solver:
+                self.on_astrometrynet_file_done(fname, rec, emit_log=False)
+        if ignored > 0:
+            self.log(
+                f"[CACHE] ignored {ignored} stale/incompatible WCS rows from {summary_path.name}"
+            )
+        if loaded <= 0 and ignored > 0:
+            self.log("[CACHE] no compatible WCS summary rows loaded; re-run Step5 for current frame set.")
+
     def open_parameters_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("WCS Parameters")
@@ -2114,11 +4271,9 @@ class WcsPlateSolvingWindow(StepWindowBase):
         wcs_form.addRow("Max Stars (S):", self.param_max_stars)
 
         self.param_max_workers = QSpinBox()
-        self.param_max_workers.setRange(0, 16)
-        self.param_max_workers.setValue(int(getattr(self.params.P, "max_workers", getattr(self.params.P, "parallel_max_workers", 0))))
-        self.param_max_workers.setEnabled(False)
-        self.param_max_workers.setToolTip("Step 5 uses global parallel workers from main settings.")
-        wcs_form.addRow("Workers (Global):", self.param_max_workers)
+        self.param_max_workers.setRange(1, 16)
+        self.param_max_workers.setValue(int(getattr(self.params.P, "wcs_max_workers", 1)))
+        wcs_form.addRow("Max Workers:", self.param_max_workers)
 
         self.param_require_qc = QCheckBox("Enable")
         self.param_require_qc.setChecked(bool(getattr(self.params.P, "wcs_require_qc_pass", True)))
@@ -2154,7 +4309,36 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_gaia_mag_max.setRange(10.0, 25.0)
         self.param_gaia_mag_max.setSingleStep(0.5)
         self.param_gaia_mag_max.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
-        wcs_form.addRow("Gaia Mag Max:", self.param_gaia_mag_max)
+        wcs_form.addRow("Gaia Query Mag Max (Step5):", self.param_gaia_mag_max)
+
+        self.param_ref_gaia_match_tol = QDoubleSpinBox()
+        self.param_ref_gaia_match_tol.setRange(0.1, 30.0)
+        self.param_ref_gaia_match_tol.setDecimals(2)
+        self.param_ref_gaia_match_tol.setSingleStep(0.1)
+        self.param_ref_gaia_match_tol.setValue(float(getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0)))
+        wcs_form.addRow("Gaia Match Tol (Ref, arcsec):", self.param_ref_gaia_match_tol)
+
+        self.param_wcs_qc_match_radius = QDoubleSpinBox()
+        self.param_wcs_qc_match_radius.setRange(0.5, 15.0)
+        self.param_wcs_qc_match_radius.setDecimals(2)
+        self.param_wcs_qc_match_radius.setSingleStep(0.1)
+        self.param_wcs_qc_match_radius.setValue(float(getattr(self.params.P, "wcs_qc_match_radius_arcsec", 2.0)))
+        wcs_form.addRow("WCS-QC Match Radius (arcsec):", self.param_wcs_qc_match_radius)
+
+        self.param_gaia_g_limit = QDoubleSpinBox()
+        self.param_gaia_g_limit.setRange(10.0, 25.0)
+        self.param_gaia_g_limit.setDecimals(2)
+        self.param_gaia_g_limit.setSingleStep(0.5)
+        self.param_gaia_g_limit.setValue(
+            float(
+                getattr(
+                    self.params.P,
+                    "idmatch_gaia_g_limit",
+                    getattr(self.params.P, "gaia_mag_max", 18.0),
+                )
+            )
+        )
+        wcs_form.addRow("Gaia G Limit (Hybrid ID, Step6/7):", self.param_gaia_g_limit)
 
         self.param_gaia_retry = QSpinBox()
         self.param_gaia_retry.setRange(0, 10)
@@ -2182,10 +4366,14 @@ class WcsPlateSolvingWindow(StepWindowBase):
     def open_astrometrynet_parameters_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Astrometry.net Parameters")
-        dialog.resize(520, 520)
+        dialog.resize(560, 640)
 
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
+
+        self.param_astnet_enable = QCheckBox("Enable")
+        self.param_astnet_enable.setChecked(bool(getattr(self.params.P, "astnet_local_enable", False)))
+        form.addRow("Enable Local Solve:", self.param_astnet_enable)
 
         self.param_astnet_use_wsl = QCheckBox("Use WSL")
         self.param_astnet_use_wsl.setChecked(bool(getattr(self.params.P, "astnet_local_use_wsl", True)))
@@ -2220,6 +4408,65 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_radius.setRange(0.1, 30.0)
         self.param_astnet_radius.setValue(float(getattr(self.params.P, "astnet_local_radius_deg", 8.0)))
         form.addRow("Radius (deg):", self.param_astnet_radius)
+
+        self.param_astnet_wcs_qc_match_radius = QDoubleSpinBox()
+        self.param_astnet_wcs_qc_match_radius.setRange(0.5, 15.0)
+        self.param_astnet_wcs_qc_match_radius.setDecimals(2)
+        self.param_astnet_wcs_qc_match_radius.setSingleStep(0.1)
+        self.param_astnet_wcs_qc_match_radius.setValue(float(getattr(self.params.P, "wcs_qc_match_radius_arcsec", 2.0)))
+        form.addRow("WCS-QC Match Radius (arcsec):", self.param_astnet_wcs_qc_match_radius)
+
+        self.param_astnet_gaia_fudge = QDoubleSpinBox()
+        self.param_astnet_gaia_fudge.setRange(0.5, 3.0)
+        self.param_astnet_gaia_fudge.setSingleStep(0.05)
+        self.param_astnet_gaia_fudge.setValue(float(getattr(self.params.P, "gaia_radius_fudge", 1.35)))
+        form.addRow("Gaia Radius Fudge:", self.param_astnet_gaia_fudge)
+
+        self.param_astnet_gaia_mag_max = QDoubleSpinBox()
+        self.param_astnet_gaia_mag_max.setRange(10.0, 25.0)
+        self.param_astnet_gaia_mag_max.setDecimals(2)
+        self.param_astnet_gaia_mag_max.setSingleStep(0.5)
+        self.param_astnet_gaia_mag_max.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
+        form.addRow("Gaia Query Mag Max (Step5):", self.param_astnet_gaia_mag_max)
+
+        self.param_astnet_ref_gaia_match_tol = QDoubleSpinBox()
+        self.param_astnet_ref_gaia_match_tol.setRange(0.1, 30.0)
+        self.param_astnet_ref_gaia_match_tol.setDecimals(2)
+        self.param_astnet_ref_gaia_match_tol.setSingleStep(0.1)
+        self.param_astnet_ref_gaia_match_tol.setValue(
+            float(getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0))
+        )
+        form.addRow("Gaia Match Tol (Ref, arcsec):", self.param_astnet_ref_gaia_match_tol)
+
+        self.param_astnet_gaia_g_limit = QDoubleSpinBox()
+        self.param_astnet_gaia_g_limit.setRange(10.0, 25.0)
+        self.param_astnet_gaia_g_limit.setDecimals(2)
+        self.param_astnet_gaia_g_limit.setSingleStep(0.5)
+        self.param_astnet_gaia_g_limit.setValue(
+            float(
+                getattr(
+                    self.params.P,
+                    "idmatch_gaia_g_limit",
+                    getattr(self.params.P, "gaia_mag_max", 18.0),
+                )
+            )
+        )
+        form.addRow("Gaia G Limit (Hybrid ID, Step6/7):", self.param_astnet_gaia_g_limit)
+
+        self.param_astnet_gaia_retry = QSpinBox()
+        self.param_astnet_gaia_retry.setRange(0, 10)
+        self.param_astnet_gaia_retry.setValue(int(getattr(self.params.P, "gaia_retry", 2)))
+        form.addRow("Gaia Retry:", self.param_astnet_gaia_retry)
+
+        self.param_astnet_gaia_backoff = QDoubleSpinBox()
+        self.param_astnet_gaia_backoff.setRange(0.0, 120.0)
+        self.param_astnet_gaia_backoff.setSingleStep(0.5)
+        self.param_astnet_gaia_backoff.setValue(float(getattr(self.params.P, "gaia_backoff_s", 6.0)))
+        form.addRow("Gaia Backoff (s):", self.param_astnet_gaia_backoff)
+
+        self.param_astnet_gaia_allow_no_cache = QCheckBox("Allow")
+        self.param_astnet_gaia_allow_no_cache.setChecked(bool(getattr(self.params.P, "gaia_allow_no_cache", True)))
+        form.addRow("Gaia Allow No Cache:", self.param_astnet_gaia_allow_no_cache)
 
         self.param_astnet_keep_outputs = QCheckBox("Keep")
         self.param_astnet_keep_outputs.setChecked(bool(getattr(self.params.P, "astnet_local_keep_outputs", True)))
@@ -2256,6 +4503,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astap_fov_fudge = self.param_fov_fudge.value()
         self.params.P.astap_downsample_z = self.param_downsample.value()
         self.params.P.astap_max_stars_s = self.param_max_stars.value()
+        self.params.P.wcs_max_workers = self.param_max_workers.value()
         self.params.P.wcs_require_qc_pass = self.param_require_qc.isChecked()
         self.params.P.wcs_refine_enable = self.param_refine_enable.isChecked()
         self.params.P.wcs_refine_max_match = self.param_refine_max_match.value()
@@ -2263,18 +4511,19 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.wcs_refine_min_match = self.param_refine_min_match.value()
         self.params.P.gaia_radius_fudge = self.param_gaia_fudge.value()
         self.params.P.gaia_mag_max = self.param_gaia_mag_max.value()
+        self.params.P.ref_wcs_match_radius_arcsec = self.param_ref_gaia_match_tol.value()
+        self.params.P.wcs_qc_match_radius_arcsec = self.param_wcs_qc_match_radius.value()
+        self.params.P.idmatch_gaia_g_limit = self.param_gaia_g_limit.value()
         self.params.P.gaia_retry = self.param_gaia_retry.value()
         self.params.P.gaia_backoff_s = self.param_gaia_backoff.value()
         self.params.P.gaia_allow_no_cache = self.param_gaia_allow_no_cache.isChecked()
-        saved = self.persist_params()
+        self.persist_params()
         self.save_state()
-        if saved:
-            QMessageBox.information(dialog, "Success", "Parameters saved!")
-        else:
-            QMessageBox.warning(dialog, "Warning", "parameters.toml save failed. Settings are only in memory.")
+        QMessageBox.information(dialog, "Success", "Parameters saved!")
         dialog.accept()
 
     def save_astrometrynet_parameters(self, dialog):
+        self.params.P.astnet_local_enable = self.param_astnet_enable.isChecked()
         self.params.P.astnet_local_use_wsl = self.param_astnet_use_wsl.isChecked()
         self.params.P.astnet_local_command = self.param_astnet_command.text().strip()
         self.params.P.astnet_local_timeout_s = self.param_astnet_timeout.value()
@@ -2286,12 +4535,17 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astnet_local_use_cache = self.param_astnet_use_cache.isChecked()
         self.params.P.astnet_local_max_objs = self.param_astnet_max_objs.value()
         self.params.P.astnet_local_cpulimit_s = self.param_astnet_cpulimit.value()
-        saved = self.persist_params()
+        self.params.P.wcs_qc_match_radius_arcsec = self.param_astnet_wcs_qc_match_radius.value()
+        self.params.P.gaia_radius_fudge = self.param_astnet_gaia_fudge.value()
+        self.params.P.gaia_mag_max = self.param_astnet_gaia_mag_max.value()
+        self.params.P.ref_wcs_match_radius_arcsec = self.param_astnet_ref_gaia_match_tol.value()
+        self.params.P.idmatch_gaia_g_limit = self.param_astnet_gaia_g_limit.value()
+        self.params.P.gaia_retry = self.param_astnet_gaia_retry.value()
+        self.params.P.gaia_backoff_s = self.param_astnet_gaia_backoff.value()
+        self.params.P.gaia_allow_no_cache = self.param_astnet_gaia_allow_no_cache.isChecked()
+        self.persist_params()
         self.save_state()
-        if saved:
-            QMessageBox.information(dialog, "Success", "Astrometry.net parameters saved!")
-        else:
-            QMessageBox.warning(dialog, "Warning", "parameters.toml save failed. Settings are only in memory.")
+        QMessageBox.information(dialog, "Success", "Astrometry.net parameters saved!")
         dialog.accept()
 
     def run_wcs(self):
@@ -2340,33 +4594,79 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
     def stop_wcs(self):
         if self.worker and self.worker.isRunning():
+            self.stop_requested = True
+            self.btn_stop.setEnabled(False)
+            self.progress_label.setText("Stopping...")
+            self.log("Stop requested...")
             self.worker.stop()
 
     def on_progress(self, current, total, filename):
         self.progress_bar.setValue(current)
         self.progress_label.setText(f"{current}/{total} | {filename}")
 
-    def on_file_done(self, filename, result):
+    def on_file_done(self, filename, result, emit_log=True):
+        def _f(v):
+            try:
+                return float(v)
+            except Exception:
+                return float("nan")
+
         self.results[filename] = result
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         self.results_table.setItem(row, 0, QTableWidgetItem(filename))
-        self.results_table.setItem(row, 1, QTableWidgetItem(str(result.get("status", ""))))
-        pix_fit = result.get("pix_fit")
-        pix_str = f"{pix_fit:.4f}" if isinstance(pix_fit, float) and np.isfinite(pix_fit) else "-"
-        self.results_table.setItem(row, 2, QTableWidgetItem(pix_str))
-        refine = result.get("refine", "")
-        self.results_table.setItem(row, 3, QTableWidgetItem(str(refine)))
-        resid_med = result.get("resid_med")
-        resid_str = f"{resid_med:.3f}" if isinstance(resid_med, float) and np.isfinite(resid_med) else "-"
-        self.results_table.setItem(row, 4, QTableWidgetItem(resid_str))
-        elapsed = result.get("elapsed", 0.0)
-        self.results_table.setItem(row, 5, QTableWidgetItem(f"{elapsed:.1f}"))
-        pix_fit_log = result.get("pix_fit")
-        pix_log = f"{pix_fit_log:.4f}" if isinstance(pix_fit_log, float) and np.isfinite(pix_fit_log) else "-"
-        resid_log = result.get("resid_med")
-        resid_str = f"{resid_log:.3f}" if isinstance(resid_log, float) and np.isfinite(resid_log) else "-"
-        self.log(f"{filename}: {result.get('status', '')} pix={pix_log} refine={refine or '-'} resid_med={resid_str}")
+        status = str(result.get("status", ""))
+        self.results_table.setItem(row, 1, QTableWidgetItem(status))
+
+        solver = str(result.get("solver", "") or "-")
+        self.results_table.setItem(row, 2, QTableWidgetItem(solver))
+
+        ra = _f(result.get("center_ra_deg", result.get("ra", np.nan)))
+        dec = _f(result.get("center_dec_deg", result.get("dec", np.nan)))
+        self.results_table.setItem(row, 3, QTableWidgetItem(f"{ra:.6f}" if np.isfinite(ra) else "-"))
+        self.results_table.setItem(row, 4, QTableWidgetItem(f"{dec:.6f}" if np.isfinite(dec) else "-"))
+
+        pix_fit = _f(result.get("pix_fit", result.get("pixscale", np.nan)))
+        self.results_table.setItem(row, 5, QTableWidgetItem(f"{pix_fit:.4f}" if np.isfinite(pix_fit) and pix_fit > 0 else "-"))
+
+        refine = str(result.get("refine", "") or "-")
+        self.results_table.setItem(row, 6, QTableWidgetItem(refine))
+
+        n_match = int(result.get("n_match", result.get("match_n", 0)) or 0)
+        self.results_table.setItem(row, 7, QTableWidgetItem(str(n_match)))
+
+        match_rate = _f(self._effective_match_rate(result))
+        self.results_table.setItem(row, 8, QTableWidgetItem(f"{match_rate:.3f}" if np.isfinite(match_rate) else "-"))
+
+        rms_px = _f(result.get("rms_px", np.nan))
+        self.results_table.setItem(row, 9, QTableWidgetItem(f"{rms_px:.3f}" if np.isfinite(rms_px) else "-"))
+
+        qc_pass = bool(result.get("wcs_qc_pass", False))
+        qc_reason = str(result.get("wcs_qc_reason", "") or "").strip()
+        if qc_pass:
+            qc_txt = "PASS"
+        elif qc_reason:
+            qc_txt = f"FAIL ({qc_reason})"
+        else:
+            qc_txt = "-"
+        self.results_table.setItem(row, 10, QTableWidgetItem(qc_txt))
+
+        fail_reason = self._text_or_dash(result.get("fail_reason", ""))
+        if fail_reason == "-" and (not bool(result.get("ok", False))):
+            fail_reason = self._text_or_dash(result.get("wcs_qc_reason", ""))
+            if fail_reason == "-":
+                fail_reason = self._text_or_dash(result.get("status", ""))
+        self.results_table.setItem(row, 11, QTableWidgetItem(fail_reason))
+
+        elapsed = _f(result.get("elapsed", result.get("elapsed_s", 0.0)) or 0.0)
+        self.results_table.setItem(row, 12, QTableWidgetItem(f"{elapsed:.1f}" if np.isfinite(elapsed) else "-"))
+
+        if emit_log:
+            self.log(
+                f"{filename}: {status} solver={solver} pix={pix_fit if np.isfinite(pix_fit) else '-'} "
+                f"n_match={n_match} rate={match_rate if np.isfinite(match_rate) else '-'} "
+                f"rms={rms_px if np.isfinite(rms_px) else '-'} qc={qc_txt} fail={fail_reason}"
+            )
 
     def on_error(self, filename, error):
         self.log(f"ERROR {filename}: {error}")
@@ -2374,9 +4674,14 @@ class WcsPlateSolvingWindow(StepWindowBase):
     def on_finished(self, summary):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.progress_label.setText("Done")
+        self.stop_requested = False
+        stopped = bool(summary.get("stopped")) if isinstance(summary, dict) else False
+        self.progress_label.setText("Stopped" if stopped else "Done")
         if summary:
-            self.log(f"WCS done: {summary.get('ok', 0)}/{summary.get('total', 0)} OK")
+            self.log(
+                f"WCS done: {summary.get('ok', 0)}/{summary.get('total', 0)} OK | "
+                f"WCS-QC pass: {summary.get('wcs_qc_pass', 0)}"
+            )
         self.save_state()
         self.update_navigation_buttons()
 
@@ -2404,6 +4709,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
             "wcs_refine_min_match": getattr(self.params.P, "wcs_refine_min_match", 50),
             "gaia_radius_fudge": getattr(self.params.P, "gaia_radius_fudge", 1.35),
             "gaia_mag_max": getattr(self.params.P, "gaia_mag_max", 18.0),
+            "ref_wcs_match_radius_arcsec": getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0),
+            "idmatch_gaia_g_limit": getattr(self.params.P, "idmatch_gaia_g_limit", getattr(self.params.P, "gaia_mag_max", 18.0)),
             "gaia_retry": getattr(self.params.P, "gaia_retry", 2),
             "gaia_backoff_s": getattr(self.params.P, "gaia_backoff_s", 6.0),
             "gaia_allow_no_cache": getattr(self.params.P, "gaia_allow_no_cache", True),

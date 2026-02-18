@@ -2,6 +2,24 @@
 
 All notable changes are documented here. Dates follow the existing project notes.
 
+## 2026-02-18
+
+### Step 5 (WCS / Gaia)
+- Fixed Gaia TAP truncation risk in Step 5:
+  - Sync query results near ~2000 rows are now re-checked with async query.
+  - If async returns more rows, async results are used and cached.
+- Strengthened Gaia cache validation:
+  - Cache center tolerance tightened.
+  - Partial-field Gaia caches are rejected and re-queried.
+
+### Parameter Naming / UX
+- Clarified Gaia parameter labels to reduce confusion:
+  - `Gaia Query Mag Max (Step5)` for catalog fetch depth.
+  - `Gaia Match Tol (Ref, arcsec)` for Step6 ref Gaia matching tolerance.
+  - `Gaia G Limit (Hybrid ID, Step6/7)` for hybrid Gaia-ID keep threshold.
+- Added `gaia.match_tol_arcsec` mapping to `ref_wcs_match_radius_arcsec` for explicit TOML control.
+- Astrometry.net parameter dialog now also edits/saves Gaia match tolerance.
+
 ## 2024-12-29
 
 ### Configuration and Tools
