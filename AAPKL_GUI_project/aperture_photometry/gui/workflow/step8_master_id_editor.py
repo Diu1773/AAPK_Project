@@ -884,11 +884,130 @@ class MasterIdEditorWindow(StepWindowBase):
                 df = pd.read_csv(path, sep="\t")
                 if "source_id" not in df.columns:
                     continue
-                sids = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
-                self.filter_master_ids[flt] = set(sids.tolist())
+                self.filter_master_ids[flt] = self._sanitize_master_catalog_source_ids(flt, df)
                 self.log(f"Master catalog loaded: {path.name} ({len(self.filter_master_ids[flt])} sources)")
             except Exception as e:
                 self.log(f"Failed to load master catalog for {flt}: {e}")
+
+    def _known_positive_source_ids(self, flt: Optional[str] = None) -> Set[int]:
+        """Collect known valid positive source_ids from loaded catalogs/gaia."""
+        known: Set[int] = set()
+
+        if flt:
+            catalogs = [self.filter_catalogs.get(flt)]
+        else:
+            catalogs = list(self.filter_catalogs.values())
+        for cat in catalogs:
+            if cat is None or "source_id" not in cat.columns:
+                continue
+            vals = pd.to_numeric(cat["source_id"], errors="coerce").dropna().astype("int64")
+            known.update(int(v) for v in vals.tolist() if int(v) > 0)
+
+        if self.step6_master_df is not None and "source_id" in self.step6_master_df.columns:
+            vals = pd.to_numeric(self.step6_master_df["source_id"], errors="coerce").dropna().astype("int64")
+            known.update(int(v) for v in vals.tolist() if int(v) > 0)
+
+        if self.gaia_df is not None and "source_id" in self.gaia_df.columns:
+            vals = pd.to_numeric(self.gaia_df["source_id"], errors="coerce").dropna().astype("int64")
+            known.update(int(v) for v in vals.tolist() if int(v) > 0)
+
+        return known
+
+    def _sanitize_master_catalog_source_ids(self, flt: str, df: pd.DataFrame) -> Set[int]:
+        """Repair legacy/corrupted source_id values in saved Step8 catalogs."""
+        sid_series = pd.to_numeric(df.get("source_id"), errors="coerce").dropna().astype("int64")
+        raw_ids = [int(v) for v in sid_series.tolist()]
+        if not raw_ids:
+            return set()
+
+        known_pos = self._known_positive_source_ids(flt)
+        sid_remap: Dict[int, int] = {}
+        idmap_fixed = 0
+        dup_fixed = 0
+        drift_fixed = 0
+
+        # If source_id was accidentally saved as stable ID (1,2,3...), recover from
+        # Step6 source_id<->ID map first.
+        self._load_global_id_map(flt)
+        id_to_source: Dict[int, int] = {}
+        for src_sid, stable_id in self._global_id_map.items():
+            src_i = int(src_sid)
+            id_i = int(stable_id)
+            if src_i <= 0 or id_i <= 0 or id_i in id_to_source:
+                continue
+            id_to_source[id_i] = src_i
+        for sid in sorted(set(raw_ids)):
+            if sid <= 0:
+                continue
+            mapped_sid = id_to_source.get(int(sid))
+            if mapped_sid is None or int(mapped_sid) == int(sid):
+                continue
+            obvious_small = sid < 1_000_000
+            unknown_vs_known = bool(known_pos) and (sid not in known_pos and int(mapped_sid) in known_pos)
+            if obvious_small or unknown_vs_known:
+                sid_remap[sid] = int(mapped_sid)
+                idmap_fixed += 1
+
+        # Legacy corruption pattern: same stable ID repeated with both real Gaia ID
+        # and small mirrored ID (1,2,3...).
+        if "ID" in df.columns:
+            pair = pd.DataFrame({
+                "source_id": pd.to_numeric(df["source_id"], errors="coerce"),
+                "ID": pd.to_numeric(df["ID"], errors="coerce"),
+            })
+            pair = pair[pair["source_id"].notna() & pair["ID"].notna()].copy()
+            if not pair.empty:
+                pair["source_id"] = pair["source_id"].astype("int64")
+                pair["ID"] = pair["ID"].astype("int64")
+                for stable_id, group in pair.groupby("ID"):
+                    uniq = sorted({int(v) for v in group["source_id"].tolist()})
+                    if len(uniq) <= 1:
+                        continue
+
+                    known_hits = [sid for sid in uniq if sid > 0 and sid in known_pos]
+                    if known_hits:
+                        preferred = max(known_hits, key=abs)
+                    else:
+                        non_mirror = [sid for sid in uniq if sid != int(stable_id)]
+                        preferred = max(non_mirror, key=abs) if non_mirror else max(uniq, key=abs)
+
+                    for sid in uniq:
+                        if sid <= 0 or sid == preferred:
+                            continue
+                        obvious_mirror = sid == int(stable_id)
+                        obvious_small = sid < 1_000_000 and preferred > 1_000_000_000_000
+                        unknown_vs_known = bool(known_pos) and (sid not in known_pos and preferred in known_pos)
+                        if obvious_mirror or obvious_small or unknown_vs_known:
+                            sid_remap[sid] = preferred
+                            dup_fixed += 1
+
+        # Additional repair for old float-rounded Gaia IDs (typically +/-128n drift).
+        if known_pos:
+            for sid in sorted(set(raw_ids)):
+                src_sid = int(sid_remap.get(sid, sid))
+                if src_sid <= 0 or src_sid in known_pos:
+                    continue
+                cands = []
+                for delta in (-128, 128, -256, 256, -384, 384, -512, 512):
+                    cand = src_sid + delta
+                    if cand in known_pos:
+                        cands.append((abs(delta), int(cand)))
+                if not cands:
+                    continue
+                cands.sort(key=lambda x: x[0])
+                best_abs = cands[0][0]
+                best = sorted({cand for ad, cand in cands if ad == best_abs})
+                if len(best) == 1:
+                    sid_remap[sid] = int(best[0])
+                    drift_fixed += 1
+
+        clean_ids = {int(sid_remap.get(sid, sid)) for sid in raw_ids}
+        if idmap_fixed or dup_fixed or drift_fixed:
+            self.log(
+                f"[Step8] {flt}: repaired source_id issues "
+                f"(id_map={idmap_fixed}, dup={dup_fixed}, drift={drift_fixed})"
+            )
+        return clean_ids
 
     # ─────────────────────────────────────────────────────────────────────────
     # Stable ID Registry Management
@@ -2003,7 +2122,12 @@ class MasterIdEditorWindow(StepWindowBase):
             self.master_table.setItem(i, 0, QTableWidgetItem(str(stable_id)))
             self.master_table.setItem(i, 1, QTableWidgetItem(f"{x_pos:.1f}"))
             self.master_table.setItem(i, 2, QTableWidgetItem(f"{y_pos:.1f}"))
-            g_str = f"{g_mag:.2f}" if np.isfinite(g_mag) else "-"
+            if np.isfinite(g_mag):
+                g_str = f"{g_mag:.2f}"
+            elif int(sid) < 0:
+                g_str = "local"
+            else:
+                g_str = "-"
             self.master_table.setItem(i, 3, QTableWidgetItem(g_str))
             color_str = f"{color_val:.2f}" if np.isfinite(color_val) else "-"
             self.master_table.setItem(i, 4, QTableWidgetItem(color_str))
@@ -2522,27 +2646,32 @@ class MasterIdEditorWindow(StepWindowBase):
         step8_dir = self.params.P.result_dir / "step8_selection"
         step8_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load master catalog to map source_id -> ID (final ID)
-        master_path = step8_dir / f"master_catalog_{flt}.tsv"
-        source_to_id = {}
-        if master_path.exists():
-            try:
-                mc = pd.read_csv(master_path, sep="\t")
-                if "source_id" in mc.columns and "ID" in mc.columns:
-                    source_to_id = dict(zip(mc["source_id"].astype(int), mc["ID"].astype(int)))
-            except Exception:
-                pass
+        # Ensure selected IDs are included in master catalog first.
+        all_sids = {int(sid) for sid in comp_sids if sid is not None}
+        if target_sid is not None:
+            all_sids.add(int(target_sid))
+        if flt not in self.filter_master_ids:
+            self.filter_master_ids[flt] = set()
+        self.filter_master_ids[flt].update(all_sids)
+
+        # Save master catalog before writing selection so source_id -> ID mapping is up to date.
+        self.save_master_catalog(flt=flt, log_action="copy_selection")
+        source_to_id = self._load_source_to_id_map(flt)
 
         # Map source_ids to final IDs
-        target_id = source_to_id.get(int(target_sid)) if target_sid else None
-        comp_ids = sorted([source_to_id.get(int(sid)) for sid in comp_sids if source_to_id.get(int(sid)) is not None])
+        target_id = source_to_id.get(int(target_sid)) if target_sid is not None else None
+        comp_ids = sorted([
+            int(source_to_id[int(sid)])
+            for sid in comp_sids
+            if sid is not None and int(sid) in source_to_id
+        ])
 
         data = {
             "filter": flt,
             "target_id": target_id,
-            "target_source_id": int(target_sid),
+            "target_source_id": int(target_sid) if target_sid is not None else None,
             "comparison_ids": comp_ids,
-            "comparison_source_ids": sorted([int(sid) for sid in comp_sids]),
+            "comparison_source_ids": sorted([int(sid) for sid in comp_sids if sid is not None]),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -2550,18 +2679,34 @@ class MasterIdEditorWindow(StepWindowBase):
         with open(selection_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-        # Also ensure master_ids for this filter includes the selection
-        all_sids = comp_sids.copy()
-        if target_sid is not None:
-            all_sids.add(int(target_sid))
-        if flt not in self.filter_master_ids:
-            self.filter_master_ids[flt] = set()
-        self.filter_master_ids[flt].update(all_sids)
-
-        # Save master catalog for this filter
-        self.save_master_catalog(flt=flt, log_action="copy_selection")
-
         self.log(f"  Saved selection for {flt}: target={target_sid}, {len(comp_sids)} comps")
+
+    def _load_source_to_id_map(self, flt: str) -> Dict[int, int]:
+        """Load final source_id -> ID mapping for a filter from Step 8 outputs."""
+        step8_dir = self.params.P.result_dir / "step8_selection"
+        source_to_id: Dict[int, int] = {}
+        candidates = [
+            (step8_dir / f"master_catalog_{flt}.tsv", "\t"),
+            (step8_dir / f"id_mapping_{flt}.csv", ","),
+        ]
+        for path, sep in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path, sep=sep)
+            except Exception:
+                continue
+            if not {"source_id", "ID"} <= set(df.columns):
+                continue
+            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
+            id_vals = pd.to_numeric(df["ID"], errors="coerce")
+            for sid_val, id_val in zip(sid_vals, id_vals):
+                if not (np.isfinite(sid_val) and np.isfinite(id_val)):
+                    continue
+                sid_int = int(sid_val)
+                if sid_int not in source_to_id:
+                    source_to_id[sid_int] = int(id_val)
+        return source_to_id
 
     def select_target_from_simbad(self):
         """SIMBAD 좌표로 타겟 선택 (Step 1에서 입력한 대상 좌표 사용)"""
@@ -2688,20 +2833,26 @@ class MasterIdEditorWindow(StepWindowBase):
         step8_dir = self.params.P.result_dir / "step8_selection"
         step8_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load master catalog to map source_id -> ID (final ID)
-        master_path = step8_dir / f"master_catalog_{self.current_filter}.tsv"
-        source_to_id = {}
-        if master_path.exists():
-            try:
-                mc = pd.read_csv(master_path, sep="\t")
-                if "source_id" in mc.columns and "ID" in mc.columns:
-                    source_to_id = dict(zip(mc["source_id"].astype(int), mc["ID"].astype(int)))
-            except Exception:
-                pass
+        # Ensure selected IDs are present in the master set first.
+        all_sids = {int(sid) for sid in self.comparison_ids if sid is not None}
+        if self.target_source_id is not None:
+            all_sids.add(int(self.target_source_id))
+        if self.current_filter not in self.filter_master_ids:
+            self.filter_master_ids[self.current_filter] = set()
+        self.filter_master_ids[self.current_filter].update(all_sids)
+        self.master_ids = self.filter_master_ids[self.current_filter]
+
+        # Save/update master catalog first, then map source IDs to final IDs.
+        self.save_master_catalog(log_action="selection_update")
+        source_to_id = self._load_source_to_id_map(self.current_filter)
 
         # Map source_ids to final IDs
-        target_id = source_to_id.get(int(self.target_source_id)) if self.target_source_id else None
-        comp_ids = sorted([source_to_id.get(int(sid)) for sid in self.comparison_ids if source_to_id.get(int(sid)) is not None])
+        target_id = source_to_id.get(int(self.target_source_id)) if self.target_source_id is not None else None
+        comp_ids = sorted([
+            int(source_to_id[int(sid)])
+            for sid in self.comparison_ids
+            if sid is not None and int(sid) in source_to_id
+        ])
 
         # 필터별 저장 (catalog 없이도 동작)
         data = {
@@ -2719,18 +2870,6 @@ class MasterIdEditorWindow(StepWindowBase):
 
         # Save selection summary inside Step 8 directory
         self._save_legacy_selection()
-
-        # Ensure selected IDs are in master_ids
-        all_sids = self.comparison_ids.copy()
-        if self.target_source_id is not None:
-            all_sids.add(int(self.target_source_id))
-        if self.current_filter not in self.filter_master_ids:
-            self.filter_master_ids[self.current_filter] = set()
-        self.filter_master_ids[self.current_filter].update(all_sids)
-        self.master_ids = self.filter_master_ids[self.current_filter]
-
-        # Always save/update master catalog when selection changes
-        self.save_master_catalog(log_action="selection_update")
 
         self.save_state()
         self.update_navigation_buttons()

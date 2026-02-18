@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step8_dir, crop_is_active
+from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, crop_is_active
 
 
 class MasterIdEditorWindow(StepWindowBase):
@@ -49,8 +49,10 @@ class MasterIdEditorWindow(StepWindowBase):
         self.last_click_xy = None
         self.gaia_df = None  # Gaia catalog cache
         self.master_gmag_map = {}
-        self.internal_id_map = {}  # source_id -> internal_id
-        self.source_id_from_internal = {}  # internal_id -> source_id
+        # Fixed ID map (source_id -> display ID); IDs must stay stable across sessions.
+        self.internal_id_map = {}
+        self.source_id_from_internal = {}
+        self._global_id_map = {}
         self._auto_master_dirty = False
 
         # Matplotlib components
@@ -237,6 +239,31 @@ class MasterIdEditorWindow(StepWindowBase):
                     pass
             files = self.file_manager.filenames
             self.use_cropped = False
+
+        base_count = len(files)
+        # Hide unsolved frames: keep only Step7 rows with wcs_ok=True when available.
+        stats_path = step7_dir(self.params.P.result_dir) / "step7_frame_stats.csv"
+        if stats_path.exists():
+            try:
+                s7 = pd.read_csv(stats_path)
+            except Exception:
+                s7 = pd.DataFrame()
+            if (not s7.empty) and ("file" in s7.columns):
+                if "wcs_ok" in s7.columns:
+                    wcs_ok = s7["wcs_ok"].astype(str).str.strip().str.lower().isin({"true", "1", "yes", "y", "on"})
+                else:
+                    wcs_ok = pd.Series(True, index=s7.index, dtype=bool)
+                keep = set(s7.loc[wcs_ok, "file"].astype(str).tolist())
+                files = [f for f in files if f in keep]
+                self.log(f"Step8 frame filter (wcs_ok): {len(files)}/{base_count} kept")
+
+        # Also hide frames without Step7 idmatch output.
+        idmatch_dir = self.params.P.cache_dir / "idmatch"
+        if idmatch_dir.exists():
+            before_idm = len(files)
+            files = [f for f in files if (idmatch_dir / f"idmatch_{f}.csv").exists()]
+            self.log(f"Step8 frame filter (idmatch csv): {len(files)}/{before_idm} kept")
+
         self.file_list = list(files)
         self.file_combo.clear()
         self.file_combo.addItems(self.file_list)
@@ -249,19 +276,207 @@ class MasterIdEditorWindow(StepWindowBase):
             master_path = self.params.P.result_dir / "master_star_ids.csv"
         self.internal_id_map = {}
         self.source_id_from_internal = {}
+        self._load_global_id_map()
         if master_path.exists():
             try:
                 df = pd.read_csv(master_path)
                 if "source_id" in df.columns:
-                    self.master_ids = set(df["source_id"].dropna().astype("int64").tolist())
+                    sid_vals = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
+                    self.master_ids = set(sid_vals.tolist())
                     if "g_mag" in df.columns:
                         gmag_series = pd.to_numeric(df["g_mag"], errors="coerce")
-                        sid_series = df["source_id"].astype("int64")
-                        self.master_gmag_map = dict(zip(sid_series.tolist(), gmag_series.tolist()))
+                        sid_series = pd.to_numeric(df["source_id"], errors="coerce")
+                        valid_sid = np.isfinite(sid_series.to_numpy(float))
+                        sid_clean = sid_series.loc[valid_sid].astype("int64")
+                        gmag_clean = gmag_series.loc[valid_sid]
+                        self.master_gmag_map = dict(zip(sid_clean.tolist(), gmag_clean.tolist()))
+                    # Repair legacy float-rounded Gaia IDs from old Step8 save files.
+                    sid_repair_map = self._repair_legacy_step8_source_ids()
+                    # Prefer saved fixed ID mapping when available.
+                    if "ID" in df.columns:
+                        id_vals = pd.to_numeric(df["ID"], errors="coerce")
+                    elif "internal_id" in df.columns:
+                        # Legacy compatibility.
+                        id_vals = pd.to_numeric(df["internal_id"], errors="coerce")
+                    else:
+                        id_vals = pd.Series([np.nan] * len(df))
+                    for sid_v, id_v in zip(pd.to_numeric(df["source_id"], errors="coerce"), id_vals):
+                        if not (np.isfinite(sid_v) and np.isfinite(id_v)):
+                            continue
+                        sid_i = int(sid_repair_map.get(int(sid_v), int(sid_v)))
+                        id_i = int(id_v)
+                        if sid_i in self.internal_id_map:
+                            continue
+                        if id_i in self.source_id_from_internal and self.source_id_from_internal[id_i] != sid_i:
+                            continue
+                        self.internal_id_map[sid_i] = id_i
+                        self.source_id_from_internal[id_i] = sid_i
+                    for sid_i in sorted(self.master_ids):
+                        self._ensure_stable_id(sid_i)
+                    # Fallback: preload Gaia G magnitudes from Step6 ref catalog.
+                    self._load_step6_gmag_map()
                     self.log(f"Loaded {len(self.master_ids)} master IDs from {master_path.name}")
                     self.update_master_table()
             except Exception as e:
                 self.log(f"Error loading master IDs: {e}")
+
+    def _repair_legacy_step8_source_ids(self) -> dict[int, int]:
+        """Repair legacy Step8 source_ids affected by float rounding of Gaia IDs.
+
+        Old runs could save Gaia source_id via float path, producing offsets that are
+        typically multiples of 128. This remaps positive IDs to Step6 canonical IDs
+        when a unique nearby candidate exists.
+        """
+        sid_map: dict[int, int] = {}
+        step6_master = step6_dir(self.params.P.result_dir) / "master_star_ids.csv"
+        if not step6_master.exists():
+            return sid_map
+        try:
+            df6 = pd.read_csv(step6_master)
+            s6 = pd.to_numeric(df6.get("source_id"), errors="coerce").dropna().astype("int64")
+            canon_pos = {int(v) for v in s6.tolist() if int(v) > 0}
+        except Exception:
+            return sid_map
+        if not canon_pos:
+            return sid_map
+
+        repaired_ids: set[int] = set()
+        repaired_count = 0
+        ambiguous = 0
+        unresolved = 0
+        for sid in sorted(int(v) for v in self.master_ids):
+            if sid <= 0:
+                repaired_ids.add(sid)
+                continue
+            if sid in canon_pos:
+                repaired_ids.add(sid)
+                continue
+            cands: list[tuple[int, int]] = []
+            for delta in (-128, 128, -256, 256, -384, 384, -512, 512):
+                cand = sid + delta
+                if cand in canon_pos:
+                    cands.append((abs(delta), cand))
+            if not cands:
+                unresolved += 1
+                repaired_ids.add(sid)
+                continue
+            cands.sort(key=lambda x: x[0])
+            best_abs = cands[0][0]
+            best = sorted({cand for ad, cand in cands if ad == best_abs})
+            if len(best) != 1:
+                ambiguous += 1
+                repaired_ids.add(sid)
+                continue
+            new_sid = int(best[0])
+            repaired_ids.add(new_sid)
+            sid_map[sid] = new_sid
+            repaired_count += 1
+
+        if sid_map:
+            # Move any saved g_mag entries to repaired keys.
+            for old_sid, new_sid in sid_map.items():
+                if old_sid in self.master_gmag_map and new_sid not in self.master_gmag_map:
+                    self.master_gmag_map[new_sid] = self.master_gmag_map[old_sid]
+            self.master_ids = repaired_ids
+            self.log(
+                "[Step8] Repaired legacy source_id precision drift: "
+                f"mapped={repaired_count}, ambiguous={ambiguous}, unresolved={unresolved}"
+            )
+        return sid_map
+
+    def _load_step6_gmag_map(self):
+        """Fallback G-mag map from Step6 ref catalog when Gaia lookup is unavailable."""
+        candidates = [
+            step6_dir(self.params.P.result_dir) / "ref_catalog.tsv",
+            self.params.P.result_dir / "ref_catalog.tsv",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path, sep="\t")
+            except Exception:
+                continue
+            if "source_id" not in df.columns:
+                continue
+            g_col = None
+            for cand in ("phot_g_mean_mag", "gaia_G", "g_mag"):
+                if cand in df.columns:
+                    g_col = cand
+                    break
+            if g_col is None:
+                continue
+            sid = pd.to_numeric(df["source_id"], errors="coerce")
+            g = pd.to_numeric(df[g_col], errors="coerce")
+            valid = sid.notna() & g.notna()
+            if not valid.any():
+                continue
+            sid_i = sid.loc[valid].astype("int64")
+            g_v = g.loc[valid].astype(float)
+            loaded = 0
+            for s, gv in zip(sid_i.tolist(), g_v.tolist()):
+                if not np.isfinite(gv):
+                    continue
+                self.master_gmag_map[int(s)] = float(gv)
+                loaded += 1
+            if loaded > 0:
+                self.log(f"Gmag fallback loaded from {path.name}: {loaded} rows")
+                break
+
+    def _load_global_id_map(self):
+        """Load source_id -> ID map generated by Step 6 (RefBuild)."""
+        self._global_id_map = {}
+        candidates = [
+            step6_dir(self.params.P.result_dir) / "sourceid_to_ID.csv",
+            step7_dir(self.params.P.result_dir) / "sourceid_to_ID.csv",
+            self.params.P.result_dir / "sourceid_to_ID.csv",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            if not {"source_id", "ID"} <= set(df.columns):
+                continue
+            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
+            id_vals = pd.to_numeric(df["ID"], errors="coerce")
+            for sid_v, id_v in zip(sid_vals, id_vals):
+                if np.isfinite(sid_v) and np.isfinite(id_v):
+                    self._global_id_map[int(sid_v)] = int(id_v)
+            if self._global_id_map:
+                break
+
+    def _next_available_id(self) -> int:
+        used = {int(v) for v in self.source_id_from_internal.keys() if int(v) > 0}
+        used.update(int(v) for v in self._global_id_map.values() if int(v) > 0)
+        if not used:
+            return 1
+        return max(used) + 1
+
+    def _ensure_stable_id(self, source_id: int) -> int:
+        sid = int(source_id)
+        if sid in self.internal_id_map:
+            return int(self.internal_id_map[sid])
+
+        # Prefer Step 7 global mapping when conflict-free.
+        gid = self._global_id_map.get(sid)
+        if gid is not None:
+            gid = int(gid)
+            owner = self.source_id_from_internal.get(gid)
+            if owner is None or int(owner) == sid:
+                self.internal_id_map[sid] = gid
+                self.source_id_from_internal[gid] = sid
+                return gid
+
+        # Allocate new stable ID (never per-frame re-number).
+        new_id = self._next_available_id()
+        while new_id in self.source_id_from_internal:
+            new_id += 1
+        self.internal_id_map[sid] = int(new_id)
+        self.source_id_from_internal[int(new_id)] = sid
+        return int(new_id)
 
     def load_gaia_catalog(self):
         """Load Gaia catalog for source info lookup"""
@@ -278,9 +493,16 @@ class MasterIdEditorWindow(StepWindowBase):
                 if lower != cols:
                     tab.rename_columns(cols, lower)
                 self.gaia_df = tab.to_pandas()
-                # Convert source_id to int64 for consistent matching
+                # Convert source_id to int64 for consistent matching (drop non-finite rows safely)
                 if "source_id" in self.gaia_df.columns:
-                    self.gaia_df["source_id"] = self.gaia_df["source_id"].astype("int64")
+                    sid_num = pd.to_numeric(self.gaia_df["source_id"], errors="coerce")
+                    valid = np.isfinite(sid_num.to_numpy(float))
+                    dropped = int((~valid).sum())
+                    if dropped > 0:
+                        self.gaia_df = self.gaia_df.loc[valid].copy()
+                        sid_num = sid_num.loc[valid]
+                        self.log(f"Gaia catalog: dropped {dropped} rows with invalid source_id")
+                    self.gaia_df["source_id"] = sid_num.astype("int64")
                 self.log(f"Gaia catalog loaded: {len(self.gaia_df)} sources")
                 if self.master_ids:
                     self.update_master_table()
@@ -328,41 +550,32 @@ class MasterIdEditorWindow(StepWindowBase):
             return ""
 
     def update_master_table(self):
-        """Update master table with internal ID (brightness sorted)"""
-        # Get G mag for each source_id and sort by brightness
-        frame_sids = None
-        if self.idmatch_df is not None and (not self.idmatch_df.empty) and "source_id" in self.idmatch_df.columns:
-            frame_sids = set(self.idmatch_df["source_id"].astype("int64").tolist())
+        """Update master table using stable ID (not frame-dependent numbering)."""
+        rows = []
+        for sid in sorted(self.master_ids):
+            sid_i = int(sid)
+            fixed_id = self._ensure_stable_id(sid_i)
+            g_mag = self._get_gmag_for_source(sid_i)
+            rows.append((int(fixed_id), sid_i, g_mag))
 
-        id_gmag_list = []
-        for sid in self.master_ids:
-            if frame_sids is not None and sid not in frame_sids:
-                continue
-            g_mag = self._get_gmag_for_source(sid)
-            id_gmag_list.append((sid, g_mag))
+        rows.sort(key=lambda x: int(x[0]))
 
-        # Sort by G mag (brightest first), NaN at end
-        id_gmag_list.sort(key=lambda x: (np.isnan(x[1]), x[1]))
-
-        # Build internal ID mapping
-        self.internal_id_map = {}  # source_id -> internal_id
-        self.source_id_from_internal = {}  # internal_id -> source_id
-
-        self.master_table.setRowCount(len(id_gmag_list))
-        for i, (sid, g_mag) in enumerate(id_gmag_list):
-            internal_id = i + 1
-            self.internal_id_map[sid] = internal_id
-            self.source_id_from_internal[internal_id] = sid
-
-            self.master_table.setItem(i, 0, QTableWidgetItem(str(internal_id)))
+        self.master_table.setRowCount(len(rows))
+        for i, (fixed_id, sid, g_mag) in enumerate(rows):
+            self.master_table.setItem(i, 0, QTableWidgetItem(str(fixed_id)))
             self.master_table.setItem(i, 1, QTableWidgetItem(str(sid)))
-            g_str = f"{g_mag:.3f}" if np.isfinite(g_mag) else "-"
+            if np.isfinite(g_mag):
+                g_str = f"{g_mag:.3f}"
+            elif int(sid) < 0:
+                g_str = "local"
+            else:
+                g_str = "-"
             self.master_table.setItem(i, 2, QTableWidgetItem(g_str))
 
-        n_total = len(id_gmag_list)
-        n_gmag = sum(1 for _, g in id_gmag_list if np.isfinite(g))
+        n_total = len(rows)
+        n_gmag = sum(1 for _, _, g in rows if np.isfinite(g))
         if hasattr(self, "log_text"):
-            self.log(f"Master IDs: {n_total} | Gmag available: {n_gmag}")
+            self.log(f"Master IDs: {n_total} | Gmag available: {n_gmag} | Stable IDs")
 
         self.update_navigation_buttons()
 
@@ -437,8 +650,26 @@ class MasterIdEditorWindow(StepWindowBase):
             try:
                 df = pd.read_csv(idmatch_path)
                 if {"x", "y", "source_id"} <= set(df.columns):
-                    self.idmatch_df = df
-                    self._auto_add_detections_to_master(df)
+                    clean = df[["x", "y", "source_id"]].copy()
+                    clean["x"] = pd.to_numeric(clean["x"], errors="coerce")
+                    clean["y"] = pd.to_numeric(clean["y"], errors="coerce")
+                    sid_num = pd.to_numeric(clean["source_id"], errors="coerce")
+                    # Keep unmatched detections too (source_id NaN -> sentinel 0).
+                    valid = (
+                        np.isfinite(clean["x"].to_numpy(float))
+                        & np.isfinite(clean["y"].to_numpy(float))
+                    )
+                    dropped = int((~valid).sum())
+                    if dropped > 0:
+                        self.log(f"[{filename}] idmatch: dropped {dropped} invalid rows (x/y)")
+                    clean = clean.loc[valid].copy()
+                    sid_valid = sid_num.loc[valid]
+                    unmatched = int(sid_valid.isna().sum())
+                    if unmatched > 0:
+                        self.log(f"[{filename}] idmatch: unmatched detections kept={unmatched}")
+                    clean["source_id"] = sid_valid.fillna(0).astype("int64")
+                    self.idmatch_df = clean.reset_index(drop=True)
+                    self._auto_add_detections_to_master(self.idmatch_df)
                     return
             except Exception:
                 pass
@@ -449,6 +680,8 @@ class MasterIdEditorWindow(StepWindowBase):
             sids = set(pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64").tolist())
         except Exception:
             return
+        if 0 in sids:
+            sids.remove(0)
         new_ids = sids - self.master_ids
         if not new_ids:
             return
@@ -501,16 +734,38 @@ class MasterIdEditorWindow(StepWindowBase):
         for coll in self.ax.collections[:]:
             coll.remove()
 
-        x = self.idmatch_df["x"].to_numpy(float)
-        y = self.idmatch_df["y"].to_numpy(float)
-        sids = self.idmatch_df["source_id"].astype("int64").to_numpy()
+        x = pd.to_numeric(self.idmatch_df["x"], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(self.idmatch_df["y"], errors="coerce").to_numpy(float)
+        sid_num = pd.to_numeric(self.idmatch_df["source_id"], errors="coerce").to_numpy(float)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(sid_num)
+        if not np.any(valid):
+            self.canvas.draw_idle()
+            return
+        x = x[valid]
+        y = y[valid]
+        sids = sid_num[valid].astype(np.int64)
         in_master = np.array([sid in self.master_ids for sid in sids])
+        is_unmatched = sids == 0
+        is_matched = ~is_unmatched
+        is_gaia = sids > 0
+        is_local = sids < 0
+        is_removed = is_matched & ~in_master
+        is_gaia_master = is_matched & in_master & is_gaia
+        is_local_master = is_matched & in_master & is_local
 
         if len(x):
-            self.ax.scatter(x[~in_master], y[~in_master], s=20, facecolors='none',
-                            edgecolors='yellow', linewidths=0.8, alpha=0.7)
-            self.ax.scatter(x[in_master], y[in_master], s=30, facecolors='none',
-                            edgecolors='lime', linewidths=1.2, alpha=0.8)
+            # Unmatched detection rows (no source_id assigned yet)
+            self.ax.scatter(x[is_unmatched], y[is_unmatched], s=20, facecolors='none',
+                            edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+            # Matched rows removed from master
+            self.ax.scatter(x[is_removed], y[is_removed], s=22, facecolors='none',
+                            edgecolors='yellow', linewidths=0.9, alpha=0.75)
+            # Matched local refs (negative source_id)
+            self.ax.scatter(x[is_local_master], y[is_local_master], s=26, facecolors='none',
+                            edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+            # Matched Gaia refs (positive source_id)
+            self.ax.scatter(x[is_gaia_master], y[is_gaia_master], s=28, facecolors='none',
+                            edgecolors='lime', linewidths=1.1, alpha=0.85)
 
         if self.selected_source_id is not None:
             sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
@@ -542,9 +797,24 @@ class MasterIdEditorWindow(StepWindowBase):
                 i = int(np.argmin(dist2))
                 if dist2[i] <= search_r * search_r:
                     found_detected = True
-                    self.selected_source_id = int(self.idmatch_df.iloc[i]["source_id"])
+                    sid = int(self.idmatch_df.iloc[i]["source_id"])
+                    if sid == 0:
+                        self.selected_source_id = None
+                        frame = self.current_filename or "?"
+                        px_x = float(self.idmatch_df.iloc[i]["x"])
+                        px_y = float(self.idmatch_df.iloc[i]["y"])
+                        self.selected_label.setText(
+                            f"Selected: unmatched detection at ({px_x:.1f}, {px_y:.1f})"
+                        )
+                        self.log(f"[{frame}] Unmatched detection selected | px=({px_x:.1f}, {px_y:.1f})")
+                        self.update_overlay()
+                        return
+                    self.selected_source_id = sid
                     in_master = "✓ IN MASTER" if self.selected_source_id in self.master_ids else "✗ not in master"
-                    internal_id = self.internal_id_map.get(self.selected_source_id, "-")
+                    internal_id = self.internal_id_map.get(
+                        self.selected_source_id,
+                        self._global_id_map.get(self.selected_source_id, "-")
+                    )
                     self.selected_label.setText(
                         f"Selected: ID {internal_id} | source_id: {self.selected_source_id} ({in_master})"
                     )
@@ -584,6 +854,7 @@ class MasterIdEditorWindow(StepWindowBase):
             return
 
         self.master_ids.add(self.selected_source_id)
+        self._ensure_stable_id(int(self.selected_source_id))
         gaia_info = self.get_gaia_info(self.selected_source_id)
         self.log(f"[{frame}] ✓ ADDED to master: {self.selected_source_id}")
         if gaia_info:
@@ -617,7 +888,8 @@ class MasterIdEditorWindow(StepWindowBase):
         df = self.idmatch_df
         in_box = (df["x"].between(x0 - half, x0 + half) &
                   df["y"].between(y0 - half, y0 + half))
-        sids = set(df.loc[in_box, "source_id"].astype("int64").tolist())
+        sid_vals = pd.to_numeric(df.loc[in_box, "source_id"], errors="coerce")
+        sids = set(sid_vals[np.isfinite(sid_vals.to_numpy(float))].astype("int64").tolist())
         # Only remove those that are in master
         to_remove = sids & self.master_ids
         if not to_remove:
@@ -631,6 +903,7 @@ class MasterIdEditorWindow(StepWindowBase):
         output_dir = step8_dir(self.params.P.result_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         master_path = output_dir / "master_star_ids.csv"
+        sid2id_path = output_dir / "sourceid_to_ID.csv"
         backup_path = output_dir / "master_star_ids.orig.csv"
         if master_path.exists() and (not backup_path.exists()):
             try:
@@ -638,25 +911,22 @@ class MasterIdEditorWindow(StepWindowBase):
             except Exception:
                 pass
 
-        # Build sorted list with G mag
-        id_gmag_list = []
-        for sid in self.master_ids:
-            g_mag = self._get_gmag_for_source(sid)
-            id_gmag_list.append((sid, g_mag))
-
-        # Sort by G mag (brightest first)
-        id_gmag_list.sort(key=lambda x: (np.isnan(x[1]), x[1]))
-
-        # Create DataFrame with internal_id
+        # Build stable-ID rows and persist mapping.
         rows = []
-        for i, (sid, g_mag) in enumerate(id_gmag_list):
+        for sid in sorted(int(s) for s in self.master_ids):
+            fixed_id = self._ensure_stable_id(sid)
+            g_mag = self._get_gmag_for_source(sid)
             rows.append({
-                "internal_id": i + 1,
+                "ID": int(fixed_id),
                 "source_id": sid,
                 "g_mag": g_mag if np.isfinite(g_mag) else None
             })
         df = pd.DataFrame(rows)
+        if len(df):
+            df = df.sort_values(["ID", "source_id"]).reset_index(drop=True)
         df.to_csv(master_path, index=False)
+        if len(df):
+            df[["source_id", "ID"]].to_csv(sid2id_path, index=False)
 
         # Only log save summary if no specific action (e.g., on load or undo)
         if log_action is None:
@@ -673,12 +943,12 @@ class MasterIdEditorWindow(StepWindowBase):
         if self.gaia_df is None or len(self.gaia_df) == 0:
             return float(self.master_gmag_map.get(int(source_id), np.nan))
         try:
-            # Handle type mismatch - convert both to int64
-            sid_col = self.gaia_df["source_id"]
-            if sid_col.dtype != np.int64:
-                sid_col = sid_col.astype(np.int64)
-            mask = sid_col == int(source_id)
-            row = self.gaia_df[mask]
+            sid_col = pd.to_numeric(self.gaia_df["source_id"], errors="coerce")
+            valid = np.isfinite(sid_col.to_numpy(float))
+            if not np.any(valid):
+                return float(self.master_gmag_map.get(int(source_id), np.nan))
+            sid_valid = sid_col.loc[valid].astype("int64")
+            row = self.gaia_df.loc[valid].loc[sid_valid == int(source_id)]
             if len(row) > 0:
                 val = float(row.iloc[0].get("phot_g_mean_mag", np.nan))
                 if np.isfinite(val):
@@ -836,7 +1106,7 @@ class MasterIdEditorWindow(StepWindowBase):
             sid = int(gaia.iloc[int(idx)]["source_id"])
             if sid in self.master_ids:
                 # Already in master - select it and show info
-                internal_id = self.internal_id_map.get(sid, "?")
+                internal_id = self._ensure_stable_id(sid)
                 gaia_info = self.get_gaia_info(sid)
                 self.log(f"[{frame}] ★ Already in master: ID {internal_id} | source_id: {sid} (sep={sep_arcsec:.2f}\")")
                 if gaia_info:
@@ -849,6 +1119,7 @@ class MasterIdEditorWindow(StepWindowBase):
                 return
 
             self.master_ids.add(sid)
+            self._ensure_stable_id(sid)
             gaia_info = self.get_gaia_info(sid)
             self.log(f"[{frame}] ✓ ADDED undetected star: {sid} (sep={sep_arcsec:.2f}\")")
             if gaia_info:
