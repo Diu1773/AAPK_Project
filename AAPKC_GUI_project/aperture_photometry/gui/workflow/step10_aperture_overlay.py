@@ -24,7 +24,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step2_cropped_dir, step7_dir, step9_dir, crop_is_active
+from ...utils.step_paths import step2_cropped_dir, step6_dir, step7_dir, step9_dir, crop_is_active
+from ...utils.io_utils import read_csv_int64_source_id, parse_int64_series
 
 
 class ApertureOverlayWindow(StepWindowBase):
@@ -184,7 +185,7 @@ class ApertureOverlayWindow(StepWindowBase):
             self.save_state()
 
     def load_master_catalog(self):
-        master_path = step7_dir(self.params.P.result_dir) / "master_catalog.tsv"
+        master_path = step6_dir(self.params.P.result_dir) / "master_catalog.tsv"
         if not master_path.exists():
             master_path = self.params.P.result_dir / "master_catalog.tsv"
         if master_path.exists():
@@ -287,9 +288,9 @@ class ApertureOverlayWindow(StepWindowBase):
             fm_path = result_dir / "frame_sourceid_to_ID.tsv"
         if fm_path.exists():
             try:
-                fm = pd.read_csv(fm_path, sep="\t")
+                fm = read_csv_int64_source_id(fm_path, sep="\t")
             except Exception:
-                fm = pd.read_csv(fm_path)
+                fm = read_csv_int64_source_id(fm_path)
             c_file = self._pick_col(fm.columns, ["file", "fname", "frame"])
             c_id = self._pick_col(fm.columns, ["ID", "id"])
             c_x = self._pick_col(fm.columns, ["x", "x_det", "x_pix", "x0"])
@@ -307,28 +308,34 @@ class ApertureOverlayWindow(StepWindowBase):
 
         idm_path = cache_dir / "idmatch" / f"idmatch_{fname}.csv"
         if idm_path.exists():
-            idm = pd.read_csv(idm_path)
+            idm = read_csv_int64_source_id(idm_path)
             c_sid = self._pick_col(idm.columns, ["source_id", "sourceid", "sid"])
             c_x = self._pick_col(idm.columns, ["x", "x_det", "x_pix", "x0"])
             c_y = self._pick_col(idm.columns, ["y", "y_det", "y_pix", "y0"])
             if c_sid and c_x and c_y:
-                sid = idm[c_sid].astype(np.int64).to_numpy()
+                sid = parse_int64_series(idm[c_sid]).fillna(0).astype("int64").to_numpy()
                 x = idm[c_x].astype(float).to_numpy()
                 y = idm[c_y].astype(float).to_numpy()
 
-                map_path = step7_dir(result_dir) / "sourceid_to_ID.csv"
+                map_path = step6_dir(result_dir) / "sourceid_to_ID.csv"
                 if not map_path.exists():
                     map_path = result_dir / "sourceid_to_ID.csv"
                 if map_path.exists():
-                    mp = pd.read_csv(map_path)
+                    mp = read_csv_int64_source_id(map_path)
                     if ("source_id" in mp.columns) and ("ID" in mp.columns):
-                        sid2id = dict(zip(mp["source_id"].astype(np.int64), mp["ID"].astype(int)))
+                        sid_series = parse_int64_series(mp["source_id"])
+                        id_series = pd.to_numeric(mp["ID"], errors="coerce")
+                        valid = sid_series.notna() & id_series.notna()
+                        sid2id = dict(zip(sid_series.loc[valid].astype("int64"), id_series.loc[valid].astype(int)))
                     else:
                         sid2id = {}
                 else:
                     sid2id = {}
                 if not sid2id and (self.master_df is not None) and ("source_id" in self.master_df.columns):
-                    sid2id = dict(zip(self.master_df["source_id"].astype(np.int64), self.master_df["ID"].astype(int)))
+                    sid_series = parse_int64_series(self.master_df["source_id"])
+                    id_series = pd.to_numeric(self.master_df["ID"], errors="coerce")
+                    valid = sid_series.notna() & id_series.notna()
+                    sid2id = dict(zip(sid_series.loc[valid].astype("int64"), id_series.loc[valid].astype(int)))
 
                 ID = np.array([sid2id.get(s, -1) for s in sid], dtype=int)
                 ok = ID >= 0
@@ -719,7 +726,7 @@ class ApertureOverlayWindow(StepWindowBase):
         ap_path = step9_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
         if not ap_path.exists():
             ap_path = self.params.P.result_dir / "aperture_by_frame.csv"
-        master_path = step7_dir(self.params.P.result_dir) / "master_catalog.tsv"
+        master_path = step6_dir(self.params.P.result_dir) / "master_catalog.tsv"
         if not master_path.exists():
             master_path = self.params.P.result_dir / "master_catalog.tsv"
         return ap_path.exists() and master_path.exists()

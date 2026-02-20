@@ -358,6 +358,8 @@ class CropSelectorWindow(StepWindowBase):
         """Apply crop to all FITS files"""
         if not self.validate_crop_region():
             return
+        if not self.confirm_recrop_warning():
+            return
 
         # Confirm with user
         reply = QMessageBox.question(
@@ -455,6 +457,27 @@ class CropSelectorWindow(StepWindowBase):
                 self, "Crop Error",
                 f"Failed to crop images:\n{str(e)}"
             )
+
+    def has_completed_step4_or_later(self) -> bool:
+        """Return True if Step 4+ has already been completed."""
+        completed_steps = self.project_state.state.get("completed_steps", [])
+        return any(step_index >= 3 for step_index in completed_steps)
+
+    def confirm_recrop_warning(self) -> bool:
+        """Warn that re-cropping after Step 4 invalidates downstream coordinates."""
+        if not self.has_completed_step4_or_later():
+            return True
+
+        reply = QMessageBox.question(
+            self, "Re-crop Warning",
+            "Step 4 (Source Detection) or later is already completed.\n"
+            "Applying crop again can shift pixel coordinates and invalidate downstream results.\n\n"
+            "After re-cropping, rerun Step 4 and all later steps.\n\n"
+            "Continue anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        return reply == QMessageBox.Yes
 
     def reset_to_original(self):
         """Reset selection and reload original image"""

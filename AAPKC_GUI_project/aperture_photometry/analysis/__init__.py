@@ -9,6 +9,7 @@ from .isochrone_fitter import (
 
 from .isochrone_fitter_v2 import (
     IsochroneFitterV2,
+    GridScanResult,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     'FitMode',
     'FitResult',
     'FitBounds',
+    'GridScanResult',
 ]

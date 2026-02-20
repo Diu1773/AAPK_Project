@@ -1,37 +1,28 @@
-# Repository Guidelines
+# AGENTS.md (Lean Runtime Rules)
 
-## Project Structure & Module Organization
-- `main.py` is the GUI entry point.
-- Core package lives in `aperture_photometry/` with submodules:
-  - `config/` parameter handling (see `parameters_example.toml`).
-  - `core/` pipeline state and file/instrument management.
-  - `gui/` PyQt5 windows, workflow steps, and widgets.
-  - `utils/` shared helpers (I/O, astronomy utilities).
-  - `tests/` placeholder for future tests.
-- User configuration is loaded from `parameters.toml` in the repo root.
-- Docs and status notes: `README.md`, `USER_GUIDE.md`, `TECHNICAL_REFERENCE.md`.
+## Immutable Rules (Always Apply)
+- Keep responses concise by default.
+- For code changes, prefer unified diff/patch style output.
+- Never reprint full files unless explicitly requested.
+- Show only changed functions/blocks and affected paths.
+- Edit only files required for the task; avoid unrelated refactors.
+- Do not modify generated outputs or large data artifacts.
+- Run minimal checks for touched code when feasible.
+- If checks are skipped or fail, report reason and impact.
+- Log quoting limit: max 80 lines, then summarize.
+- CSV/table output: top 20 rows + mean/std/quantiles.
 
-## Build, Test, and Development Commands
-- `pip install -r requirements.txt` installs runtime dependencies.
-- `python main.py` runs the GUI locally.
-- `pyinstaller --onefile --windowed --add-data "aperture_photometry;aperture_photometry" --name "AAPKI-Photometry" main.py` builds a Windows executable.
-- If you add tests later, prefer `python -m pytest` (not currently configured).
+## Situational Rules (Task-Specific, Mutable)
+- Maintain a short task context in working notes: `goal`, `target_modules`, `temporary_debug_flags`, `done_criteria`.
+- Remove temporary flags/rules after task completion.
 
-## Coding Style & Naming Conventions
-- Python style: 4-space indentation, PEP 8 naming (snake_case for functions/vars, CapWords for classes).
-- Keep GUI classes in `aperture_photometry/gui/` and processing logic in `aperture_photometry/core/` or `analysis/`.
-- Match existing module naming: `stepN_*` for workflow steps (e.g., `step2_crop_selector.py`).
+## Do-Not-Read/Scan by Default (Unless Explicitly Mentioned)
+- `data/`, `raw/`, `stack/`, `exports/`, `<data_dir>/result/`
+- `*.fits`, `*.fit`, `*.fts`
+- large `*.log`, large `*.csv`, large notebooks
+- Do not recursively scan excluded paths.
 
-## Testing Guidelines
-- No formal test framework is configured yet; `aperture_photometry/tests/` is empty.
-- If you add tests, place them under `aperture_photometry/tests/` and name files `test_*.py`.
-
-## Commit & Pull Request Guidelines
-- Git history is not available in this workspace, so no established commit convention was detected.
-- Suggested standard: Conventional Commits (e.g., `feat: add crop preview`, `fix: handle missing param file`).
-- PRs should include: purpose summary, steps to verify, and screenshots for UI changes.
-
-## Configuration & Data Notes
-- `parameters.toml` is required for running the GUI; copy from `parameters_example.toml` and edit paths (e.g., `data_dir`, `filename_prefix`).
-- The pipeline writes outputs under `<data_dir>/result/` (see `USER_GUIDE.md`).
-- ASTAP is an external dependency for WCS solving; install separately when enabling those steps.
+## Retrieval and Editing Defaults
+- Use `rg --files` and `rg` for discovery/search first.
+- Read only files needed for the current step.
+- Keep this file short; move detailed policies to `docs/dev_rules.md` when needed.

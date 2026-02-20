@@ -216,8 +216,8 @@ class MainWindowWorkflow(QMainWindow):
             "Sky Preview & QC",
             "Source Detection",
             "WCS Plate Solving",
-            "Star ID Matching",
             "Reference Build",
+            "Star ID Matching",
             "Master ID Editor",
             "Forced Photometry",
             "Aperture Overlay",
@@ -466,13 +466,13 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 5:
-            from .workflow.step6_star_id_matching import StarIdMatchingWindow
-            self.current_step_window = StarIdMatchingWindow(
+            from .workflow.step6_ref_build import RefBuildWindow
+            self.current_step_window = RefBuildWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 6:
-            from .workflow.step7_ref_build import RefBuildWindow
-            self.current_step_window = RefBuildWindow(
+            from .workflow.step7_star_id_matching import StarIdMatchingWindow
+            self.current_step_window = StarIdMatchingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 7:

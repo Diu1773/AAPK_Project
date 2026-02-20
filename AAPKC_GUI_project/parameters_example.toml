@@ -103,12 +103,18 @@ max_iter = 5
 neighbor_mask_scale = 1.3
 
 [photometry.apcorr]
+# Growth curve based optimal aperture finder.
+# Measures photometry at many aperture radii (scale_min to scale_max × FWHM),
+# computes CCD-equation error at each radius, and selects the radius with minimum error.
 apply = true
-small_scale = 1.0
-large_scale = 3.0
-min_n = 20
-scatter_max = 0.05
-min_snr = 40.0
+min_n = 12             # Minimum isolated stars required for valid result
+scatter_max = 0.10     # Max allowed MAD/median scatter of apcorr ratio
+max_sources = 250      # Max bright sources to use per frame
+scale_min = 0.5        # Growth curve start (× FWHM)
+scale_max = 5.0        # Growth curve end (× FWHM); also the large reference aperture
+scale_step = 0.25      # Step between radius samples (× FWHM)
+large_ref_scale = 5.0  # Large reference aperture for apcorr ratio (× FWHM)
+isolation_factor = 2.0 # Stars must have nearest neighbor > factor × r_large_ref away
 
 [hud5x]
 aperture_scale = 1.0
@@ -134,6 +140,16 @@ astap_downsample = 2
 astap_max_stars = 500
 require_qc_pass = true
 refine_enable = true
+
+[idmatch]
+two_pass_enable = true              # Enable two-pass matching (tight -> loose)
+tight_radius_arcsec = 1.0           # Pass 1: high confidence matches (auto-floored to 0.4 * FWHM-based radius)
+loose_radius_arcsec = 3.0           # Pass 2: remaining matches (auto-floored to FWHM-based radius)
+min_correction_pairs = 3            # Min pass-1 pairs to apply shift/affine correction before pass 2
+min_affine_pairs = 6                # Min pass-1 pairs to use affine correction (else global shift)
+adaptive_retry_threshold = 0.5      # If match_rate < this after pass 2, retry with 2x loose_r (0=disable)
+fwhm_adaptive_floor = true          # Floor tight/loose radii to FWHM-based size (disable to use fixed arcsec only)
+geom_correction_enable = true       # Apply affine/shift correction from pass-1 seeds before pass 2
 
 [match]
 tol_px = 1.0

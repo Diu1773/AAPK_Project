@@ -31,6 +31,12 @@ from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, crop_is_active
+from ...utils.io_utils import (
+    parse_int64_scalar,
+    parse_int64_series,
+    read_csv_int64_source_id,
+    read_ecsv_int64_source_id,
+)
 
 
 class MasterIdEditorWindow(StepWindowBase):
@@ -60,12 +66,26 @@ class MasterIdEditorWindow(StepWindowBase):
         self.canvas = None
         self.ax = None
         self._imshow_obj = None
-        self._normalized_cache = None
+        self._normalized_cache = None   # single-slot legacy (unused now)
+        self._norm_cache: dict = {}     # (filename, stretch_idx) -> normalized_array (LRU 5)
         self.xlim_original = None
         self.ylim_original = None
         self.panning = False
         self.pan_start = None
         self.hover_xy = None  # Track mouse hover position for G key
+
+        # Persistent scatter artists (avoids remove/recreate each overlay update)
+        self._scat_unmatched = None
+        self._scat_removed = None
+        self._scat_local = None
+        self._scat_gaia = None
+        self._scat_selected = None
+
+        # Frame data caches: filename -> data  (LRU, max _FITS_CACHE_SIZE entries)
+        self._fits_cache: dict = {}        # filename -> (image_data, header)
+        self._fits_cache_order: list = []  # LRU order
+        self._FITS_CACHE_SIZE = 5
+        self._idmatch_cache: dict = {}     # filename -> idmatch_df (all frames, small)
 
         super().__init__(
             step_index=7,
@@ -281,12 +301,12 @@ class MasterIdEditorWindow(StepWindowBase):
             try:
                 df = pd.read_csv(master_path)
                 if "source_id" in df.columns:
-                    sid_vals = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
+                    sid_vals = parse_int64_series(df["source_id"]).dropna().astype("int64")
                     self.master_ids = set(sid_vals.tolist())
                     if "g_mag" in df.columns:
                         gmag_series = pd.to_numeric(df["g_mag"], errors="coerce")
-                        sid_series = pd.to_numeric(df["source_id"], errors="coerce")
-                        valid_sid = np.isfinite(sid_series.to_numpy(float))
+                        sid_series = parse_int64_series(df["source_id"])
+                        valid_sid = sid_series.notna()
                         sid_clean = sid_series.loc[valid_sid].astype("int64")
                         gmag_clean = gmag_series.loc[valid_sid]
                         self.master_gmag_map = dict(zip(sid_clean.tolist(), gmag_clean.tolist()))
@@ -300,8 +320,9 @@ class MasterIdEditorWindow(StepWindowBase):
                         id_vals = pd.to_numeric(df["internal_id"], errors="coerce")
                     else:
                         id_vals = pd.Series([np.nan] * len(df))
-                    for sid_v, id_v in zip(pd.to_numeric(df["source_id"], errors="coerce"), id_vals):
-                        if not (np.isfinite(sid_v) and np.isfinite(id_v)):
+                    sid_series = parse_int64_series(df["source_id"])
+                    for sid_v, id_v in zip(sid_series.tolist(), id_vals):
+                        if not (pd.notna(sid_v) and np.isfinite(id_v)):
                             continue
                         sid_i = int(sid_repair_map.get(int(sid_v), int(sid_v)))
                         id_i = int(id_v)
@@ -333,7 +354,7 @@ class MasterIdEditorWindow(StepWindowBase):
             return sid_map
         try:
             df6 = pd.read_csv(step6_master)
-            s6 = pd.to_numeric(df6.get("source_id"), errors="coerce").dropna().astype("int64")
+            s6 = parse_int64_series(df6.get("source_id", pd.Series(dtype="Int64"))).dropna().astype("int64")
             canon_pos = {int(v) for v in s6.tolist() if int(v) > 0}
         except Exception:
             return sid_map
@@ -406,7 +427,7 @@ class MasterIdEditorWindow(StepWindowBase):
                     break
             if g_col is None:
                 continue
-            sid = pd.to_numeric(df["source_id"], errors="coerce")
+            sid = parse_int64_series(df["source_id"])
             g = pd.to_numeric(df[g_col], errors="coerce")
             valid = sid.notna() & g.notna()
             if not valid.any():
@@ -435,15 +456,15 @@ class MasterIdEditorWindow(StepWindowBase):
             if not path.exists():
                 continue
             try:
-                df = pd.read_csv(path)
+                df = read_csv_int64_source_id(path)
             except Exception:
                 continue
             if not {"source_id", "ID"} <= set(df.columns):
                 continue
-            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
+            sid_vals = parse_int64_series(df["source_id"])
             id_vals = pd.to_numeric(df["ID"], errors="coerce")
             for sid_v, id_v in zip(sid_vals, id_vals):
-                if np.isfinite(sid_v) and np.isfinite(id_v):
+                if pd.notna(sid_v) and np.isfinite(id_v):
                     self._global_id_map[int(sid_v)] = int(id_v)
             if self._global_id_map:
                 break
@@ -480,29 +501,21 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def load_gaia_catalog(self):
         """Load Gaia catalog for source info lookup"""
-        from astropy.table import Table
         gaia_path = step5_dir(self.params.P.result_dir) / "gaia_fov.ecsv"
         if not gaia_path.exists():
             gaia_path = self.params.P.result_dir / "gaia_fov.ecsv"
         if gaia_path.exists():
             try:
-                tab = Table.read(str(gaia_path), format="ascii.ecsv")
-                # Lowercase column names
-                cols = list(tab.colnames)
-                lower = [c.lower() for c in cols]
-                if lower != cols:
-                    tab.rename_columns(cols, lower)
-                self.gaia_df = tab.to_pandas()
-                # Convert source_id to int64 for consistent matching (drop non-finite rows safely)
+                self.gaia_df = read_ecsv_int64_source_id(gaia_path)
                 if "source_id" in self.gaia_df.columns:
-                    sid_num = pd.to_numeric(self.gaia_df["source_id"], errors="coerce")
-                    valid = np.isfinite(sid_num.to_numpy(float))
+                    sid_series = parse_int64_series(self.gaia_df["source_id"])
+                    valid = sid_series.notna()
                     dropped = int((~valid).sum())
                     if dropped > 0:
                         self.gaia_df = self.gaia_df.loc[valid].copy()
-                        sid_num = sid_num.loc[valid]
+                        sid_series = sid_series.loc[valid]
                         self.log(f"Gaia catalog: dropped {dropped} rows with invalid source_id")
-                    self.gaia_df["source_id"] = sid_num.astype("int64")
+                    self.gaia_df["source_id"] = sid_series.astype("int64")
                 self.log(f"Gaia catalog loaded: {len(self.gaia_df)} sources")
                 if self.master_ids:
                     self.update_master_table()
@@ -613,28 +626,51 @@ class MasterIdEditorWindow(StepWindowBase):
             return
         self.load_and_display()
 
-    def load_and_display(self):
+    def _get_fits_path(self, filename):
+        if self.use_cropped:
+            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+            if not cropped_dir.exists():
+                cropped_dir = self.params.P.result_dir / "cropped"
+            return cropped_dir / filename
+        return self.params.P.data_dir / filename
+
+    def _load_fits_cached(self, filename):
+        """Return (image_data, header) from cache or disk. LRU eviction."""
+        if filename in self._fits_cache:
+            # Move to end (most recently used)
+            self._fits_cache_order.remove(filename)
+            self._fits_cache_order.append(filename)
+            return self._fits_cache[filename]
+        file_path = self._get_fits_path(filename)
+        with fits.open(file_path) as hdul:
+            data = hdul[0].data.astype(float)
+            header = hdul[0].header.copy()
+        # Evict oldest if over limit
+        while len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+            oldest = self._fits_cache_order.pop(0)
+            self._fits_cache.pop(oldest, None)
+        self._fits_cache[filename] = (data, header)
+        self._fits_cache_order.append(filename)
+        return data, header
+
+    def load_and_display(self, quick_switch=False):
         filename = self.file_combo.currentText()
         if not filename:
             return
         try:
-            if self.use_cropped:
-                cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-                if not cropped_dir.exists():
-                    cropped_dir = self.params.P.result_dir / "cropped"
-                file_path = cropped_dir / filename
-            else:
-                file_path = self.params.P.data_dir / filename
-            with fits.open(file_path) as hdul:
-                self.image_data = hdul[0].data.astype(float)
-                self.header = hdul[0].header
+            new_data, new_header = self._load_fits_cached(filename)
+            # Detect size change — forces full redraw if image shape differs
+            shape_changed = (self.image_data is None or new_data.shape != self.image_data.shape)
+            self.image_data = new_data
+            self.header = new_header
             self.current_filename = filename
-            self.xlim_original = None
-            self.ylim_original = None
-            self._imshow_obj = None
-            self._normalized_cache = None
+            self._normalized_cache = None  # Always invalidate (new image data)
+            if not quick_switch or shape_changed:
+                self.xlim_original = None
+                self.ylim_original = None
+                self._imshow_obj = None
             self.load_idmatch_for_file(filename)
-            self.display_image(full_redraw=True)
+            self.display_image(full_redraw=(self._imshow_obj is None))
             self.update_overlay()
             if self._auto_master_dirty:
                 self.save_master_ids(log_action="auto_add")
@@ -645,16 +681,19 @@ class MasterIdEditorWindow(StepWindowBase):
             QMessageBox.critical(self, "Error", f"Failed to load: {str(e)}")
 
     def load_idmatch_for_file(self, filename):
+        # Check cache first
+        if filename in self._idmatch_cache:
+            self.idmatch_df = self._idmatch_cache[filename]
+            self._auto_add_detections_to_master(self.idmatch_df)
+            return
         idmatch_path = self.params.P.cache_dir / "idmatch" / f"idmatch_{filename}.csv"
         if idmatch_path.exists():
             try:
-                df = pd.read_csv(idmatch_path)
+                df = read_csv_int64_source_id(idmatch_path)
                 if {"x", "y", "source_id"} <= set(df.columns):
                     clean = df[["x", "y", "source_id"]].copy()
                     clean["x"] = pd.to_numeric(clean["x"], errors="coerce")
                     clean["y"] = pd.to_numeric(clean["y"], errors="coerce")
-                    sid_num = pd.to_numeric(clean["source_id"], errors="coerce")
-                    # Keep unmatched detections too (source_id NaN -> sentinel 0).
                     valid = (
                         np.isfinite(clean["x"].to_numpy(float))
                         & np.isfinite(clean["y"].to_numpy(float))
@@ -663,21 +702,26 @@ class MasterIdEditorWindow(StepWindowBase):
                     if dropped > 0:
                         self.log(f"[{filename}] idmatch: dropped {dropped} invalid rows (x/y)")
                     clean = clean.loc[valid].copy()
-                    sid_valid = sid_num.loc[valid]
-                    unmatched = int(sid_valid.isna().sum())
+                    unmatched = int(clean["source_id"].apply(
+                        lambda s: pd.isna(s)
+                    ).sum())
                     if unmatched > 0:
                         self.log(f"[{filename}] idmatch: unmatched detections kept={unmatched}")
-                    clean["source_id"] = sid_valid.fillna(0).astype("int64")
-                    self.idmatch_df = clean.reset_index(drop=True)
+                    clean["source_id"] = parse_int64_series(clean["source_id"]).fillna(0).astype("int64")
+                    result = clean.reset_index(drop=True)
+                    self._idmatch_cache[filename] = result
+                    self.idmatch_df = result
                     self._auto_add_detections_to_master(self.idmatch_df)
                     return
             except Exception:
                 pass
-        self.idmatch_df = pd.DataFrame(columns=["x", "y", "source_id"])
+        empty = pd.DataFrame(columns=["x", "y", "source_id"])
+        self._idmatch_cache[filename] = empty
+        self.idmatch_df = empty
 
     def _auto_add_detections_to_master(self, df: pd.DataFrame):
         try:
-            sids = set(pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64").tolist())
+            sids = set(parse_int64_series(df["source_id"]).dropna().astype("int64").tolist())
         except Exception:
             return
         if 0 in sids:
@@ -698,10 +742,18 @@ class MasterIdEditorWindow(StepWindowBase):
 
         stretched = self.apply_stretch(normalized)
 
+        filt = ""
+        if self.header is not None:
+            filt = str(self.header.get("FILTER", self.header.get("filter", ""))).strip()
+        stretch_name = self.scale_combo.currentText()
+        title = f"{self.current_filename}"
+        if filt:
+            title += f" [{filt}]"
+        title += f" | {stretch_name}"
+
         if self._imshow_obj is not None and not full_redraw:
             self._imshow_obj.set_data(stretched)
-            stretch_name = self.scale_combo.currentText()
-            self.ax.set_title(f"{self.current_filename} | {stretch_name}")
+            self.ax.set_title(title)
             self.canvas.draw_idle()
             return
 
@@ -709,12 +761,30 @@ class MasterIdEditorWindow(StepWindowBase):
         ylim_current = self.ax.get_ylim() if self.ylim_original else None
 
         self.ax.clear()
+        # ax.clear() destroys all artists — reset scatter refs
+        self._scat_unmatched = None
+        self._scat_removed = None
+        self._scat_local = None
+        self._scat_gaia = None
+        self._scat_selected = None
+
         self._imshow_obj = self.ax.imshow(
             stretched, cmap='gray', origin='lower',
             vmin=0, vmax=1, interpolation='nearest'
         )
-        stretch_name = self.scale_combo.currentText()
-        self.ax.set_title(f"{self.current_filename} | {stretch_name}")
+        # Pre-create persistent scatter artists (updated via set_offsets, no remove/recreate)
+        self._scat_unmatched = self.ax.scatter([], [], s=20, facecolors='none',
+                                               edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+        self._scat_removed   = self.ax.scatter([], [], s=22, facecolors='none',
+                                               edgecolors='yellow', linewidths=0.9, alpha=0.75)
+        self._scat_local     = self.ax.scatter([], [], s=26, facecolors='none',
+                                               edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+        self._scat_gaia      = self.ax.scatter([], [], s=28, facecolors='none',
+                                               edgecolors='lime', linewidths=1.1, alpha=0.85)
+        self._scat_selected  = self.ax.scatter([], [], s=60, facecolors='none',
+                                               edgecolors='red', linewidths=1.5, alpha=0.9)
+
+        self.ax.set_title(title)
         self.ax.set_xlabel("X")
         self.ax.set_ylabel("Y")
 
@@ -727,51 +797,64 @@ class MasterIdEditorWindow(StepWindowBase):
 
         self.canvas.draw_idle()
 
+    @staticmethod
+    def _safe_offsets(x_arr, y_arr):
+        """Return Nx2 offsets array (empty-safe) for set_offsets()."""
+        if len(x_arr) == 0:
+            return np.zeros((0, 2), dtype=float)
+        return np.column_stack([x_arr, y_arr])
+
     def update_overlay(self):
-        if self.idmatch_df is None or self.idmatch_df.empty:
+        # Scatter artists may not exist yet (before first full_redraw)
+        if self._scat_gaia is None:
             self.canvas.draw_idle()
             return
-        for coll in self.ax.collections[:]:
-            coll.remove()
+
+        empty = np.zeros((0, 2), dtype=float)
+
+        if self.idmatch_df is None or self.idmatch_df.empty:
+            for s in (self._scat_unmatched, self._scat_removed,
+                      self._scat_local, self._scat_gaia, self._scat_selected):
+                s.set_offsets(empty)
+            self.canvas.draw_idle()
+            return
 
         x = pd.to_numeric(self.idmatch_df["x"], errors="coerce").to_numpy(float)
         y = pd.to_numeric(self.idmatch_df["y"], errors="coerce").to_numpy(float)
-        sid_num = pd.to_numeric(self.idmatch_df["source_id"], errors="coerce").to_numpy(float)
-        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(sid_num)
+        sid_series = parse_int64_series(self.idmatch_df["source_id"])
+        sid_valid = sid_series.notna().to_numpy(bool)
+        valid = np.isfinite(x) & np.isfinite(y) & sid_valid
+
         if not np.any(valid):
+            for s in (self._scat_unmatched, self._scat_removed,
+                      self._scat_local, self._scat_gaia, self._scat_selected):
+                s.set_offsets(empty)
             self.canvas.draw_idle()
             return
+
         x = x[valid]
         y = y[valid]
-        sids = sid_num[valid].astype(np.int64)
+        sids = sid_series.loc[valid].astype("int64").to_numpy(dtype=np.int64)
         in_master = np.array([sid in self.master_ids for sid in sids])
-        is_unmatched = sids == 0
-        is_matched = ~is_unmatched
-        is_gaia = sids > 0
-        is_local = sids < 0
-        is_removed = is_matched & ~in_master
-        is_gaia_master = is_matched & in_master & is_gaia
+        is_unmatched  = sids == 0
+        is_matched    = ~is_unmatched
+        is_gaia       = sids > 0
+        is_local      = sids < 0
+        is_removed    = is_matched & ~in_master
+        is_gaia_master  = is_matched & in_master & is_gaia
         is_local_master = is_matched & in_master & is_local
 
-        if len(x):
-            # Unmatched detection rows (no source_id assigned yet)
-            self.ax.scatter(x[is_unmatched], y[is_unmatched], s=20, facecolors='none',
-                            edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
-            # Matched rows removed from master
-            self.ax.scatter(x[is_removed], y[is_removed], s=22, facecolors='none',
-                            edgecolors='yellow', linewidths=0.9, alpha=0.75)
-            # Matched local refs (negative source_id)
-            self.ax.scatter(x[is_local_master], y[is_local_master], s=26, facecolors='none',
-                            edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
-            # Matched Gaia refs (positive source_id)
-            self.ax.scatter(x[is_gaia_master], y[is_gaia_master], s=28, facecolors='none',
-                            edgecolors='lime', linewidths=1.1, alpha=0.85)
+        self._scat_unmatched.set_offsets(self._safe_offsets(x[is_unmatched], y[is_unmatched]))
+        self._scat_removed.set_offsets(self._safe_offsets(x[is_removed], y[is_removed]))
+        self._scat_local.set_offsets(self._safe_offsets(x[is_local_master], y[is_local_master]))
+        self._scat_gaia.set_offsets(self._safe_offsets(x[is_gaia_master], y[is_gaia_master]))
 
         if self.selected_source_id is not None:
-            sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
-            if len(sel):
-                self.ax.scatter(sel["x"], sel["y"], s=60, facecolors='none',
-                                edgecolors='red', linewidths=1.5, alpha=0.9)
+            sel_mask = sids == self.selected_source_id
+            self._scat_selected.set_offsets(self._safe_offsets(x[sel_mask], y[sel_mask]))
+        else:
+            self._scat_selected.set_offsets(empty)
+
         self.canvas.draw_idle()
 
     def on_click(self, event):
@@ -888,8 +971,8 @@ class MasterIdEditorWindow(StepWindowBase):
         df = self.idmatch_df
         in_box = (df["x"].between(x0 - half, x0 + half) &
                   df["y"].between(y0 - half, y0 + half))
-        sid_vals = pd.to_numeric(df.loc[in_box, "source_id"], errors="coerce")
-        sids = set(sid_vals[np.isfinite(sid_vals.to_numpy(float))].astype("int64").tolist())
+        sid_vals = parse_int64_series(df.loc[in_box, "source_id"])
+        sids = set(sid_vals[sid_vals.notna()].astype("int64").tolist())
         # Only remove those that are in master
         to_remove = sids & self.master_ids
         if not to_remove:
@@ -943,8 +1026,8 @@ class MasterIdEditorWindow(StepWindowBase):
         if self.gaia_df is None or len(self.gaia_df) == 0:
             return float(self.master_gmag_map.get(int(source_id), np.nan))
         try:
-            sid_col = pd.to_numeric(self.gaia_df["source_id"], errors="coerce")
-            valid = np.isfinite(sid_col.to_numpy(float))
+            sid_col = parse_int64_series(self.gaia_df["source_id"])
+            valid = sid_col.notna().to_numpy(bool)
             if not np.any(valid):
                 return float(self.master_gmag_map.get(int(source_id), np.nan))
             sid_valid = sid_col.loc[valid].astype("int64")
@@ -1201,9 +1284,13 @@ class MasterIdEditorWindow(StepWindowBase):
         if not self.file_list:
             return
         idx = self.file_combo.currentIndex()
-        idx = max(0, min(len(self.file_list) - 1, idx + delta))
-        if idx != self.file_combo.currentIndex():
-            self.file_combo.setCurrentIndex(idx)
+        new_idx = max(0, min(len(self.file_list) - 1, idx + delta))
+        if new_idx != idx:
+            # Disconnect signal temporarily to call load_and_display with quick_switch flag
+            self.file_combo.blockSignals(True)
+            self.file_combo.setCurrentIndex(new_idx)
+            self.file_combo.blockSignals(False)
+            self.load_and_display(quick_switch=True)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_A:
@@ -1343,7 +1430,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
     # Stretch functions (from Step4)
     def on_stretch_changed(self, index):
-        self._normalized_cache = None
+        self._norm_cache.clear()  # Stretch changed — invalidate all normalized caches
         self.display_image()
 
     def update_stretch_label(self, value):
@@ -1360,10 +1447,9 @@ class MasterIdEditorWindow(StepWindowBase):
             return None
 
         stretch_idx = self.scale_combo.currentIndex()
-        cache_key = (id(self.image_data), stretch_idx)
-        if self._normalized_cache is not None:
-            if self._normalized_cache[0] == cache_key:
-                return self._normalized_cache[1].copy()
+        cache_key = (self.current_filename, stretch_idx)
+        if cache_key in self._norm_cache:
+            return self._norm_cache[cache_key].copy()
 
         finite = np.isfinite(self.image_data)
         if not finite.any():
@@ -1387,7 +1473,11 @@ class MasterIdEditorWindow(StepWindowBase):
 
         normalized = (data - vmin) / (vmax - vmin + 1e-10)
         normalized = np.clip(normalized, 0, 1)
-        self._normalized_cache = (cache_key, normalized)
+        # LRU: evict oldest if over limit
+        if len(self._norm_cache) >= self._FITS_CACHE_SIZE:
+            oldest = next(iter(self._norm_cache))
+            del self._norm_cache[oldest]
+        self._norm_cache[cache_key] = normalized
 
         return normalized.copy()
 

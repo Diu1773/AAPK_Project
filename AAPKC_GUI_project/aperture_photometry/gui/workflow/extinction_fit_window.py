@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from astropy.io import fits
-from astropy.table import Table
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -27,12 +26,13 @@ from ...utils.astro_utils import compute_airmass_from_header, normalize_filter_n
 from ...utils.step_paths import (
     step2_cropped_dir,
     step5_dir,
-    step7_dir,
+    step6_dir,
     step9_dir,
     step11_dir,
     step11_extinction_dir,
     crop_is_active,
 )
+from ...utils.io_utils import parse_int64_series, read_ecsv_int64_source_id
 
 
 class ExtinctionFitWorker(QThread):
@@ -250,7 +250,7 @@ class ExtinctionFitWorker(QThread):
             wide_snr.columns = [f"snr_{c}" for c in wide_snr.columns]
             wide = pd.concat([wide_mag, wide_snr], axis=1).reset_index()
 
-            master_path = step7_dir(result_dir) / "master_catalog.tsv"
+            master_path = step6_dir(result_dir) / "master_catalog.tsv"
             if not master_path.exists():
                 master_path = result_dir / "master_catalog.tsv"
             if not master_path.exists():
@@ -291,9 +291,9 @@ class ExtinctionFitWorker(QThread):
                     gaia_path = result_dir / "gaia_fov.ecsv"
                 if not gaia_path.exists():
                     raise RuntimeError("gaia_fov.ecsv not found")
-                t_gaia = Table.read(gaia_path, format="ascii.ecsv")
-                gaia_df = t_gaia.to_pandas()
-                gaia_df["source_id"] = gaia_df["source_id"].astype("int64")
+                gaia_df = read_ecsv_int64_source_id(gaia_path)
+                gaia_df["source_id"] = parse_int64_series(gaia_df["source_id"]).astype("Int64")
+                df["source_id"] = parse_int64_series(df["source_id"]).astype("Int64")
                 gaia_cols = ["source_id", "phot_g_mean_mag"]
                 if "phot_bp_mean_mag" in gaia_df.columns:
                     gaia_cols.append("phot_bp_mean_mag")

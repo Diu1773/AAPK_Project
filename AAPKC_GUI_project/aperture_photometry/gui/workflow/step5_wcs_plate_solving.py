@@ -55,6 +55,7 @@ from ...utils.step_paths import (
     legacy_step7_refbuild_dir,
 )
 from ...utils.constants import get_parallel_workers
+from ...utils.io_utils import parse_int64_series
 
 
 def _tail_text(value: str | None, limit: int = 800, max_lines: int = 8) -> str:
@@ -146,6 +147,18 @@ def _source_signature_detection_compatible(saved_sig: dict, current_sig: dict) -
     if saved_size <= 0 or curr_size <= 0:
         return False
     return saved_size == curr_size
+
+
+def _coerce_source_id_int64(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Gaia source_id as signed int64 without float precision loss."""
+    if df is None or df.empty or "source_id" not in df.columns:
+        return df
+    out = df.copy()
+    sid = parse_int64_series(out["source_id"])
+    valid = sid.notna()
+    out = out.loc[valid].copy()
+    out["source_id"] = sid.loc[valid].astype("int64")
+    return out
 
 
 def _canonicalize_windows_path_case(path_value) -> Path:
@@ -962,7 +975,7 @@ class WcsWorker(QThread):
                 if need not in cols:
                     return None
             tab.rename_columns(tab.colnames, cols)
-            return tab.to_pandas()
+            return _coerce_source_id_int64(tab.to_pandas())
         except Exception:
             return None
 
@@ -984,41 +997,16 @@ class WcsWorker(QThread):
     )
         """.strip()
         Gaia.ROW_LIMIT = -1
-        def _run_async():
-            job_a = Gaia.launch_job_async(adql, dump_to_file=False)
-            return job_a.get_results()
-
-        tab = None
-        sync_err = None
+        if self._stop_requested:
+            raise RuntimeError("stopped")
         try:
-            # Sync can be faster, but some TAP servers may cap rows near ~2000.
-            job = Gaia.launch_job(adql, dump_to_file=False)
+            job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
-            try:
-                if int(len(tab)) >= 1900:
-                    tab_async = _run_async()
-                    if int(len(tab_async)) > int(len(tab)):
-                        tab = tab_async
-            except Exception:
-                pass
         except Exception as e:
-            sync_err = e
-
-        if tab is None:
-            if self._stop_requested:
-                raise RuntimeError("stopped")
-            try:
-                tab = _run_async()
-            except Exception as async_err:
-                if sync_err is not None:
-                    raise RuntimeError(
-                        "Gaia TAP query failed "
-                        f"(sync={_exc_brief(sync_err)}, async={_exc_brief(async_err)})"
-                    ) from async_err
-                raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(async_err)}") from async_err
+            raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
-        return tab.to_pandas()
+        return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
         step5_out = step5_dir(self.result_dir)
@@ -1158,7 +1146,10 @@ class WcsWorker(QThread):
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
                 try:
-                    Table.from_pandas(df).write(cache_path, format="ascii.ecsv", overwrite=True)
+                    df_out = df.copy()
+                    if "source_id" in df_out.columns:
+                        df_out = _coerce_source_id_int64(df_out)
+                    Table.from_pandas(df_out).write(cache_path, format="ascii.ecsv", overwrite=True)
                     # 메타데이터 저장
                     meta_path.write_text(json.dumps({
                         "center_ra_deg": float(center.ra.deg),
@@ -2011,7 +2002,7 @@ class AstrometryNetWorker(QThread):
                 if need not in cols:
                     return None
             tab.rename_columns(tab.colnames, cols)
-            return tab.to_pandas()
+            return _coerce_source_id_int64(tab.to_pandas())
         except Exception:
             return None
 
@@ -2033,41 +2024,16 @@ class AstrometryNetWorker(QThread):
     )
         """.strip()
         Gaia.ROW_LIMIT = -1
-        def _run_async():
-            job_a = Gaia.launch_job_async(adql, dump_to_file=False)
-            return job_a.get_results()
-
-        tab = None
-        sync_err = None
+        if self._stop_requested:
+            raise RuntimeError("stopped")
         try:
-            # Sync can be faster, but some TAP servers may cap rows near ~2000.
-            job = Gaia.launch_job(adql, dump_to_file=False)
+            job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
-            try:
-                if int(len(tab)) >= 1900:
-                    tab_async = _run_async()
-                    if int(len(tab_async)) > int(len(tab)):
-                        tab = tab_async
-            except Exception:
-                pass
         except Exception as e:
-            sync_err = e
-
-        if tab is None:
-            if self._stop_requested:
-                raise RuntimeError("stopped")
-            try:
-                tab = _run_async()
-            except Exception as async_err:
-                if sync_err is not None:
-                    raise RuntimeError(
-                        "Gaia TAP query failed "
-                        f"(sync={_exc_brief(sync_err)}, async={_exc_brief(async_err)})"
-                    ) from async_err
-                raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(async_err)}") from async_err
+            raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
-        return tab.to_pandas()
+        return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
         step5_out = step5_dir(self.result_dir)
@@ -2204,7 +2170,10 @@ class AstrometryNetWorker(QThread):
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
                 try:
-                    Table.from_pandas(df).write(cache_path, format="ascii.ecsv", overwrite=True)
+                    df_out = df.copy()
+                    if "source_id" in df_out.columns:
+                        df_out = _coerce_source_id_int64(df_out)
+                    Table.from_pandas(df_out).write(cache_path, format="ascii.ecsv", overwrite=True)
                     meta_path.write_text(json.dumps({
                         "center_ra_deg": float(center.ra.deg),
                         "center_dec_deg": float(center.dec.deg),

@@ -608,6 +608,13 @@ Parameters:
 - `large_scale` (x FWHM).
 - `min_n` (count).
 - `scatter_max` (fraction).
+- `optimize_scales` (bool) enable FWHM-scale grid search.
+- `small_scale_min`, `small_scale_max` (x FWHM) search range.
+- `large_scale_min`, `large_scale_max` (x FWHM) search range.
+- `scale_step` (x FWHM) grid step.
+- `min_gap_fwhm` (x FWHM) minimum large-small separation.
+- `max_pairs` (count) maximum candidate pairs per frame.
+- `max_sources` (count) maximum bright stars used per frame.
 - `min_snr` (SNR, reserved).
 
 ### [hud5x]

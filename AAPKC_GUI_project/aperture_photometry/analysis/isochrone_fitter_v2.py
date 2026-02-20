@@ -27,6 +27,7 @@ class FitMode(Enum):
     """Fitting mode selection"""
     FAST = "fast"
     HESSIAN = "hessian"
+    GRID_SCAN = "grid_scan"
 
 
 @dataclass
@@ -119,14 +120,41 @@ class FitResult:
         return "\n".join(lines)
 
 
+@dataclass
+class GridScanResult:
+    """Result from grid scan fitting, including chi2 landscape."""
+    best_fit: FitResult
+    chi2_grid: np.ndarray          # shape (n_ages, n_mhs)
+    dm_grid: np.ndarray            # shape (n_ages, n_mhs)
+    egr_grid: np.ndarray           # shape (n_ages, n_mhs)
+    grid_ages: np.ndarray          # 1D sorted ages within bounds
+    grid_mhs: np.ndarray           # 1D sorted metallicities within bounds
+    n_evaluated: int = 0
+    elapsed_sec: float = 0.0
+
+    def summary(self) -> str:
+        lines = [
+            "=" * 50,
+            "Grid Scan Result",
+            "=" * 50,
+            "",
+            f"Grid: {len(self.grid_ages)} ages x {len(self.grid_mhs)} [M/H]"
+            f" = {len(self.grid_ages) * len(self.grid_mhs)} cells",
+            f"Evaluated: {self.n_evaluated} cells",
+            f"Elapsed: {self.elapsed_sec:.2f} sec",
+            "",
+        ]
+        lines.append(self.best_fit.summary())
+        return "\n".join(lines)
+
+
 class IsochroneFitterV2:
     """
     Improved Isochrone Fitter with interpolation and perpendicular distance.
     """
 
-    # Extinction coefficients (SDSS)
-    R_G = 3.303
-    R_R = 2.285
+    # SDSS extinction coefficients: R_band = A_band / E(B-V)
+    SDSS_R = {"g": 3.303, "r": 2.285, "i": 1.698, "z": 1.263}
 
     def __init__(
         self,
@@ -135,16 +163,26 @@ class IsochroneFitterV2:
         col_age: int = 2,
         col_g: int = 29,
         col_r: int = 30,
+        col_mag: Optional[int] = None,
         col_mass: int = 5,  # Initial mass column for IMF weighting
-        fit_fraction: float = 0.7
+        fit_fraction: float = 0.7,
+        R_band1: float = 3.303,
+        R_band2: float = 2.285,
+        R_mag: Optional[float] = None,
     ):
         self.iso_file = Path(isochrone_file)
         self.COL_MH = col_mh
         self.COL_AGE = col_age
+        # band1, band2 define color = band1 - band2
         self.COL_G = col_g
         self.COL_R = col_r
+        # mag band can be independent from color bands.
+        self.COL_MAG = int(col_mag) if col_mag is not None else int(col_g)
         self.COL_MASS = col_mass
         self.fit_fraction = fit_fraction
+        self.R_1 = R_band1
+        self.R_2 = R_band2
+        self.R_MAG = float(R_mag) if R_mag is not None else float(R_band1)
 
         self.iso_data = self._load_isochrone()
 
@@ -160,6 +198,7 @@ class IsochroneFitterV2:
         self.progress_callback: Optional[Callable[[float, str], None]] = None
         self._fit_obs: Optional[np.ndarray] = None
         self._fit_err: Optional[np.ndarray] = None
+        self._fit_weight: Optional[np.ndarray] = None
         self._fit_iteration: int = 0
         self._fit_max_iter: int = 100
 
@@ -179,7 +218,7 @@ class IsochroneFitterV2:
                 iso_sub = self.iso_data[mask]
                 if len(iso_sub) > 10:
                     # Sort by magnitude (evolutionary sequence)
-                    sort_idx = np.argsort(iso_sub[:, self.COL_G])
+                    sort_idx = np.argsort(iso_sub[:, self.COL_MAG])
                     self._iso_cache[(round(age, 2), round(mh, 2))] = iso_sub[sort_idx]
 
     def _get_nearby_isochrones(self, log_age: float, mh: float) -> List[Tuple[float, float, np.ndarray]]:
@@ -225,21 +264,24 @@ class IsochroneFitterV2:
 
         iso_data = self._iso_cache[key]
 
-        g = iso_data[:, self.COL_G]
-        r = iso_data[:, self.COL_R]
+        band1 = iso_data[:, self.COL_G]
+        band2 = iso_data[:, self.COL_R]
+        mag_band = iso_data[:, self.COL_MAG]
         mass = iso_data[:, self.COL_MASS]
 
         # Apply extinction and distance modulus
-        E_BV = e_gr / (self.R_G - self.R_R)
-        A_g = self.R_G * E_BV
-        A_r = self.R_R * E_BV
+        E_BV = e_gr / (self.R_1 - self.R_2)
+        A_1 = self.R_1 * E_BV
+        A_2 = self.R_2 * E_BV
+        A_mag = self.R_MAG * E_BV
 
-        g_obs = g + dm + A_g
-        r_obs = r + dm + A_r
-        color = g_obs - r_obs
+        b1_obs = band1 + dm + A_1
+        b2_obs = band2 + dm + A_2
+        mag_obs = mag_band + dm + A_mag
+        color = b1_obs - b2_obs
 
-        valid = np.isfinite(color) & np.isfinite(g_obs)
-        return color[valid], g_obs[valid], mass[valid]
+        valid = np.isfinite(color) & np.isfinite(mag_obs)
+        return color[valid], mag_obs[valid], mass[valid]
 
     def _fast_distance(
         self,
@@ -258,8 +300,8 @@ class IsochroneFitterV2:
             return np.full(len(obs_color), np.inf)
 
         # Normalize by median errors for balanced color/mag weighting
-        color_scale = np.median(obs_color_err)
-        mag_scale = np.median(obs_mag_err)
+        color_scale = max(np.median(obs_color_err), 1e-6)
+        mag_scale = max(np.median(obs_mag_err), 1e-6)
 
         # Normalized isochrone points
         iso_pts = np.column_stack([
@@ -334,7 +376,15 @@ class IsochroneFitterV2:
             closest_idx = sorted_idx[:n_use]
 
             # Chi² = sum of squared normalized distances
-            chi2 = np.sum(dist[closest_idx] ** 2)
+            # Optional robust weighting for iterative membership refinement.
+            weights = self._fit_weight
+            if weights is not None and len(weights) == len(dist):
+                w = np.asarray(weights, dtype=float)[closest_idx]
+                w = np.clip(w, 1e-3, None)
+                # Normalize weights so chi2 scale stays comparable across EM rounds.
+                chi2 = np.sum((dist[closest_idx] ** 2) * w) * (len(w) / np.sum(w))
+            else:
+                chi2 = np.sum(dist[closest_idx] ** 2)
 
             return chi2
 
@@ -364,7 +414,6 @@ class IsochroneFitterV2:
         if bounds is None:
             bounds = FitBounds()
 
-        eps = 1e-6
         obs_color_err = np.clip(obs_color_err, 0.01, None)
         obs_mag_err = np.clip(obs_mag_err, 0.01, None)
 
@@ -391,15 +440,52 @@ class IsochroneFitterV2:
         # Store for objective function
         self._fit_obs = np.column_stack([color, mag])
         self._fit_err = np.column_stack([color_err, mag_err])
+        self._fit_weight = np.ones(n_stars, dtype=float)
         self._fit_iteration = 0
 
-        # Run optimization
-        if mode == FitMode.FAST:
-            result = self._fit_fast(bounds, n_stars, **kwargs)
-        elif mode == FitMode.HESSIAN:
-            result = self._fit_hessian(bounds, n_stars, **kwargs)
-        else:
-            raise ValueError(f"Unsupported fit mode: {mode}")
+        em_iters = max(1, int(kwargs.pop("em_iters", 1)))
+        membership_sigma_scale = float(kwargs.pop("membership_sigma_scale", 1.3))
+        weight_floor = float(kwargs.pop("weight_floor", 0.05))
+
+        best_result = None
+
+        for em_idx in range(em_iters):
+            # Scale per-round progress into overall [0, 1]
+            original_callback = self.progress_callback
+            if original_callback:
+                def _round_callback(progress, message, _em=em_idx):
+                    p = (float(_em) + float(np.clip(progress, 0.0, 1.0))) / float(em_iters)
+                    original_callback(p, f"Round {_em + 1}/{em_iters}: {message}")
+                self.progress_callback = _round_callback
+
+            try:
+                if mode == FitMode.FAST:
+                    result = self._fit_fast(bounds, n_stars, **kwargs)
+                elif mode == FitMode.HESSIAN:
+                    result = self._fit_hessian(bounds, n_stars, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported fit mode: {mode}")
+            finally:
+                self.progress_callback = original_callback
+
+            if (best_result is None) or (float(result.chi2) < float(best_result.chi2)):
+                best_result = result
+
+            # Update weights from membership for next EM round.
+            if em_idx < em_iters - 1:
+                try:
+                    prob = self.compute_membership(
+                        result,
+                        color,
+                        mag,
+                        sigma_scale=membership_sigma_scale,
+                    )
+                    if prob is not None and len(prob) == n_stars:
+                        self._fit_weight = np.clip(np.asarray(prob, dtype=float), weight_floor, 1.0)
+                except Exception:
+                    pass
+
+        result = best_result if best_result is not None else result
 
         result.n_stars = n_stars
         result.elapsed_sec = time.time() - t0
@@ -407,6 +493,7 @@ class IsochroneFitterV2:
 
         self._fit_obs = None
         self._fit_err = None
+        self._fit_weight = None
 
         return result
 
@@ -636,6 +723,212 @@ class IsochroneFitterV2:
             reduced_chi2=chi2 / dof,
             converged=converged,
         )
+
+    # -----------------------------------------------------------------
+    # Grid Scan
+    # -----------------------------------------------------------------
+
+    def _grid_objective_2p(self, params_2p: np.ndarray, age: float, mh: float) -> float:
+        """2-parameter wrapper: optimize (DM, E(g-r)) for fixed (age, mh)."""
+        dm, e_gr = params_2p
+        return self._objective(np.array([age, mh, dm, e_gr]))
+
+    def _fit_grid_scan(self, bounds: FitBounds, n_stars: int, **kwargs) -> GridScanResult:
+        local_maxiter = int(kwargs.get("local_maxiter", 50))
+        initial_dm = float(kwargs.get("initial_dm", (bounds.distance_mod[0] + bounds.distance_mod[1]) * 0.5))
+        initial_egr = float(kwargs.get("initial_egr", (bounds.extinction_gr[0] + bounds.extinction_gr[1]) * 0.5))
+
+        # Filter grid to bounds
+        age_mask = (self.ages >= bounds.log_age[0]) & (self.ages <= bounds.log_age[1])
+        mh_mask = (self.metallicities >= bounds.metallicity[0]) & (self.metallicities <= bounds.metallicity[1])
+        grid_ages = self.ages[age_mask]
+        grid_mhs = self.metallicities[mh_mask]
+
+        n_ages = len(grid_ages)
+        n_mhs = len(grid_mhs)
+        total_cells = n_ages * n_mhs
+
+        if total_cells == 0:
+            empty_fit = FitResult(
+                log_age=0.0, metallicity=0.0, distance_mod=0.0, extinction_gr=0.0,
+                chi2=np.inf, n_stars=n_stars, converged=False, fit_mode="grid_scan",
+            )
+            return GridScanResult(
+                best_fit=empty_fit,
+                chi2_grid=np.full((0, 0), np.nan),
+                dm_grid=np.full((0, 0), np.nan),
+                egr_grid=np.full((0, 0), np.nan),
+                grid_ages=grid_ages, grid_mhs=grid_mhs,
+            )
+
+        chi2_grid = np.full((n_ages, n_mhs), np.nan)
+        dm_grid = np.full((n_ages, n_mhs), np.nan)
+        egr_grid = np.full((n_ages, n_mhs), np.nan)
+
+        bounds_2p = [bounds.distance_mod, bounds.extinction_gr]
+        x0_2p = np.array([initial_dm, initial_egr], dtype=float)
+        n_evaluated = 0
+
+        for i, age in enumerate(grid_ages):
+            for j, mh in enumerate(grid_mhs):
+                cell_idx = i * n_mhs + j
+
+                # Check cache
+                key = (round(float(age), 2), round(float(mh), 2))
+                if key not in self._iso_cache:
+                    if self.progress_callback:
+                        self.progress_callback(
+                            (cell_idx + 1) / total_cells,
+                            f"Cell {cell_idx + 1}/{total_cells} (skip)"
+                        )
+                    continue
+
+                try:
+                    res = minimize(
+                        self._grid_objective_2p,
+                        x0_2p,
+                        args=(float(age), float(mh)),
+                        method='L-BFGS-B',
+                        bounds=bounds_2p,
+                        options={'maxiter': local_maxiter},
+                    )
+                    chi2_grid[i, j] = float(res.fun)
+                    dm_grid[i, j] = float(res.x[0])
+                    egr_grid[i, j] = float(res.x[1])
+                    n_evaluated += 1
+                except Exception:
+                    pass
+
+                if self.progress_callback:
+                    self.progress_callback(
+                        (cell_idx + 1) / total_cells,
+                        f"Cell {cell_idx + 1}/{total_cells} | age={age:.2f} [M/H]={mh:.2f}"
+                    )
+
+        # Find best cell
+        if n_evaluated == 0:
+            empty_fit = FitResult(
+                log_age=0.0, metallicity=0.0, distance_mod=0.0, extinction_gr=0.0,
+                chi2=np.inf, n_stars=n_stars, converged=False, fit_mode="grid_scan",
+            )
+            return GridScanResult(
+                best_fit=empty_fit,
+                chi2_grid=chi2_grid, dm_grid=dm_grid, egr_grid=egr_grid,
+                grid_ages=grid_ages, grid_mhs=grid_mhs,
+                n_evaluated=n_evaluated,
+            )
+
+        flat_idx = np.nanargmin(chi2_grid)
+        i_best, j_best = np.unravel_index(flat_idx, chi2_grid.shape)
+        best_age = float(grid_ages[i_best])
+        best_mh = float(grid_mhs[j_best])
+        best_dm = float(dm_grid[i_best, j_best])
+        best_egr = float(egr_grid[i_best, j_best])
+        best_chi2 = float(chi2_grid[i_best, j_best])
+
+        # Final 4-param refinement for error estimation
+        errors = [None, None, None, None]
+        try:
+            bounds_list = bounds.to_list()
+            ref = minimize(
+                self._objective,
+                np.array([best_age, best_mh, best_dm, best_egr]),
+                method='L-BFGS-B',
+                bounds=bounds_list,
+                options={'maxiter': 200},
+            )
+            if ref.fun <= best_chi2:
+                best_age, best_mh, best_dm, best_egr = (float(v) for v in ref.x)
+                best_chi2 = float(ref.fun)
+            if hasattr(ref, 'hess_inv') and ref.hess_inv is not None:
+                if hasattr(ref.hess_inv, 'todense'):
+                    hess_inv = np.array(ref.hess_inv.todense())
+                else:
+                    hess_inv = np.array(ref.hess_inv)
+                errors = list(np.sqrt(np.abs(np.diag(hess_inv))))
+        except Exception:
+            pass
+
+        dof = max(1, n_stars - 4)
+        best_fit = FitResult(
+            log_age=best_age,
+            metallicity=best_mh,
+            distance_mod=best_dm,
+            extinction_gr=best_egr,
+            log_age_err=errors[0],
+            metallicity_err=errors[1],
+            distance_mod_err=errors[2],
+            extinction_gr_err=errors[3],
+            chi2=best_chi2,
+            reduced_chi2=best_chi2 / dof,
+            n_stars=n_stars,
+            converged=True,
+            fit_mode="grid_scan",
+        )
+
+        return GridScanResult(
+            best_fit=best_fit,
+            chi2_grid=chi2_grid, dm_grid=dm_grid, egr_grid=egr_grid,
+            grid_ages=grid_ages, grid_mhs=grid_mhs,
+            n_evaluated=n_evaluated,
+        )
+
+    def fit_grid_scan(
+        self,
+        obs_color: np.ndarray,
+        obs_mag: np.ndarray,
+        obs_color_err: np.ndarray,
+        obs_mag_err: np.ndarray,
+        bounds: Optional[FitBounds] = None,
+        snr_min: float = 5.0,
+        **kwargs,
+    ) -> GridScanResult:
+        """Exhaustive grid scan over all (age, mh) within bounds."""
+        t0 = time.time()
+        if bounds is None:
+            bounds = FitBounds()
+
+        obs_color_err = np.clip(obs_color_err, 0.01, None)
+        obs_mag_err = np.clip(obs_mag_err, 0.01, None)
+        snr_c = 1.0 / obs_color_err
+        snr_m = 1.0 / obs_mag_err
+        snr = np.minimum(snr_c, snr_m)
+        mask = (snr > snr_min) & np.isfinite(obs_color) & np.isfinite(obs_mag)
+
+        color = obs_color[mask]
+        mag = obs_mag[mask]
+        color_err = obs_color_err[mask]
+        mag_err = obs_mag_err[mask]
+        n_stars = len(color)
+
+        if n_stars < 20:
+            empty_fit = FitResult(
+                log_age=0.0, metallicity=0.0, distance_mod=0.0, extinction_gr=0.0,
+                chi2=np.inf, n_stars=n_stars, converged=False, fit_mode="grid_scan",
+            )
+            return GridScanResult(
+                best_fit=empty_fit,
+                chi2_grid=np.full((0, 0), np.nan),
+                dm_grid=np.full((0, 0), np.nan),
+                egr_grid=np.full((0, 0), np.nan),
+                grid_ages=np.array([]), grid_mhs=np.array([]),
+            )
+
+        self._fit_obs = np.column_stack([color, mag])
+        self._fit_err = np.column_stack([color_err, mag_err])
+        self._fit_weight = np.ones(n_stars, dtype=float)
+
+        try:
+            grid_result = self._fit_grid_scan(bounds, n_stars, **kwargs)
+        finally:
+            self._fit_obs = None
+            self._fit_err = None
+            self._fit_weight = None
+
+        grid_result.elapsed_sec = time.time() - t0
+        grid_result.best_fit.n_stars = n_stars
+        grid_result.best_fit.elapsed_sec = grid_result.elapsed_sec
+        return grid_result
 
     def get_best_fit_isochrone(self, result: FitResult) -> Tuple[np.ndarray, np.ndarray]:
         """Get best-fit isochrone CMD coordinates"""

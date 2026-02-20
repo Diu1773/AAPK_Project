@@ -10,10 +10,11 @@ from PyQt5.QtWidgets import (
     QFormLayout, QLineEdit, QDialogButtonBox, QSplitter, QApplication,
     QProgressBar, QCheckBox, QSpinBox, QDoubleSpinBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QSlider, QGridLayout,
-    QWidget
+    QWidget, QTabWidget
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from pathlib import Path
+from typing import Optional
 import copy
 import shutil
 import json
@@ -23,14 +24,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats, SigmaClip
+from astropy.time import Time
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter, median_filter
 from scipy.spatial import cKDTree as KDTree
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step2_cropped_dir, crop_is_active
 from ...utils.constants import get_parallel_workers
+from ...utils.step_paths import (
+    step2_cropped_dir,
+    crop_is_active,
+    step4_dir,
+    step5_dir,
+    legacy_step7_wcs_dir,
+)
 
 
 class DetectionWorker(QThread):
@@ -76,6 +84,8 @@ class DetectionWorker(QThread):
             results = {}
             total = len(self.file_list)
             P = self.params.P
+            step4_out = step4_dir(self.result_dir)
+            step4_out.mkdir(parents=True, exist_ok=True)
 
             # Get parameters
             detect_sigma_base = float(getattr(P, 'detect_sigma', 3.2))
@@ -85,7 +95,7 @@ class DetectionWorker(QThread):
             deblend_cont = float(getattr(P, 'deblend_cont', 0.004))
             deblend_max_labels = int(getattr(P, 'deblend_max_labels', 4000))
             deblend_label_hard_max = int(getattr(P, 'deblend_label_hard_max', 7000))
-            bkg2d_enable = bool(getattr(P, 'bkg2d_enable', True)) and bool(getattr(P, 'bkg2d_in_detect', True))
+            bkg2d_enable = getattr(P, 'bkg2d_in_detect', True)
             bkg2d_box = int(getattr(P, 'bkg2d_box', 64))
             dao_refine_enable = getattr(P, 'dao_refine_enable', False)
             dao_fwhm_px = float(getattr(P, 'dao_fwhm_px', getattr(P, 'fwhm_seed_px', 6.0)))
@@ -105,7 +115,7 @@ class DetectionWorker(QThread):
             if isinstance(peak_scales, str):
                 peak_scales = [float(s) for s in peak_scales.split(",") if s.strip()]
 
-            max_workers = get_parallel_workers(self.params)  # Central config
+            max_workers = get_parallel_workers(self.params)
 
             print(f"[DetectionWorker] max_workers={max_workers}, sigma_base={detect_sigma_base}")
 
@@ -143,7 +153,20 @@ class DetectionWorker(QThread):
                             cropped_dir = self.result_dir / "cropped"
                         file_path = cropped_dir / filename
                     else:
-                        file_path = self.data_dir / filename
+                        file_path = self.params.get_file_path(filename)
+                    source_sig = {
+                        "cache_schema": 2,
+                        "source_path": str(Path(file_path)).replace("\\", "/").lower(),
+                        "source_use_cropped": bool(self.use_cropped),
+                        "source_size": None,
+                        "source_mtime_ns": None,
+                    }
+                    try:
+                        st = Path(file_path).stat()
+                        source_sig["source_size"] = int(st.st_size)
+                        source_sig["source_mtime_ns"] = int(st.st_mtime_ns)
+                    except Exception:
+                        pass
 
                     # Load FITS
                     with fits.open(file_path) as hdul:
@@ -165,6 +188,8 @@ class DetectionWorker(QThread):
 
                     # Stage 2: Background
                     self.worker_status.emit(worker_id, short_name, "Background", 25)
+                    if self._stop_requested:
+                        return filename, None
 
                     def refine_centroid(img, x, y, seed_fwhm_px):
                         h, w = img.shape
@@ -264,6 +289,8 @@ class DetectionWorker(QThread):
                         centers = 0.5 * (edges[:-1] + edges[1:])
                         prof = np.full_like(centers, np.nan, dtype=float)
                         for i in range(len(centers)):
+                            if self._stop_requested:
+                                return np.nan, sky_med, sky_std
                             a = (rr >= edges[i]) & (rr < edges[i + 1])
                             if np.any(a):
                                 vv = val[a]
@@ -296,6 +323,8 @@ class DetectionWorker(QThread):
                         out = []
 
                         for s in (peak_scales or [0.9, 1.3]):
+                            if self._stop_requested:
+                                return []
                             sig = max(0.7, (s * seed_fwhm_px) / 2.355)
                             fim_local = gaussian_filter(det_safe - med, sig, mode="nearest")
                             _, mF, stdF = sigma_clipped_stats(fim_local, sigma=3.0, maxiters=5)
@@ -322,6 +351,8 @@ class DetectionWorker(QThread):
                         keep = np.ones(len(pts), bool)
                         tree = KDTree(pts)
                         for i in range(len(pts)):
+                            if self._stop_requested:
+                                return []
                             if not keep[i]:
                                 continue
                             j = tree.query_ball_point(pts[i], r=peak_min_sep)
@@ -337,13 +368,21 @@ class DetectionWorker(QThread):
                         return [tuple(xy) for xy in pts]
 
                     # Background estimation (Jupyter-style downsample median)
+                    if self._stop_requested:
+                        return filename, None
                     data_filled = np.where(np.isfinite(data), data, 0.0)
                     if bkg2d_enable:
+                        if self._stop_requested:
+                            return filename, None
                         ds = max(1, int(getattr(P, 'bkg2d_downsample', 4)))
                         k = max(3, int(round(bkg2d_box / ds)))
                         small = data_filled[::ds, ::ds]
                         bkg_small = median_filter(small, size=k, mode="nearest")
+                        if self._stop_requested:
+                            return filename, None
                         bkg = np.repeat(np.repeat(bkg_small, ds, axis=0), ds, axis=1)[:data.shape[0], :data.shape[1]]
+                        if self._stop_requested:
+                            return filename, None
                         data_sub = data - bkg
                     else:
                         data_sub = data.copy()
@@ -357,6 +396,8 @@ class DetectionWorker(QThread):
                     fwhm_seed = float(getattr(P, 'fwhm_seed_px', getattr(P, 'fwhm_pix_guess', 6.0) or 6.0))
                     sig = max(0.8, fwhm_seed / 2.355)
                     fim = gaussian_filter(work - bkg_median, sig, mode="nearest")
+                    if self._stop_requested:
+                        return filename, None
 
                     # Threshold (median + nsig * std)
                     _, mF, stdF = sigma_clipped_stats(fim, sigma=3.0, maxiters=5)
@@ -368,17 +409,25 @@ class DetectionWorker(QThread):
 
                     # Segmentation detection
                     detect_engine = str(getattr(P, 'detect_engine', 'segm')).strip().lower()
+                    if detect_engine not in ("segm", "peak", "dao"):
+                        detect_engine = "segm"
                     segm = None
-                    if detect_engine != "peak":
+                    if detect_engine == "segm":
                         segm = detect_sources(
                             fim, threshold=threshold,
                             npixels=max(3, minarea_pix), connectivity=8
                         )
+                    if self._stop_requested:
+                        return filename, None
 
                     n_sources = 0
                     positions = []
                     fwhm_values = []
-                    detect_method = "segm"
+                    detect_method = "segm" if detect_engine == "segm" else detect_engine
+                    median_elongation = np.nan
+                    median_roundness = np.nan
+                    sat_star_count = 0
+                    elong_map = {}
 
                     if segm is not None and segm.nlabels > 0:
                         # Stage 4: Deblending
@@ -426,6 +475,11 @@ class DetectionWorker(QThread):
                         ycen = np.asarray(tab["ycentroid"], float)
                         flux = np.asarray(tab["segment_flux"], float)
                         elong = np.asarray(tab["elongation"], float) if "elongation" in tab.colnames else np.ones_like(xcen)
+                        if len(elong):
+                            try:
+                                median_elongation = float(np.nanmedian(elong))
+                            except Exception:
+                                median_elongation = np.nan
 
                         order = np.argsort(flux)[::-1]
                         x0 = xcen[order]
@@ -434,19 +488,23 @@ class DetectionWorker(QThread):
 
                         elong_max = float(getattr(P, 'fwhm_elong_max', 1.3))
                         keep = np.isfinite(x0) & np.isfinite(y0) & (e0 <= elong_max)
-                        x0, y0 = x0[keep], y0[keep]
+                        x0, y0, e0 = x0[keep], y0[keep], e0[keep]
 
                         cand = np.vstack([x0, y0]).T
+                        e_cand = e0.copy()
                         detect_keep_max = int(getattr(P, 'detect_keep_max', 6000))
                         if len(cand) > detect_keep_max:
                             cand = cand[:detect_keep_max]
+                            e_cand = e_cand[:detect_keep_max]
 
                         iso_min_sep = float(getattr(P, 'iso_min_sep_pix', 18.0))
                         if len(cand) > 1:
                             tree = KDTree(cand)
                             d, _ = tree.query(cand, k=2)
                             sep = d[:, 1]
-                            cand = cand[sep >= iso_min_sep]
+                            keep_iso = sep >= iso_min_sep
+                            cand = cand[keep_iso]
+                            e_cand = e_cand[keep_iso]
 
                         if len(cand) > 0:
                             H, W = data.shape
@@ -454,9 +512,16 @@ class DetectionWorker(QThread):
                             iy = np.clip(np.round(cand[:, 1]).astype(int), 0, H - 1)
                             sat_adu = float(getattr(P, 'saturation_adu', 60000.0))
                             ok = data[iy, ix] < sat_adu
+                            sat_star_count = int((~ok).sum())
                             cand = cand[ok]
+                            e_cand = e_cand[ok]
 
                         positions = [tuple(map(float, p)) for p in cand]
+                        if len(cand):
+                            elong_map = {
+                                (float(x), float(y)): float(e)
+                                for (x, y), e in zip(cand, e_cand)
+                            }
                         n_sources = len(positions)
 
                         for src in cat:
@@ -469,61 +534,115 @@ class DetectionWorker(QThread):
 
                     # Optional DAO refine to reject hot pixels (cutout-based for speed)
                     # Also collect DAO statistics for each source
-                    source_dao_info = {}  # dict: (x,y) -> {sharpness, roundness1, roundness2, peak, flux}
-
-                    if dao_refine_enable and positions:
+                    source_dao_info = {}
+                    dao_primary = detect_engine == "dao"
+                    if dao_refine_enable or dao_primary:
                         if self._stop_requested:
                             return filename, None
                         self.worker_status.emit(worker_id, short_name, "DAO refine", 65)
 
-                        # DAO refine: cutout-based validation (fast)
-                        cutout_half = int(dao_fwhm_px * 3)  # 3x FWHM radius
-                        ny, nx = data_sub.shape
-                        filtered = []
-
-                        daofind = DAOStarFinder(
-                            fwhm=dao_fwhm_px,
-                            threshold=threshold * 0.8,  # slightly lower for cutout
-                            sharplo=dao_sharp_lo,
-                            sharphi=dao_sharp_hi,
-                            roundlo=dao_round_lo,
-                            roundhi=dao_round_hi
-                        )
-
-                        for x, y in positions:
-                            ix, iy = int(round(x)), int(round(y))
-                            x0 = max(0, ix - cutout_half)
-                            x1 = min(nx, ix + cutout_half + 1)
-                            y0 = max(0, iy - cutout_half)
-                            y1 = min(ny, iy + cutout_half + 1)
-
-                            if x1 - x0 < 5 or y1 - y0 < 5:
-                                continue
-
-                            cutout = data_sub[y0:y1, x0:x1]
+                        if dao_primary:
+                            # DAO as primary detector: full image scan
                             try:
-                                dao_cat = daofind(cutout)
+                                daofind = DAOStarFinder(
+                                    fwhm=dao_fwhm_px,
+                                    threshold=threshold,
+                                    sharplo=dao_sharp_lo,
+                                    sharphi=dao_sharp_hi,
+                                    roundlo=dao_round_lo,
+                                    roundhi=dao_round_hi
+                                )
+                                dao_cat = daofind(data_sub)
                                 if dao_cat is not None and len(dao_cat) > 0:
-                                    # Check if any detection is near the center
-                                    cx, cy = x - x0, y - y0
-                                    for i, (dx, dy) in enumerate(zip(dao_cat['xcentroid'], dao_cat['ycentroid'])):
-                                        if (dx - cx)**2 + (dy - cy)**2 <= dao_match_tol**2:
-                                            filtered.append((float(x), float(y)))
-                                            # Store DAO statistics
-                                            source_dao_info[(float(x), float(y))] = {
+                                    positions = []
+                                    try:
+                                        round1 = np.asarray(dao_cat["roundness1"], float)
+                                        round2 = np.asarray(dao_cat["roundness2"], float)
+                                        round_vals = np.maximum(np.abs(round1), np.abs(round2))
+                                        if len(round_vals):
+                                            median_roundness = float(np.nanmedian(round_vals))
+                                    except Exception:
+                                        median_roundness = np.nan
+                                    try:
+                                        sat_adu = float(getattr(P, 'saturation_adu', 60000.0))
+                                        if "peak" in dao_cat.colnames:
+                                            peaks = np.asarray(dao_cat["peak"], float)
+                                            sat_star_count = int(np.sum(peaks >= sat_adu))
+                                    except Exception:
+                                        sat_star_count = 0
+                                    for i, (x, y) in enumerate(zip(dao_cat['xcentroid'], dao_cat['ycentroid'])):
+                                        xf, yf = float(x), float(y)
+                                        positions.append((xf, yf))
+                                        try:
+                                            source_dao_info[(xf, yf)] = {
                                                 'sharpness': float(dao_cat['sharpness'][i]),
                                                 'roundness1': float(dao_cat['roundness1'][i]),
                                                 'roundness2': float(dao_cat['roundness2'][i]),
                                                 'peak': float(dao_cat['peak'][i]),
                                                 'flux': float(dao_cat['flux'][i]),
                                             }
-                                            break
+                                        except Exception:
+                                            pass
+                                    n_sources = len(positions)
+                                    detect_method = "dao"
+                                else:
+                                    detect_method = "none"
                             except Exception:
-                                pass
+                                detect_method = "none"
+                        elif positions:
+                            # DAO refine: cutout-based validation (fast)
+                            cutout_half = int(dao_fwhm_px * 3)  # 3x FWHM radius
+                            ny, nx = data_sub.shape
+                            filtered = []
 
-                        positions = filtered
-                        n_sources = len(positions)
-                        detect_method = "segm+dao"
+                            daofind = DAOStarFinder(
+                                fwhm=dao_fwhm_px,
+                                threshold=threshold * 0.8,  # slightly lower for cutout
+                                sharplo=dao_sharp_lo,
+                                sharphi=dao_sharp_hi,
+                                roundlo=dao_round_lo,
+                                roundhi=dao_round_hi
+                            )
+
+                            for x, y in positions:
+                                if self._stop_requested:
+                                    return filename, None
+                                ix, iy = int(round(x)), int(round(y))
+                                x0 = max(0, ix - cutout_half)
+                                x1 = min(nx, ix + cutout_half + 1)
+                                y0 = max(0, iy - cutout_half)
+                                y1 = min(ny, iy + cutout_half + 1)
+
+                                if x1 - x0 < 5 or y1 - y0 < 5:
+                                    continue
+
+                                cutout = data_sub[y0:y1, x0:x1]
+                                try:
+                                    dao_cat = daofind(cutout)
+                                    if dao_cat is not None and len(dao_cat) > 0:
+                                        # Check if any detection is near the center
+                                        cx, cy = x - x0, y - y0
+                                    for i, (dx, dy) in enumerate(zip(dao_cat['xcentroid'], dao_cat['ycentroid'])):
+                                        if (dx - cx)**2 + (dy - cy)**2 <= dao_match_tol**2:
+                                            xf, yf = float(x), float(y)
+                                            filtered.append((xf, yf))
+                                            try:
+                                                source_dao_info[(xf, yf)] = {
+                                                    'sharpness': float(dao_cat['sharpness'][i]),
+                                                    'roundness1': float(dao_cat['roundness1'][i]),
+                                                    'roundness2': float(dao_cat['roundness2'][i]),
+                                                    'peak': float(dao_cat['peak'][i]),
+                                                    'flux': float(dao_cat['flux'][i]),
+                                                }
+                                            except Exception:
+                                                pass
+                                            break
+                                except Exception:
+                                    pass
+
+                            positions = filtered
+                            n_sources = len(positions)
+                            detect_method = "segm+dao"
 
                     # Peak assist (Jupyter-style)
                     added_peak = 0
@@ -570,8 +689,8 @@ class DetectionWorker(QThread):
                     ann_out_scale = float(getattr(P, 'fitsky_dannulus_scale', 2.0))
                     ann_min_gap_px = float(getattr(P, 'annulus_min_gap_px', 6.0))
                     ann_min_width_px = float(getattr(P, 'annulus_min_width_px', 12.0))
-                    try:
 
+                    try:
                         if positions:
                             pts = np.array(positions, float)
                             h, w = data.shape
@@ -583,6 +702,8 @@ class DetectionWorker(QThread):
                             n_use = min(int(fwhm_qc_max), int(fwhm_measure_max), len(pts))
                             fwhm_values = []
                             for (x, y) in pts[:n_use]:
+                                if self._stop_requested:
+                                    return filename, None
                                 rc = refine_centroid(data, x, y, fwhm_seed)
                                 if rc is None:
                                     continue
@@ -614,50 +735,76 @@ class DetectionWorker(QThread):
                         'threshold': threshold,
                         'sigma_used': nsig,
                         'detect_method': detect_method,
+                        'median_elongation': median_elongation,
+                        'median_roundness': median_roundness,
+                        'sat_star_count': sat_star_count,
+                        **source_sig,
                     }
 
                     # Stage 6: Saving
                     self.worker_status.emit(worker_id, short_name, "Saving", 90)
+                    if self._stop_requested:
+                        return filename, None
 
                     # Save to cache
                     cache_file = self.cache_dir / f"detect_{filename}.json"
+                    step4_file = step4_out / f"detect_{filename}.json"
+                    payload = {
+                        'n_sources': n_sources,
+                        'fwhm_px': fwhm_median,
+                        'fwhm_arcsec': fwhm_arcsec,
+                        'bkg_median': bkg_median,
+                        'bkg_rms': bkg_rms,
+                        'filter': filt,
+                        'threshold': threshold,
+                        'sigma_used': nsig,
+                        'detect_method': detect_method,
+                        'peak_added': added_peak,
+                        'median_elongation': median_elongation,
+                        'median_roundness': median_roundness,
+                        'sat_star_count': sat_star_count,
+                        **source_sig,
+                    }
                     with open(cache_file, 'w') as f:
-                        json.dump({
-                            'n_sources': n_sources,
-                            'fwhm_px': fwhm_median,
-                            'fwhm_arcsec': fwhm_arcsec,
-                            'bkg_median': bkg_median,
-                            'bkg_rms': bkg_rms,
-                            'filter': filt,
-                            'threshold': threshold,
-                            'sigma_used': nsig,
-                            'detect_method': detect_method,
-                            'peak_added': added_peak,
-                        }, f)
+                        json.dump(payload, f)
+                    with open(step4_file, 'w') as f:
+                        json.dump(payload, f)
 
                     # Save positions with extended info (DAO stats, FWHM, peak value)
                     pos_file = self.cache_dir / f"detect_{filename}.csv"
+                    step4_pos = step4_out / f"detect_{filename}.csv"
                     if positions:
                         source_records = []
+                        peak_set = {(float(px), float(py)) for px, py in peak_positions}
                         for idx, (x, y) in enumerate(positions):
+                            if self._stop_requested:
+                                return filename, None
                             record = {
                                 'id': idx + 1,
                                 'x': x,
                                 'y': y,
                             }
-                            # Add DAO info if available
+                            if elong_map:
+                                record['elongation'] = elong_map.get((x, y), np.nan)
                             dao_info = source_dao_info.get((x, y), {})
                             record['sharpness'] = dao_info.get('sharpness', np.nan)
                             record['roundness1'] = dao_info.get('roundness1', np.nan)
                             record['roundness2'] = dao_info.get('roundness2', np.nan)
+                            try:
+                                r1 = float(record['roundness1'])
+                                r2 = float(record['roundness2'])
+                                if np.isfinite(r1) or np.isfinite(r2):
+                                    r1 = r1 if np.isfinite(r1) else 0.0
+                                    r2 = r2 if np.isfinite(r2) else 0.0
+                                    record['roundness'] = max(abs(r1), abs(r2))
+                            except Exception:
+                                pass
                             record['dao_peak'] = dao_info.get('peak', np.nan)
                             record['dao_flux'] = dao_info.get('flux', np.nan)
 
-                            # Measure individual FWHM and peak value from image
                             try:
                                 ix, iy = int(round(x)), int(round(y))
                                 record['peak_adu'] = float(data[iy, ix]) if 0 <= iy < data.shape[0] and 0 <= ix < data.shape[1] else np.nan
-                                # Per-source FWHM measurement
                                 rc = refine_centroid(data, x, y, fwhm_seed)
                                 if rc is not None:
                                     xc, yc, _, _ = rc
@@ -674,17 +821,18 @@ class DetectionWorker(QThread):
                                 record['peak_adu'] = np.nan
                                 record['fwhm_px'] = np.nan
 
-                            # Source type (peak-assisted or segmentation)
-                            record['source_type'] = 'peak' if (x, y) in [(px, py) for px, py in peak_positions] else 'segm'
-
+                            record['source_type'] = 'peak' if (x, y) in peak_set else 'segm'
                             source_records.append(record)
 
                         df_sources = pd.DataFrame(source_records)
                         df_sources.to_csv(pos_file, index=False)
-
+                        df_sources.to_csv(step4_pos, index=False)
                     if peak_positions:
                         peak_file = self.cache_dir / f"detect_peak_{filename}.csv"
+                        step4_peak = step4_out / f"detect_peak_{filename}.csv"
                         np.savetxt(peak_file, peak_positions, delimiter=',',
+                                  header='x,y', comments='')
+                        np.savetxt(step4_peak, peak_positions, delimiter=',',
                                   header='x,y', comments='')
 
                     self.worker_status.emit(worker_id, short_name, "Done", 100)
@@ -759,11 +907,809 @@ class DetectionWorker(QThread):
             self.finished.emit(summary)
 
         except Exception as e:
+            print(f"[DetectionWorker] FATAL ERROR: {e}")
             import traceback
-            error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-            print(f"[DetectionWorker] FATAL ERROR: {error_msg}")
-            self.error.emit("WORKER", error_msg)
+            traceback.print_exc()
+            self.error.emit("WORKER", str(e))
             self.finished.emit({})
+
+
+class QCInspectionPanel(QWidget):
+    """QC inspection panel for per-frame quality checks."""
+    ALL_FILTER_LABEL = "All"
+
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.params = parent_window.params
+        self.file_manager = parent_window.file_manager
+        self.file_list = []
+        self.frame_df = pd.DataFrame()
+        self.exclude_reasons = {}
+        self.pending_candidates = {}
+        self._header_cache = {}
+        self._scatter_map = {}
+        self._pending_state = None
+        self.current_filter = None
+        self._selected_fname = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        # Left: controls
+        control_box = QGroupBox("QC Controls")
+        control_layout = QVBoxLayout(control_box)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(self.filter_combo)
+        control_layout.addLayout(filter_row)
+
+        xmode_row = QHBoxLayout()
+        xmode_row.addWidget(QLabel("X axis:"))
+        self.xmode_combo = QComboBox()
+        self.xmode_combo.addItems(["Auto", "Airmass", "Time", "Index"])
+        self.xmode_combo.currentIndexChanged.connect(self.update_plots)
+        xmode_row.addWidget(self.xmode_combo)
+        control_layout.addLayout(xmode_row)
+
+        z_group = QGroupBox("Auto QC (robust z)")
+        z_layout = QFormLayout(z_group)
+        self.sky_z_spin = QDoubleSpinBox()
+        self.sky_z_spin.setRange(1.0, 10.0)
+        self.sky_z_spin.setSingleStep(0.5)
+        self.sky_z_spin.setValue(4.0)
+        z_layout.addRow("Sky z (high):", self.sky_z_spin)
+
+        self.fwhm_z_spin = QDoubleSpinBox()
+        self.fwhm_z_spin.setRange(1.0, 10.0)
+        self.fwhm_z_spin.setSingleStep(0.5)
+        self.fwhm_z_spin.setValue(4.0)
+        z_layout.addRow("FWHM z (high):", self.fwhm_z_spin)
+
+        self.nsrc_z_spin = QDoubleSpinBox()
+        self.nsrc_z_spin.setRange(1.0, 10.0)
+        self.nsrc_z_spin.setSingleStep(0.5)
+        self.nsrc_z_spin.setValue(4.0)
+        z_layout.addRow("Nsrc z (low):", self.nsrc_z_spin)
+
+        control_layout.addWidget(z_group)
+
+        btn_row = QHBoxLayout()
+        self.btn_find = QPushButton("Find Outliers")
+        self.btn_find.clicked.connect(self.find_outliers)
+        btn_row.addWidget(self.btn_find)
+        self.btn_apply = QPushButton("Exclude Candidates")
+        self.btn_apply.clicked.connect(self.apply_candidates)
+        btn_row.addWidget(self.btn_apply)
+        control_layout.addLayout(btn_row)
+
+        btn_row2 = QHBoxLayout()
+        self.btn_reset = QPushButton("Clear Exclusions")
+        self.btn_reset.clicked.connect(self.reset_filter_exclusions)
+        btn_row2.addWidget(self.btn_reset)
+        self.btn_save = QPushButton("Save")
+        self.btn_save.clicked.connect(self.save_frame_quality)
+        btn_row2.addWidget(self.btn_save)
+        control_layout.addLayout(btn_row2)
+
+        self.warning_label = QLabel("")
+        self.warning_label.setStyleSheet("QLabel { color: #D32F2F; }")
+        self.warning_label.setWordWrap(True)
+        control_layout.addWidget(self.warning_label)
+
+        self.hotkey_label = QLabel("Click a point to select. D = exclude, A = include (undo)")
+        self.hotkey_label.setStyleSheet("QLabel { color: #455A64; }")
+        self.hotkey_label.setWordWrap(True)
+        control_layout.addWidget(self.hotkey_label)
+
+        info_group = QGroupBox("Selected Frame")
+        info_layout = QVBoxLayout(info_group)
+        self.selected_label = QLabel("Click a point to inspect frame details.")
+        self.selected_label.setWordWrap(True)
+        info_layout.addWidget(self.selected_label)
+        self.btn_open_frame = QPushButton("Open in Detection Tab")
+        self.btn_open_frame.clicked.connect(self._open_selected_frame)
+        info_layout.addWidget(self.btn_open_frame)
+        control_layout.addWidget(info_group)
+
+        cand_group = QGroupBox("Outlier Candidates")
+        cand_layout = QVBoxLayout(cand_group)
+        self.cand_table = QTableWidget()
+        self.cand_table.setColumnCount(5)
+        self.cand_table.setHorizontalHeaderLabels(["File", "Sky z", "FWHM z", "Nsrc z", "Reasons"])
+        self.cand_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.cand_table.horizontalHeader().setStretchLastSection(True)
+        self.cand_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.cand_table.setMinimumHeight(160)
+        self.cand_table.cellClicked.connect(self._on_candidate_clicked)
+        cand_layout.addWidget(self.cand_table)
+        control_layout.addWidget(cand_group)
+
+        summary_group = QGroupBox("QC Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        self.summary_text.setStyleSheet("QTextEdit { font-family: monospace; font-size: 9pt; }")
+        summary_layout.addWidget(self.summary_text)
+        control_layout.addWidget(summary_group)
+
+        layout.addWidget(control_box)
+
+        # Right: plots
+        plot_box = QGroupBox("Inspection Plots")
+        plot_layout = QVBoxLayout(plot_box)
+        self.plot_status = QLabel("No data loaded.")
+        plot_layout.addWidget(self.plot_status)
+        self.fig = Figure(figsize=(6, 6))
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setFocusPolicy(Qt.StrongFocus)
+        self.ax_sky = self.fig.add_subplot(2, 1, 1)
+        self.ax_fwhm = self.fig.add_subplot(2, 1, 2)
+        self.canvas.mpl_connect("pick_event", self._on_pick)
+        self.canvas.mpl_connect("key_press_event", self._on_keypress)
+        plot_layout.addWidget(self.canvas)
+        layout.addWidget(plot_box, stretch=1)
+
+    def _safe_float(self, value, default=np.nan):
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _resolve_fits_path(self, fname: str, use_cropped: bool) -> Optional[Path]:
+        if use_cropped:
+            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+            cand = cropped_dir / fname
+            if cand.exists():
+                return cand
+        try:
+            return Path(self.params.get_file_path(fname))
+        except Exception:
+            return None
+
+    def _parse_time_value(self, header: fits.Header) -> tuple[float, str]:
+        for key in ("JD", "JULIAN", "BJD", "HJD", "MJD-OBS", "MJD"):
+            if key in header:
+                val = self._safe_float(header.get(key), np.nan)
+                if np.isfinite(val):
+                    return float(val), key
+        date_obs = header.get("DATE-OBS") or header.get("DATE")
+        time_obs = header.get("TIME-OBS") or header.get("UTC") or header.get("UT")
+        if date_obs:
+            dt_str = str(date_obs).strip()
+            if "T" not in dt_str and time_obs:
+                dt_str = f"{dt_str}T{str(time_obs).strip()}"
+            try:
+                t = Time(dt_str, format="isot", scale="utc")
+                return float(t.jd), "JD"
+            except Exception:
+                pass
+            try:
+                t = Time(dt_str, scale="utc")
+                return float(t.jd), "JD"
+            except Exception:
+                pass
+        return np.nan, "index"
+
+    def _load_header_meta(self, fname: str, use_cropped: bool) -> dict:
+        if fname in self._header_cache:
+            return self._header_cache[fname]
+        meta = {"airmass": np.nan, "time_val": np.nan, "time_src": "index"}
+        path = self._resolve_fits_path(fname, use_cropped)
+        if path and path.exists():
+            try:
+                with fits.open(path) as hdul:
+                    h = hdul[0].header
+                meta["airmass"] = self._safe_float(h.get("AIRMASS"), np.nan)
+                tval, tsrc = self._parse_time_value(h)
+                meta["time_val"] = tval
+                meta["time_src"] = tsrc
+            except Exception:
+                pass
+        self._header_cache[fname] = meta
+        return meta
+
+    def _load_detect_meta(self, fname: str) -> dict:
+        if hasattr(self.parent_window, "_pick_detection_cache"):
+            try:
+                payload, _, _, _ = self.parent_window._pick_detection_cache(fname, previous=False)
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                pass
+        cache_dir = self.params.P.cache_dir
+        step4_out = step4_dir(self.params.P.result_dir)
+        cache_file = cache_dir / f"detect_{fname}.json"
+        if not cache_file.exists():
+            alt = step4_out / f"detect_{fname}.json"
+            if alt.exists():
+                cache_file = alt
+        if not cache_file.exists():
+            return {}
+        try:
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def load_frames(self, detection_results: dict, file_list: list, use_cropped: bool) -> None:
+        self.exclude_reasons = {}
+        self.pending_candidates = {}
+        rows = []
+        self.file_list = list(file_list)
+        for idx, fname in enumerate(self.file_list):
+            meta = detection_results.get(fname)
+            if meta is None:
+                meta = self._load_detect_meta(fname)
+            if not meta:
+                continue
+            hmeta = self._load_header_meta(fname, use_cropped)
+            rows.append({
+                "file": fname,
+                "filter": str(meta.get("filter", "") or "").strip(),
+                "time_index": idx,
+                "time_val": hmeta.get("time_val", np.nan),
+                "time_src": hmeta.get("time_src", "index"),
+                "airmass": hmeta.get("airmass", np.nan),
+                "sky_med": self._safe_float(meta.get("bkg_median"), np.nan),
+                "sky_sigma": self._safe_float(meta.get("bkg_rms"), np.nan),
+                "fwhm_med": self._safe_float(meta.get("fwhm_px"), np.nan),
+                "n_sources": int(meta.get("n_sources", 0) or 0),
+                "elong_med": self._safe_float(meta.get("median_elongation"), np.nan),
+                "round_med": self._safe_float(meta.get("median_roundness"), np.nan),
+            })
+
+        self.frame_df = pd.DataFrame(rows)
+        self._refresh_filter_list()
+        self._apply_exclusions_from_file()
+        self._apply_pending_state()
+        self.update_plots()
+        self.update_summary()
+
+
+    def _refresh_filter_list(self):
+        self.filter_combo.blockSignals(True)
+        self.filter_combo.clear()
+        filters = sorted(self.frame_df.get("filter", pd.Series([""])).fillna("").astype(str).unique().tolist())
+        if not filters:
+            filters = [""]
+        self.filter_combo.addItem(self.ALL_FILTER_LABEL)
+        for f in filters:
+            if not f:
+                continue
+            self.filter_combo.addItem(f)
+        self.filter_combo.setCurrentIndex(0)
+        self.filter_combo.blockSignals(False)
+        self.current_filter = None
+
+    def _on_filter_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        selected = self.filter_combo.currentText()
+        if selected == self.ALL_FILTER_LABEL:
+            self.current_filter = None
+        else:
+            self.current_filter = selected
+        self.pending_candidates = {}
+        self.cand_table.setRowCount(0)
+        self.warning_label.setText("")
+        self.update_plots()
+        self.update_summary()
+
+    def _toggle_exclusion(self, fname: str) -> None:
+        reasons = set(self.exclude_reasons.get(fname, set()))
+        if reasons:
+            self.exclude_reasons[fname] = set()
+        else:
+            self.exclude_reasons[fname] = {"manual"}
+        self.update_plots()
+        self.update_summary()
+
+    def _on_pick(self, event):
+        artist = event.artist
+        if artist not in self._scatter_map:
+            return
+        indices = getattr(event, "ind", None)
+        if indices is None or len(indices) == 0:
+            return
+        fname = self._scatter_map[artist][int(indices[0])]
+        self._show_frame_info(fname)
+        self.update_plots()
+        self.setFocus()
+        self.canvas.setFocus()
+
+    def _on_keypress(self, event) -> None:
+        key = (getattr(event, "key", "") or "").lower()
+        if key not in ("a", "d"):
+            return
+        fname = getattr(self, "_selected_fname", None)
+        if not fname:
+            return
+        # D = exclude (제외), A = include (되돌리기)
+        if key == "d":
+            self.exclude_reasons[fname] = {"manual"}
+            self.warning_label.setText(f"Excluded: {fname}")
+        else:  # key == "a"
+            self.exclude_reasons[fname] = set()
+            self.warning_label.setText(f"Included: {fname}")
+        self.update_plots()
+        self.update_summary()
+
+    def _show_frame_info(self, fname: str) -> None:
+        if self.frame_df.empty:
+            return
+        row = self.frame_df[self.frame_df["file"] == fname]
+        if row.empty:
+            return
+        r = row.iloc[0]
+        self.selected_label.setText(
+            f"{fname}\n"
+            f"filter={r.get('filter','')}, airmass={r.get('airmass', np.nan):.3f}\n"
+            f"sky={r.get('sky_med', np.nan):.2f}, fwhm={r.get('fwhm_med', np.nan):.2f}, "
+            f"n_sources={int(r.get('n_sources', 0))}"
+        )
+        self.selected_label.repaint()
+        self._selected_fname = fname
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_A:
+            self._on_keypress(type("evt", (), {"key": "a"})())
+            return
+        if event.key() == Qt.Key_D:
+            self._on_keypress(type("evt", (), {"key": "d"})())
+            return
+        super().keyPressEvent(event)
+
+    def _open_selected_frame(self):
+        fname = getattr(self, "_selected_fname", None)
+        if not fname:
+            return
+        if hasattr(self.parent_window, "show_frame_in_detection_tab"):
+            self.parent_window.show_frame_in_detection_tab(fname)
+
+    def _robust_z(self, values: np.ndarray) -> np.ndarray:
+        med = np.nanmedian(values)
+        mad = np.nanmedian(np.abs(values - med))
+        if not np.isfinite(mad) or mad == 0:
+            return np.zeros_like(values, dtype=float)
+        return 0.6745 * (values - med) / mad
+
+    def _subset_df(self) -> pd.DataFrame:
+        if self.frame_df.empty:
+            return self.frame_df
+        if self.current_filter:
+            return self.frame_df[self.frame_df["filter"] == self.current_filter].copy()
+        return self.frame_df.copy()
+
+    def find_outliers(self):
+        self.pending_candidates = {}
+        self.cand_table.setRowCount(0)
+        df = self._subset_df()
+        if df.empty:
+            return
+        self.warning_label.setText("")
+        sky_th = float(self.sky_z_spin.value())
+        fwhm_th = float(self.fwhm_z_spin.value())
+        nsrc_th = float(self.nsrc_z_spin.value())
+
+        def _accumulate(df_in: pd.DataFrame) -> None:
+            sky = df_in["sky_med"].to_numpy(float)
+            fwhm = df_in["fwhm_med"].to_numpy(float)
+            nsrc = df_in["n_sources"].to_numpy(float)
+            z_sky = self._robust_z(sky)
+            z_fwhm = self._robust_z(fwhm)
+            z_nsrc = self._robust_z(nsrc)
+            for idx, row in enumerate(df_in.itertuples(index=False)):
+                reasons = []
+                if np.isfinite(z_sky[idx]) and z_sky[idx] > sky_th:
+                    reasons.append("sky_outlier")
+                if np.isfinite(z_fwhm[idx]) and z_fwhm[idx] > fwhm_th:
+                    reasons.append("fwhm_outlier")
+                if np.isfinite(z_nsrc[idx]) and z_nsrc[idx] < -nsrc_th:
+                    reasons.append("low_nsrc")
+                if reasons:
+                    fname = row.file
+                    self.pending_candidates[fname] = {
+                        "sky_z": z_sky[idx],
+                        "fwhm_z": z_fwhm[idx],
+                        "nsrc_z": z_nsrc[idx],
+                        "reasons": reasons,
+                    }
+
+        if self.current_filter:
+            if len(df) < 10:
+                self.warning_label.setText("Too few frames for auto QC (need >=10).")
+                return
+            _accumulate(df)
+        else:
+            warn_filters = []
+            for filt, grp in df.groupby("filter"):
+                if len(grp) < 10:
+                    warn_filters.append(filt or "(none)")
+                    continue
+                _accumulate(grp)
+            if warn_filters:
+                self.warning_label.setText(
+                    "Auto QC skipped (too few frames): " + ", ".join(warn_filters)
+                )
+
+        for fname, info in self.pending_candidates.items():
+            row_idx = self.cand_table.rowCount()
+            self.cand_table.insertRow(row_idx)
+            self.cand_table.setItem(row_idx, 0, QTableWidgetItem(str(fname)))
+            self.cand_table.setItem(row_idx, 1, QTableWidgetItem(f"{info['sky_z']:.2f}"))
+            self.cand_table.setItem(row_idx, 2, QTableWidgetItem(f"{info['fwhm_z']:.2f}"))
+            self.cand_table.setItem(row_idx, 3, QTableWidgetItem(f"{info['nsrc_z']:.2f}"))
+            self.cand_table.setItem(row_idx, 4, QTableWidgetItem(",".join(info["reasons"])))
+
+        if not self.pending_candidates:
+            self.warning_label.setText("No outlier candidates found.")
+        else:
+            first_candidate = next(iter(self.pending_candidates.keys()))
+            self._show_frame_info(first_candidate)
+        self.update_plots()
+
+    def apply_candidates(self):
+        if not self.pending_candidates:
+            return
+        for fname, info in self.pending_candidates.items():
+            self.exclude_reasons.setdefault(fname, set()).update(info.get("reasons", []))
+        self.pending_candidates = {}
+        self.cand_table.setRowCount(0)
+        self.update_plots()
+        self.update_summary()
+
+    def _on_candidate_clicked(self, row: int, col: int) -> None:
+        if row < 0:
+            return
+        item = self.cand_table.item(row, 0)
+        if not item:
+            return
+        fname = item.text().strip()
+        if not fname:
+            return
+        self._show_frame_info(fname)
+        self._ensure_visible_x(fname)
+        self.update_plots()
+
+    def reset_filter_exclusions(self):
+        df = self._subset_df()
+        for fname in df["file"].tolist():
+            self.exclude_reasons[fname] = set()
+        self.update_plots()
+        self.update_summary()
+
+    def _apply_exclusions_from_file(self):
+        fq_path = step5_dir(self.params.P.result_dir) / "frame_quality.csv"
+        if not fq_path.exists():
+            fq_path = legacy_step7_wcs_dir(self.params.P.result_dir) / "frame_quality.csv"
+        if not fq_path.exists():
+            return
+        try:
+            dfq = pd.read_csv(fq_path)
+        except Exception:
+            return
+        if "file" not in dfq.columns:
+            return
+        for _, row in dfq.iterrows():
+            fname = str(row.get("file", ""))
+            passed = bool(row.get("passed", True))
+            if not fname:
+                continue
+            if passed:
+                self.exclude_reasons[fname] = set()
+                continue
+            reasons = set()
+            reason_str = row.get("exclude_reason", "")
+            if isinstance(reason_str, str) and reason_str.strip():
+                reasons.update([r.strip() for r in reason_str.split(",") if r.strip()])
+            if not reasons:
+                reasons.add("manual")
+            self.exclude_reasons[fname] = reasons
+
+    def _apply_pending_state(self):
+        if not self._pending_state:
+            return
+        state = self._pending_state
+        self._pending_state = None
+        self.exclude_reasons = {
+            str(k): set(v) for k, v in (state.get("exclude_reasons", {}) or {}).items()
+        }
+        if "qc_filter" in state and state["qc_filter"]:
+            filt = state["qc_filter"]
+            idx = self.filter_combo.findText(filt)
+            if idx >= 0:
+                self.filter_combo.setCurrentIndex(idx)
+        if "sky_z" in state:
+            self.sky_z_spin.setValue(float(state["sky_z"]))
+        if "fwhm_z" in state:
+            self.fwhm_z_spin.setValue(float(state["fwhm_z"]))
+        if "nsrc_z" in state:
+            self.nsrc_z_spin.setValue(float(state["nsrc_z"]))
+        if "x_mode" in state:
+            idx = self.xmode_combo.findText(state["x_mode"])
+            if idx >= 0:
+                self.xmode_combo.setCurrentIndex(idx)
+
+    def export_state(self) -> dict:
+        return {
+            "exclude_reasons": {k: sorted(list(v)) for k, v in self.exclude_reasons.items()},
+            "qc_filter": self.current_filter,
+            "sky_z": self.sky_z_spin.value(),
+            "fwhm_z": self.fwhm_z_spin.value(),
+            "nsrc_z": self.nsrc_z_spin.value(),
+            "x_mode": self.xmode_combo.currentText(),
+        }
+
+    def restore_state(self, state: Optional[dict]) -> None:
+        if not state:
+            return
+        if self.frame_df.empty:
+            self._pending_state = state
+        else:
+            self._pending_state = state
+            self._apply_pending_state()
+            self.update_plots()
+            self.update_summary()
+
+    def _build_quality_df(self) -> pd.DataFrame:
+        if self.frame_df.empty:
+            return pd.DataFrame()
+        df = self.frame_df.copy()
+        reasons = []
+        passed = []
+        for fname in df["file"].tolist():
+            r = self.exclude_reasons.get(fname, set())
+            reasons.append(",".join(sorted(r)) if r else "")
+            passed.append(len(r) == 0)
+        df["exclude_reason"] = reasons
+        df["passed"] = passed
+        return df
+
+    def save_frame_quality(self):
+        df = self._build_quality_df()
+        if df.empty:
+            return
+        out_dir = step5_dir(self.params.P.result_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gain = self._safe_float(getattr(self.params.P, "gain_e_per_adu", np.nan), np.nan)
+        if np.isfinite(gain):
+            df["sky_sigma_med_e"] = df["sky_sigma"] * gain
+        df.rename(columns={
+            "sky_sigma": "sky_sigma_med_adu",
+        }, inplace=True)
+        df.to_csv(out_dir / "frame_quality.csv", index=False)
+        self._apply_pipeline_flags()
+        self.warning_label.setText("QC saved and applied.")
+        self.update_summary()
+
+    def apply_to_pipeline(self):
+        self._apply_pipeline_flags()
+
+    def _apply_pipeline_flags(self):
+        self.params.P.wcs_require_qc_pass = True
+        self.params.P.phot_use_qc_pass_only = True
+        if hasattr(self.params.P, "idmatch_use_qc_pass_only"):
+            self.params.P.idmatch_use_qc_pass_only = True
+        if hasattr(self.parent_window, "persist_params"):
+            self.parent_window.persist_params()
+        if hasattr(self.parent_window, "save_state"):
+            self.parent_window.save_state()
+
+    def update_plots(self):
+        if self.frame_df.empty:
+            self.plot_status.setText("No data loaded.")
+            self.fig.clear()
+            self.ax_sky = self.fig.add_subplot(2, 1, 1)
+            self.ax_fwhm = self.fig.add_subplot(2, 1, 2)
+            self.canvas.draw_idle()
+            return
+        df = self._subset_df()
+        if df.empty:
+            return
+        x_mode = self.xmode_combo.currentText()
+        if x_mode == "Airmass":
+            x_vals = df["airmass"].to_numpy(float)
+            x_label = "Airmass"
+        elif x_mode == "Time":
+            x_vals = df["time_val"].to_numpy(float)
+            x_label = "Time"
+        elif x_mode == "Index":
+            x_vals = df["time_index"].to_numpy(float)
+            x_label = "Index"
+        else:
+            airmass = df["airmass"].to_numpy(float)
+            time_vals = df["time_val"].to_numpy(float)
+            n_air = int(np.isfinite(airmass).sum())
+            n_time = int(np.isfinite(time_vals).sum())
+            if n_air == 0 and n_time == 0:
+                x_vals = df["time_index"].to_numpy(float)
+                x_label = "Index"
+            elif n_air >= n_time:
+                x_vals = airmass
+                x_label = "Airmass"
+            else:
+                x_vals = time_vals
+                x_label = "Time"
+
+        excluded = np.array([len(self.exclude_reasons.get(f, set())) > 0 for f in df["file"].tolist()])
+        pending = np.array([f in self.pending_candidates for f in df["file"].tolist()])
+        included = ~(excluded | pending)
+
+        self.fig.clear()
+        self.ax_sky = self.fig.add_subplot(2, 1, 1)
+        self.ax_fwhm = self.fig.add_subplot(2, 1, 2)
+        self._scatter_map = {}
+
+        def _scatter(ax, x, y, mask, color, marker, label, size=28, alpha=0.8, edge=None):
+            finite = mask & np.isfinite(x) & np.isfinite(y)
+            xs = x[finite]
+            ys = y[finite]
+            if len(xs) == 0:
+                return None
+            sc = ax.scatter(
+                xs, ys, s=size, color=color, marker=marker, alpha=alpha, picker=5,
+                label=label, edgecolors=edge
+            )
+            files = [f for f, m in zip(df["file"].tolist(), finite) if m]
+            self._scatter_map[sc] = files
+            return sc
+
+        finite_x = np.isfinite(x_vals)
+        finite_sky = np.isfinite(df["sky_med"].to_numpy(float))
+        finite_fwhm = np.isfinite(df["fwhm_med"].to_numpy(float))
+        hidden_sky = int(np.sum(pending & ~(finite_x & finite_sky)))
+        hidden_fwhm = int(np.sum(pending & ~(finite_x & finite_fwhm)))
+
+        sky_handles = []
+        sc = _scatter(self.ax_sky, x_vals, df["sky_med"].to_numpy(float), included,
+                      "#000000", "o", "included", size=22, alpha=0.9)
+        if sc:
+            sky_handles.append(sc)
+        sc = _scatter(self.ax_sky, x_vals, df["sky_med"].to_numpy(float), pending,
+                      "#E53935", "o", "outlier", size=58, alpha=0.9, edge="#212121")
+        if sc:
+            sky_handles.append(sc)
+        sc = _scatter(self.ax_sky, x_vals, df["sky_med"].to_numpy(float), excluded,
+                      "#9E9E9E", "x", "excluded", size=40, alpha=0.9)
+        if sc:
+            sky_handles.append(sc)
+        self.ax_sky.set_ylabel("sky_med")
+        self.ax_sky.set_xlabel(x_label)
+        self.ax_sky.grid(True, alpha=0.2)
+        if sky_handles:
+            self.ax_sky.legend(handles=sky_handles, loc="best", fontsize=8, frameon=False)
+
+        fwhm_handles = []
+        sc = _scatter(self.ax_fwhm, x_vals, df["fwhm_med"].to_numpy(float), included,
+                      "#000000", "o", "included", size=22, alpha=0.9)
+        if sc:
+            fwhm_handles.append(sc)
+        sc = _scatter(self.ax_fwhm, x_vals, df["fwhm_med"].to_numpy(float), pending,
+                      "#E53935", "o", "outlier", size=58, alpha=0.9, edge="#212121")
+        if sc:
+            fwhm_handles.append(sc)
+        sc = _scatter(self.ax_fwhm, x_vals, df["fwhm_med"].to_numpy(float), excluded,
+                      "#9E9E9E", "x", "excluded", size=40, alpha=0.9)
+        if sc:
+            fwhm_handles.append(sc)
+        self.ax_fwhm.set_ylabel("fwhm_med")
+        self.ax_fwhm.set_xlabel(x_label)
+        self.ax_fwhm.grid(True, alpha=0.2)
+        fwhm_vals = df["fwhm_med"].to_numpy(float)
+        fwhm_med = np.nanmedian(fwhm_vals)
+        fwhm_mad = np.nanmedian(np.abs(fwhm_vals - fwhm_med))
+        if np.isfinite(fwhm_med) and np.isfinite(fwhm_mad) and fwhm_mad > 0:
+            fwhm_cut = fwhm_med + (self.fwhm_z_spin.value() * fwhm_mad / 0.6745)
+            self.ax_fwhm.axhline(fwhm_cut, color="#E53935", linestyle="--", linewidth=1.2, alpha=0.8)
+        if fwhm_handles:
+            self.ax_fwhm.legend(handles=fwhm_handles, loc="best", fontsize=8, frameon=False)
+
+        sel = getattr(self, "_selected_fname", None)
+        if sel:
+            row = df[df["file"] == sel]
+            if not row.empty:
+                r = row.iloc[0]
+                x_sel = float(x_vals[df["file"].tolist().index(sel)])
+                self.ax_sky.scatter(x_sel, r["sky_med"], s=34, marker="o",
+                                    color="#1976D2", zorder=6)
+                self.ax_fwhm.scatter(x_sel, r["fwhm_med"], s=34, marker="o",
+                                     color="#1976D2", zorder=6)
+
+        n_total = len(df)
+        n_exc = int(excluded.sum())
+        rate = (n_exc / n_total * 100.0) if n_total else 0.0
+        filter_label = self.current_filter or "all"
+        hidden_note = ""
+        if hidden_sky or hidden_fwhm:
+            hidden_note = f" | hidden(outlier) sky={hidden_sky} fwhm={hidden_fwhm}"
+        self.plot_status.setText(
+            f"Filter={filter_label} | frames={n_total} | excluded={n_exc} ({rate:.1f}%) | "
+            f"outlier=red dot, excluded=gray x{hidden_note}"
+        )
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _ensure_visible_x(self, fname: str) -> None:
+        if self.frame_df.empty or not fname:
+            return
+        row = self.frame_df[self.frame_df["file"] == fname]
+        if row.empty:
+            return
+        r = row.iloc[0]
+        x_mode = self.xmode_combo.currentText()
+        airmass = self._safe_float(r.get("airmass"), np.nan)
+        time_val = self._safe_float(r.get("time_val"), np.nan)
+        if x_mode == "Airmass":
+            if not np.isfinite(airmass):
+                if np.isfinite(time_val):
+                    self.xmode_combo.setCurrentText("Time")
+                    self.warning_label.setText("X axis switched to Time (missing AIRMASS).")
+                else:
+                    self.xmode_combo.setCurrentText("Index")
+                    self.warning_label.setText("X axis switched to Index (missing AIRMASS/Time).")
+        elif x_mode == "Time":
+            if not np.isfinite(time_val):
+                if np.isfinite(airmass):
+                    self.xmode_combo.setCurrentText("Airmass")
+                    self.warning_label.setText("X axis switched to Airmass (missing Time).")
+                else:
+                    self.xmode_combo.setCurrentText("Index")
+                    self.warning_label.setText("X axis switched to Index (missing AIRMASS/Time).")
+        elif x_mode == "Auto":
+            if not (np.isfinite(airmass) or np.isfinite(time_val)):
+                self.xmode_combo.setCurrentText("Index")
+                self.warning_label.setText("X axis switched to Index (missing AIRMASS/Time).")
+
+    def update_summary(self):
+        df = self._subset_df()
+        if df.empty:
+            self.summary_text.setText("No data.")
+            return
+        reasons_count = {"sky_outlier": 0, "fwhm_outlier": 0, "low_nsrc": 0, "manual": 0}
+        excluded_files = []
+        for fname in df["file"].tolist():
+            r = self.exclude_reasons.get(fname, set())
+            if r:
+                excluded_files.append(fname)
+            for key in reasons_count:
+                if key in r:
+                    reasons_count[key] += 1
+        n_total = len(df)
+        n_exc = len(excluded_files)
+        rate = (n_exc / n_total * 100.0) if n_total else 0.0
+
+        sky_top = df.sort_values("sky_med", ascending=False).head(10)
+        fwhm_top = df.sort_values("fwhm_med", ascending=False).head(10)
+        nsrc_low = df.sort_values("n_sources", ascending=True).head(10)
+
+        lines = [
+            f"Excluded: {n_exc}/{n_total} ({rate:.1f}%)",
+            f"Reasons: sky={reasons_count['sky_outlier']} "
+            f"fwhm={reasons_count['fwhm_outlier']} "
+            f"nsrc={reasons_count['low_nsrc']} "
+            f"manual={reasons_count['manual']}",
+            "",
+            "Top sky_med:",
+        ]
+        for _, r in sky_top.iterrows():
+            lines.append(f"  {r['file']}  {r['sky_med']:.2f}")
+        lines.append("")
+        lines.append("Top fwhm_med:")
+        for _, r in fwhm_top.iterrows():
+            lines.append(f"  {r['file']}  {r['fwhm_med']:.2f}")
+        lines.append("")
+        lines.append("Low n_sources:")
+        for _, r in nsrc_low.iterrows():
+            lines.append(f"  {r['file']}  {int(r['n_sources'])}")
+
+        self.summary_text.setText("\n".join(lines))
 
 
 class SourceDetectionWindow(StepWindowBase):
@@ -807,6 +1753,21 @@ class SourceDetectionWindow(StepWindowBase):
         self.log_window = None
         self.worker_progress_bars = {}
         self.worker_last_status = {}
+        self._resume_cache_active = False
+
+        # Stretch plot window (2D Plot)
+        self.stretch_plot_dialog = None
+        self.stretch_plot_canvas = None
+        self.stretch_plot_ax = None
+        self.stretch_plot_fig = None
+        self.stretch_plot_info_label = None
+        self._stretch_vmin = None
+        self._stretch_vmax = None
+        self._stretch_data_range = None
+        self._stretch_dragging = False
+        self._stretch_drag_target = None
+        self._stretch_marker_min_line = None
+        self._stretch_marker_max_line = None
 
         # Initialize base class
         super().__init__(
@@ -855,8 +1816,6 @@ class SourceDetectionWindow(StepWindowBase):
         # Determine data directory
         if self.use_cropped:
             data_dir = step2_cropped_dir(self.params.P.result_dir)
-            if not data_dir.exists():
-                data_dir = self.params.P.result_dir / "cropped"
         else:
             data_dir = self.params.P.data_dir
 
@@ -865,7 +1824,10 @@ class SourceDetectionWindow(StepWindowBase):
 
         for filename in sample_files:
             try:
-                file_path = data_dir / filename
+                if self.use_cropped:
+                    file_path = step2_cropped_dir(self.params.P.result_dir) / filename
+                else:
+                    file_path = self.params.get_file_path(filename)
                 with fits.open(file_path) as hdul:
                     filt = hdul[0].header.get('FILTER', '').strip()
                     if filt:
@@ -875,8 +1837,128 @@ class SourceDetectionWindow(StepWindowBase):
 
         return sorted(filters_found)
 
+    @staticmethod
+    def _norm_path_key(path_value) -> str:
+        if path_value is None:
+            return ""
+        try:
+            s = str(path_value).strip().replace("\\", "/")
+        except Exception:
+            s = str(path_value).replace("\\", "/")
+        if len(s) >= 3 and s[1] == ":" and s[2] == "/" and s[0].isalpha():
+            s = f"/mnt/{s[0].lower()}/{s[3:]}"
+        while "//" in s:
+            s = s.replace("//", "/")
+        if len(s) > 1 and s.endswith("/"):
+            s = s[:-1]
+        return s.lower()
+
+    def _resolve_source_path_for_file(self, filename: str) -> Optional[Path]:
+        if self.use_cropped:
+            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+            cand = cropped_dir / filename
+            if cand.exists():
+                return cand
+            legacy_cropped = self.params.P.result_dir / "cropped"
+            cand = legacy_cropped / filename
+            if cand.exists():
+                return cand
+        try:
+            cand = Path(self.params.get_file_path(filename))
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+        return None
+
+    def _source_signature_for_file(self, filename: str) -> Optional[dict]:
+        src_path = self._resolve_source_path_for_file(filename)
+        if src_path is None or not src_path.exists():
+            return None
+        try:
+            st = src_path.stat()
+        except Exception:
+            return None
+        return {
+            "source_path": self._norm_path_key(src_path),
+            "source_use_cropped": bool(self.use_cropped),
+            "source_size": int(st.st_size),
+            "source_mtime_ns": int(st.st_mtime_ns),
+        }
+
+    def _is_detection_cache_compatible(self, filename: str, payload: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        sig = self._source_signature_for_file(filename)
+        if sig is None:
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return False
+        if bool(payload.get("source_use_cropped", None)) != bool(sig["source_use_cropped"]):
+            return False
+        if self._norm_path_key(payload.get("source_path")) != sig["source_path"]:
+            return False
+        try:
+            if int(payload.get("source_mtime_ns")) != int(sig["source_mtime_ns"]):
+                # Step5+ can update FITS headers in place, changing mtime only.
+                # For detection cache reuse, accept when path/crop/size still match.
+                try:
+                    saved_size = int(payload.get("source_size"))
+                    curr_size = int(sig["source_size"])
+                except Exception:
+                    return False
+                if saved_size <= 0 or curr_size <= 0:
+                    return False
+                if saved_size != curr_size:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def _pick_detection_cache(self, filename: str, previous: bool = False):
+        cache_dir = self.params.P.cache_dir
+        step4_out = step4_dir(self.params.P.result_dir)
+        if previous:
+            prefix = "detect_prev_"
+            peak_prefix = "detect_prev_peak_"
+            candidates = [cache_dir / f"{prefix}{filename}.json"]
+        else:
+            prefix = "detect_"
+            peak_prefix = "detect_peak_"
+            candidates = [cache_dir / f"{prefix}{filename}.json", step4_out / f"{prefix}{filename}.json"]
+            candidates = [p for p in candidates if p.exists()]
+            candidates.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
+        for meta_path in candidates:
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._is_detection_cache_compatible(filename, payload, meta_path):
+                continue
+            base_dir = meta_path.parent
+            pos_path = base_dir / f"{prefix}{filename}.csv"
+            peak_path = base_dir / f"{peak_prefix}{filename}.csv"
+            return payload, pos_path, peak_path, meta_path
+        return None, None, None, None
+
     def setup_step_ui(self):
         """Setup step-specific UI components"""
+
+        # Tabs
+        self.tabs = QTabWidget()
+        self.detect_tab = QWidget()
+        self.detect_layout = QVBoxLayout(self.detect_tab)
+        self.qc_tab = QWidget()
+        self.qc_layout = QVBoxLayout(self.qc_tab)
+        self.tabs.addTab(self.detect_tab, "Detection")
+        self.tabs.addTab(self.qc_tab, "QC")
+        self.content_layout.addWidget(self.tabs)
 
         # === Info Label ===
         info_label = QLabel(
@@ -884,7 +1966,7 @@ class SourceDetectionWindow(StepWindowBase):
             "Results are cached for subsequent steps. Mouse: Wheel to zoom | Right-click drag to pan"
         )
         info_label.setStyleSheet("QLabel { background-color: #E8F5E9; padding: 10px; border-radius: 5px; }")
-        self.content_layout.addWidget(info_label)
+        self.detect_layout.addWidget(info_label)
 
         # === Control Bar ===
         control_layout = QHBoxLayout()
@@ -893,6 +1975,16 @@ class SourceDetectionWindow(StepWindowBase):
         btn_params.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 8px 15px; }")
         btn_params.clicked.connect(self.open_parameters_dialog)
         control_layout.addWidget(btn_params)
+
+        btn_clear_cache = QPushButton("Clear Detection Cache")
+        btn_clear_cache.setStyleSheet("QPushButton { background-color: #455A64; color: white; font-weight: bold; padding: 8px 12px; }")
+        btn_clear_cache.clicked.connect(self.clear_detection_cache)
+        control_layout.addWidget(btn_clear_cache)
+
+        self.chk_resume_cache = QCheckBox("Resume from cache")
+        self.chk_resume_cache.setChecked(True)
+        self.chk_resume_cache.setToolTip("Skip files that already have detect_*.json in cache")
+        control_layout.addWidget(self.chk_resume_cache)
 
         control_layout.addStretch()
 
@@ -918,7 +2010,7 @@ class SourceDetectionWindow(StepWindowBase):
         btn_log.clicked.connect(self.show_log_window)
         control_layout.addWidget(btn_log)
 
-        self.content_layout.addLayout(control_layout)
+        self.detect_layout.addLayout(control_layout)
 
         # === Progress Bar ===
         progress_layout = QHBoxLayout()
@@ -932,7 +2024,7 @@ class SourceDetectionWindow(StepWindowBase):
         self.progress_label.setMinimumWidth(350)
         progress_layout.addWidget(self.progress_label)
 
-        self.content_layout.addLayout(progress_layout)
+        self.detect_layout.addLayout(progress_layout)
 
         # === Main Splitter ===
         main_splitter = QSplitter(Qt.Horizontal)
@@ -1010,6 +2102,11 @@ class SourceDetectionWindow(StepWindowBase):
         btn_reset_zoom.clicked.connect(self.reset_zoom)
         stretch_layout.addWidget(btn_reset_zoom)
 
+        btn_2d_plot = QPushButton("2D Plot")
+        btn_2d_plot.setStyleSheet("QPushButton { background-color: #FF9800; color: white; font-weight: bold; }")
+        btn_2d_plot.clicked.connect(self.open_stretch_plot)
+        stretch_layout.addWidget(btn_2d_plot)
+
         stretch_layout.addStretch()
         viewer_layout.addLayout(stretch_layout)
 
@@ -1042,8 +2139,10 @@ class SourceDetectionWindow(StepWindowBase):
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(6)
         self.results_table.setHorizontalHeaderLabels(['File', 'Sources', 'FWHM', 'Bkg', 'Filter', 'Sigma'])
-        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.results_table.cellClicked.connect(self.on_table_cell_clicked)
         results_layout.addWidget(self.results_table)
 
@@ -1073,9 +2172,12 @@ class SourceDetectionWindow(StepWindowBase):
         main_splitter.setStretchFactor(0, 2)
         main_splitter.setStretchFactor(1, 1)
 
-        self.content_layout.addWidget(main_splitter)
+        self.detect_layout.addWidget(main_splitter)
 
         self.setup_log_window()
+
+        self.qc_panel = QCInspectionPanel(self)
+        self.qc_layout.addWidget(self.qc_panel)
 
         # Populate file list
         self.populate_file_list()
@@ -1097,7 +2199,7 @@ class SourceDetectionWindow(StepWindowBase):
             if not self.file_manager.filenames:
                 try:
                     self.file_manager.scan_files()
-                except:
+                except Exception:
                     pass
             files = self.file_manager.filenames
             self.use_cropped = False
@@ -1108,31 +2210,47 @@ class SourceDetectionWindow(StepWindowBase):
         self.load_cached_results()
         self.load_previous_cached_results()
 
+    def _refresh_qc_panel(self):
+        if hasattr(self, "qc_panel") and self.qc_panel is not None:
+            self.qc_panel.load_frames(self.detection_results, self.file_list, self.use_cropped)
+
+    def show_frame_in_detection_tab(self, filename: str) -> None:
+        idx = self.file_combo.findText(filename)
+        if idx >= 0:
+            self.file_combo.setCurrentIndex(idx)
+            self.load_and_display()
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(0)
+
     def load_cached_results(self):
         """Load cached detection results from disk"""
         cache_dir = self.params.P.cache_dir
-        if not cache_dir.exists():
+        step4_out = step4_dir(self.params.P.result_dir)
+        if not cache_dir.exists() and not step4_out.exists():
             return
 
         results = {}
+        skipped_incompatible = 0
         for filename in self.file_list:
-            cache_file = cache_dir / f"detect_{filename}.json"
-            pos_file = cache_dir / f"detect_{filename}.csv"
-            peak_file = cache_dir / f"detect_peak_{filename}.csv"
-            if not cache_file.exists():
+            data, pos_file, peak_file, cache_file = self._pick_detection_cache(filename, previous=False)
+            if data is None:
+                # meta exists but all incompatible/legacy -> count for log
+                maybe_meta = [
+                    cache_dir / f"detect_{filename}.json",
+                    step4_out / f"detect_{filename}.json",
+                ]
+                if any(p.exists() for p in maybe_meta):
+                    skipped_incompatible += 1
                 continue
             try:
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
                 positions = []
                 peak_positions = []
-                if pos_file.exists():
+                if pos_file is not None and pos_file.exists():
                     try:
-                        # Use pandas to properly extract x,y columns from extended CSV
                         df_pos = pd.read_csv(pos_file)
                         if 'x' in df_pos.columns and 'y' in df_pos.columns:
                             positions = [(row['x'], row['y']) for _, row in df_pos.iterrows()]
                         else:
-                            # Fallback for old format (just x,y columns)
                             pos_data = np.loadtxt(pos_file, delimiter=',', skiprows=1)
                             if pos_data.ndim == 1:
                                 positions = [(pos_data[0], pos_data[1])]
@@ -1140,13 +2258,11 @@ class SourceDetectionWindow(StepWindowBase):
                                 positions = [(row[0], row[1]) for row in pos_data]
                     except Exception:
                         positions = []
-                if peak_file.exists():
+                if peak_file is not None and peak_file.exists():
                     try:
-                        peak_data = np.loadtxt(peak_file, delimiter=',', skiprows=1)
-                        if peak_data.ndim == 1:
-                            peak_positions = [(peak_data[0], peak_data[1])]
-                        else:
-                            peak_positions = [(row[0], row[1]) for row in peak_data]
+                        peak_positions = np.loadtxt(peak_file, delimiter=',', skiprows=1).tolist()
+                        if peak_positions and isinstance(peak_positions[0], float):
+                            peak_positions = [peak_positions]
                     except Exception:
                         peak_positions = []
 
@@ -1173,7 +2289,12 @@ class SourceDetectionWindow(StepWindowBase):
             self.update_summary_from_results()
             self.btn_undo.setEnabled(self.previous_detection_results is not None)
             self.log(f"Loaded cached results: {len(results)} files")
+            if skipped_incompatible > 0:
+                self.log(f"Skipped incompatible detection cache: {skipped_incompatible} files")
             self.update_navigation_buttons()
+            self._refresh_qc_panel()
+        elif skipped_incompatible > 0:
+            self.log(f"Ignored legacy/incompatible detection cache: {skipped_incompatible} files")
 
     def load_previous_cached_results(self):
         """Load previous detection results for undo"""
@@ -1182,24 +2303,22 @@ class SourceDetectionWindow(StepWindowBase):
             return
 
         results = {}
+        skipped_incompatible = 0
         for filename in self.file_list:
-            cache_file = cache_dir / f"detect_prev_{filename}.json"
-            pos_file = cache_dir / f"detect_prev_{filename}.csv"
-            peak_file = cache_dir / f"detect_prev_peak_{filename}.csv"
-            if not cache_file.exists():
+            data, pos_file, peak_file, cache_file = self._pick_detection_cache(filename, previous=True)
+            if data is None:
+                if (cache_dir / f"detect_prev_{filename}.json").exists():
+                    skipped_incompatible += 1
                 continue
             try:
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
                 positions = []
                 peak_positions = []
-                if pos_file.exists():
+                if pos_file is not None and pos_file.exists():
                     try:
-                        # Use pandas to properly extract x,y columns from extended CSV
                         df_pos = pd.read_csv(pos_file)
                         if 'x' in df_pos.columns and 'y' in df_pos.columns:
                             positions = [(row['x'], row['y']) for _, row in df_pos.iterrows()]
                         else:
-                            # Fallback for old format
                             pos_data = np.loadtxt(pos_file, delimiter=',', skiprows=1)
                             if pos_data.ndim == 1:
                                 positions = [(pos_data[0], pos_data[1])]
@@ -1207,13 +2326,11 @@ class SourceDetectionWindow(StepWindowBase):
                                 positions = [(row[0], row[1]) for row in pos_data]
                     except Exception:
                         positions = []
-                if peak_file.exists():
+                if peak_file is not None and peak_file.exists():
                     try:
-                        peak_data = np.loadtxt(peak_file, delimiter=',', skiprows=1)
-                        if peak_data.ndim == 1:
-                            peak_positions = [(peak_data[0], peak_data[1])]
-                        else:
-                            peak_positions = [(row[0], row[1]) for row in peak_data]
+                        peak_positions = np.loadtxt(peak_file, delimiter=',', skiprows=1).tolist()
+                        if peak_positions and isinstance(peak_positions[0], float):
+                            peak_positions = [peak_positions]
                     except Exception:
                         peak_positions = []
 
@@ -1238,6 +2355,8 @@ class SourceDetectionWindow(StepWindowBase):
             self.previous_detection_results = results
             self.btn_undo.setEnabled(True)
             self.log(f"Loaded previous cached results: {len(results)} files")
+        elif skipped_incompatible > 0:
+            self.log(f"Ignored incompatible previous cache: {skipped_incompatible} files")
 
     def backup_current_cache(self):
         """Backup current cache to previous cache for undo"""
@@ -1368,12 +2487,9 @@ class SourceDetectionWindow(StepWindowBase):
 
         try:
             if self.use_cropped:
-                cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-                if not cropped_dir.exists():
-                    cropped_dir = self.params.P.result_dir / "cropped"
-                file_path = cropped_dir / filename
+                file_path = step2_cropped_dir(self.params.P.result_dir) / filename
             else:
-                file_path = self.params.P.data_dir / filename
+                file_path = self.params.get_file_path(filename)
 
             with fits.open(file_path) as hdul:
                 self.image_data = hdul[0].data.astype(float)
@@ -1385,6 +2501,7 @@ class SourceDetectionWindow(StepWindowBase):
             self.xlim_original = None
             self.ylim_original = None
 
+            self.reset_stretch_plot_values()
             self.display_image(full_redraw=True)
             self.update_overlay()
 
@@ -1396,6 +2513,7 @@ class SourceDetectionWindow(StepWindowBase):
     def on_stretch_changed(self, index):
         """Handle stretch method change"""
         self._normalized_cache = None
+        self.reset_stretch_plot_values()
         self.display_image()
 
     def update_stretch_label(self, value):
@@ -1409,6 +2527,186 @@ class SourceDetectionWindow(StepWindowBase):
     def redisplay_image(self):
         """Redisplay with new scaling"""
         self.display_image()
+
+    def open_stretch_plot(self):
+        """Open stretch plot window showing histogram with draggable min/max markers"""
+        if self.image_data is None:
+            QMessageBox.warning(self, "Warning", "Load an image first")
+            return
+
+        if self.stretch_plot_dialog is not None and self.stretch_plot_dialog.isVisible():
+            self.stretch_plot_dialog.raise_()
+            self.stretch_plot_dialog.activateWindow()
+            self._update_stretch_plot()
+            return
+
+        self.stretch_plot_dialog = QDialog(self)
+        self.stretch_plot_dialog.setWindowTitle("2D Plot - Stretch Control")
+        self.stretch_plot_dialog.resize(500, 250)
+
+        layout = QVBoxLayout(self.stretch_plot_dialog)
+
+        self.stretch_plot_info_label = QLabel("Drag min/max markers to adjust stretch")
+        self.stretch_plot_info_label.setStyleSheet(
+            "QLabel { padding: 5px; background-color: #E3F2FD; border-radius: 3px; }"
+        )
+        layout.addWidget(self.stretch_plot_info_label)
+
+        self.stretch_plot_fig = Figure(figsize=(6, 2.5))
+        self.stretch_plot_canvas = FigureCanvas(self.stretch_plot_fig)
+        self.stretch_plot_ax = self.stretch_plot_fig.add_subplot(111)
+        self.stretch_plot_fig.subplots_adjust(left=0.1, right=0.95, bottom=0.15, top=0.9)
+
+        self.stretch_plot_canvas.mpl_connect('button_press_event', self._on_stretch_plot_press)
+        self.stretch_plot_canvas.mpl_connect('motion_notify_event', self._on_stretch_plot_motion)
+        self.stretch_plot_canvas.mpl_connect('button_release_event', self._on_stretch_plot_release)
+
+        layout.addWidget(self.stretch_plot_canvas)
+
+        hint_label = QLabel("Click and drag < > markers to adjust min/max | Changes apply in real-time")
+        hint_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        layout.addWidget(hint_label)
+
+        self.stretch_plot_dialog.show()
+        self._update_stretch_plot()
+
+    def _update_stretch_plot(self):
+        """Update the stretch plot histogram and markers"""
+        if self.stretch_plot_ax is None or self.image_data is None:
+            return
+
+        ax = self.stretch_plot_ax
+        ax.clear()
+
+        data = self.image_data.copy()
+        finite_mask = np.isfinite(data)
+        if not finite_mask.any():
+            return
+
+        flat = data[finite_mask].flatten()
+
+        p_low, p_high = np.percentile(flat, [1, 99])
+        display_data = flat[(flat >= p_low) & (flat <= p_high)]
+        if len(display_data) == 0:
+            display_data = flat
+
+        self._stretch_data_range = (float(p_low), float(p_high))
+
+        if self._stretch_vmin is None or self._stretch_vmax is None:
+            stretch_idx = self.scale_combo.currentIndex()
+            if stretch_idx == 6:
+                vmin = np.percentile(flat, 1)
+                vmax = np.percentile(flat, 99)
+            elif stretch_idx == 7:
+                vmin, vmax = self.calculate_zscale()
+            else:
+                _, median_val, std_val = sigma_clipped_stats(flat, sigma=3.0, maxiters=5)
+                vmin = max(np.min(flat), median_val - 2.8 * std_val)
+                vmax = min(np.max(flat), np.percentile(flat, 99.9))
+
+            if vmax <= vmin:
+                vmin = np.min(flat)
+                vmax = np.max(flat)
+
+            self._stretch_vmin = float(vmin)
+            self._stretch_vmax = float(vmax)
+
+        ax.hist(display_data, bins=128, color='#3a6ea5', edgecolor='none', alpha=0.7)
+        ax.set_xlim(p_low, p_high)
+
+        vmin = self._stretch_vmin
+        vmax = self._stretch_vmax
+
+        vmin_display = max(p_low, min(p_high, vmin))
+        vmax_display = max(p_low, min(p_high, vmax))
+
+        self._stretch_marker_min_line = ax.axvline(
+            vmin_display, color='#FF5722', linewidth=2, linestyle='-', label=f"Min: {vmin:.1f}"
+        )
+        self._stretch_marker_max_line = ax.axvline(
+            vmax_display, color='#4CAF50', linewidth=2, linestyle='-', label=f"Max: {vmax:.1f}"
+        )
+
+        y_max = ax.get_ylim()[1]
+        ax.text(vmin_display, y_max * 0.95, '<', color='#FF5722', fontsize=14,
+                ha='center', va='top', fontweight='bold')
+        ax.text(vmax_display, y_max * 0.95, '>', color='#4CAF50', fontsize=14,
+                ha='center', va='top', fontweight='bold')
+
+        ax.set_xlabel('Pixel Value')
+        ax.set_ylabel('Count')
+        ax.set_title('Image Histogram')
+        ax.legend(loc='upper right', fontsize=8)
+
+        if self.stretch_plot_info_label:
+            stretch_name = self.scale_combo.currentText()
+            self.stretch_plot_info_label.setText(
+                f"Stretch: {stretch_name} | Min: {vmin:.2f} | Max: {vmax:.2f}"
+            )
+
+        self.stretch_plot_canvas.draw_idle()
+
+    def _on_stretch_plot_press(self, event):
+        """Handle mouse press on stretch plot"""
+        if event.inaxes != self.stretch_plot_ax or event.xdata is None:
+            return
+        if self._stretch_vmin is None or self._stretch_vmax is None:
+            return
+
+        x = event.xdata
+        dist_to_min = abs(x - self._stretch_vmin)
+        dist_to_max = abs(x - self._stretch_vmax)
+        self._stretch_drag_target = "min" if dist_to_min < dist_to_max else "max"
+        self._stretch_dragging = True
+
+    def _on_stretch_plot_motion(self, event):
+        """Handle mouse motion on stretch plot (dragging)"""
+        if not self._stretch_dragging or event.xdata is None:
+            return
+
+        x = event.xdata
+        if self._stretch_drag_target == "min":
+            new_val = min(x, self._stretch_vmax - 1)
+            self._stretch_vmin = new_val
+        else:
+            new_val = max(x, self._stretch_vmin + 1)
+            self._stretch_vmax = new_val
+
+        self._update_stretch_plot()
+        self._apply_custom_stretch()
+
+    def _on_stretch_plot_release(self, event):
+        """Handle mouse release on stretch plot"""
+        self._stretch_dragging = False
+        self._stretch_drag_target = None
+
+    def _apply_custom_stretch(self):
+        """Apply custom vmin/vmax stretch to the image"""
+        if self.image_data is None:
+            return
+        if self._stretch_vmin is None or self._stretch_vmax is None:
+            return
+
+        vmin = self._stretch_vmin
+        vmax = self._stretch_vmax
+        if vmax <= vmin:
+            vmax = vmin + 1
+
+        data = self.image_data.copy()
+        normalized = (data - vmin) / (vmax - vmin + 1e-10)
+        normalized = np.clip(normalized, 0, 1)
+        stretched = self.apply_stretch(normalized)
+
+        if self._imshow_obj is not None:
+            self._imshow_obj.set_data(stretched)
+            self.canvas.draw_idle()
+
+    def reset_stretch_plot_values(self):
+        """Reset stretch plot values when changing image or stretch mode"""
+        self._stretch_vmin = None
+        self._stretch_vmax = None
+        if self.stretch_plot_dialog and self.stretch_plot_dialog.isVisible():
+            self._update_stretch_plot()
 
     def normalize_image(self):
         """Normalize image data to [0, 1] range"""
@@ -1619,7 +2917,7 @@ class SourceDetectionWindow(StepWindowBase):
 
     def on_button_press(self, event):
         """Handle mouse button press"""
-        if event.button == 3:  # Right click - pan
+        if event.button == 3:  # Right click
             self.panning = True
             self.pan_start = (event.xdata, event.ydata)
         elif event.button == 1 and event.inaxes == self.ax:  # Left click - select star
@@ -1632,7 +2930,6 @@ class SourceDetectionWindow(StepWindowBase):
         if not self.current_filename:
             return
 
-        # Load source data from CSV
         cache_dir = self.params.P.cache_dir
         pos_file = cache_dir / f"detect_{self.current_filename}.csv"
 
@@ -1646,22 +2943,16 @@ class SourceDetectionWindow(StepWindowBase):
                 self.star_info_label.setText("No sources in detection file")
                 return
 
-            # Find nearest source
-            distances = np.sqrt((df['x'] - click_x)**2 + (df['y'] - click_y)**2)
+            distances = np.sqrt((df['x'] - click_x) ** 2 + (df['y'] - click_y) ** 2)
             min_idx = distances.idxmin()
             min_dist = distances[min_idx]
 
-            # Check if click is close enough (within ~20 pixels)
             if min_dist > 20:
                 self.star_info_label.setText(f"No star found near click position\n(nearest is {min_dist:.1f} px away)")
                 return
 
-            # Get source info
             src = df.iloc[min_idx]
-
-            # Build info text
             det_id = int(src.get('id', min_idx + 1))
-            source_type = src.get('source_type', 'unknown')
             info_lines = [
                 f"{'═' * 32}",
                 f"  Detection #{det_id}",
@@ -1673,22 +2964,19 @@ class SourceDetectionWindow(StepWindowBase):
                 f"",
             ]
 
-            # FWHM with arcsec if available
             if 'fwhm_px' in src and pd.notna(src['fwhm_px']):
-                fwhm_px = src['fwhm_px']
+                fwhm_px = float(src['fwhm_px'])
                 pixscale = getattr(self.params.P, 'pixel_scale_arcsec', 0.4)
                 fwhm_arcsec = fwhm_px * pixscale
                 info_lines.append(f"FWHM: {fwhm_px:.2f} px ({fwhm_arcsec:.2f}\")")
             else:
-                info_lines.append(f"FWHM: (measurement failed)")
+                info_lines.append("FWHM: (measurement failed)")
 
-            # Peak ADU
             if 'peak_adu' in src and pd.notna(src['peak_adu']):
                 info_lines.append(f"Peak: {src['peak_adu']:.1f} ADU")
 
             info_lines.append("")
 
-            # DAO Statistics
             if 'sharpness' in src and pd.notna(src['sharpness']):
                 info_lines.append("DAO Statistics:")
                 info_lines.append(f"  Sharpness:  {src['sharpness']:.4f}")
@@ -1705,27 +2993,21 @@ class SourceDetectionWindow(StepWindowBase):
                 info_lines.append("  (DAO refine disabled or source")
                 info_lines.append("   added via peak-assist)")
 
-            # Source type
             if 'source_type' in src:
-                info_lines.append(f"")
+                info_lines.append("")
                 info_lines.append(f"Source Type: {src['source_type']}")
 
             self.star_info_label.setText("\n".join(info_lines))
-
-            # Highlight selected star on plot
             self.highlight_selected_star(src['x'], src['y'])
-
         except Exception as e:
             self.star_info_label.setText(f"Error reading source data:\n{str(e)}")
 
     def highlight_selected_star(self, x, y):
         """Highlight the selected star with a circle"""
-        # Remove previous highlight
         for artist in self.ax.patches[:]:
             if hasattr(artist, '_is_selection_highlight'):
                 artist.remove()
 
-        # Add new highlight circle
         from matplotlib.patches import Circle
         highlight = Circle((x, y), radius=15, fill=False, color='yellow', linewidth=2, linestyle='--')
         highlight._is_selection_highlight = True
@@ -1801,19 +3083,43 @@ class SourceDetectionWindow(StepWindowBase):
             return
 
         # Prepare
+        use_cache = bool(getattr(self, "chk_resume_cache", None) and self.chk_resume_cache.isChecked())
+        self._resume_cache_active = use_cache
+
+        if use_cache:
+            self.load_cached_results()
+            cached = set(self.detection_results.keys())
+            pending_files = [f for f in self.file_list if f not in cached]
+            if not pending_files:
+                self.update_summary_from_results(title="Detection Complete (cache)")
+                self.progress_label.setText("Done")
+                self.log("All frames already cached. Nothing to do.")
+                return
+        else:
+            pending_files = list(self.file_list)
+
         if self.detection_results:
             self.previous_detection_results = copy.deepcopy(self.detection_results)
             self.btn_undo.setEnabled(True)
         else:
             self.previous_detection_results = None
             self.btn_undo.setEnabled(False)
+
         self.backup_current_cache()
-        self.detection_results = {}
-        self.results_table.setRowCount(0)
+        if not use_cache:
+            self.detection_results = {}
+            self._refresh_qc_panel()
+            self.results_table.setRowCount(0)
+        else:
+            self.populate_results_table()
+            self._refresh_qc_panel()
+
         self.log_text.clear()
         self.clear_worker_status()
         self.stop_requested = False
-        self.log(f"Starting detection on {len(self.file_list)} files...")
+        if use_cache:
+            self.log(f"Starting detection (resume). Cached: {len(self.file_list) - len(pending_files)}, Pending: {len(pending_files)}")
+        self.log(f"Starting detection on {len(pending_files)} files...")
         self.log(f"Use cropped: {self.use_cropped}")
         self.log(f"Data dir: {self.params.P.data_dir}")
         self.log(f"Filter sigma map: {self.filter_sigma_map}")
@@ -1825,7 +3131,7 @@ class SourceDetectionWindow(StepWindowBase):
 
         # Create worker with filter sigma map
         self.detection_worker = DetectionWorker(
-            self.file_list,
+            pending_files,
             self.params,
             self.params.P.data_dir,
             cache_dir,
@@ -1845,8 +3151,8 @@ class SourceDetectionWindow(StepWindowBase):
         self.btn_stop.setEnabled(True)
         self.btn_stop.setText("Stop")
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(len(self.file_list))
-        self.progress_label.setText(f"0/{len(self.file_list)} | Starting...")
+        self.progress_bar.setMaximum(len(pending_files))
+        self.progress_label.setText(f"0/{len(pending_files)} | Starting...")
 
         # Start
         self.log("Starting worker thread...")
@@ -1933,6 +3239,8 @@ class SourceDetectionWindow(StepWindowBase):
         self.btn_stop.setEnabled(False)
         self.btn_stop.setText("Stop")
         self.stop_requested = False
+        resume_mode = self._resume_cache_active
+        self._resume_cache_active = False
         if self.detection_worker:
             self.detection_worker.wait(2000)
             self.detection_worker.deleteLater()
@@ -1947,7 +3255,7 @@ class SourceDetectionWindow(StepWindowBase):
             )
             self.log("Detection stopped by user")
             self.progress_label.setText("Stopped")
-        elif summary:
+        elif summary and not resume_mode:
             median_arc = float(summary.get("median_fwhm_arcsec", np.nan))
             median_px = float(summary.get("median_fwhm_px", np.nan))
             if np.isfinite(median_arc) and np.isfinite(median_px):
@@ -1970,11 +3278,16 @@ class SourceDetectionWindow(StepWindowBase):
 
             # Save state
             self.save_state()
+        elif summary and resume_mode:
+            self.update_summary_from_results(title="Detection Complete (cache+new)")
+            self.log(f"Detection complete (cache+new): {len(self.detection_results)} files")
+            self.save_state()
         else:
             self.summary_label.setText("Detection stopped or failed")
 
         if self.detection_results:
             self.update_navigation_buttons()
+            self._refresh_qc_panel()
 
         if not summary or not summary.get('stopped'):
             self.progress_label.setText("Done")
@@ -1983,15 +3296,8 @@ class SourceDetectionWindow(StepWindowBase):
         """Ensure worker thread is stopped before closing window"""
         if self.detection_worker and self.detection_worker.isRunning():
             self.stop_detection()
-            if not self.detection_worker.wait(10000):
-                QMessageBox.warning(
-                    self,
-                    "Background Task Running",
-                    "Detection worker is still stopping. Please wait a few seconds and close again.",
-                )
-                event.ignore()
-                return
-        super().closeEvent(event)
+            self.detection_worker.wait(5000)
+        event.accept()
 
     def populate_results_table(self):
         """Populate results table from detection_results"""
@@ -2010,7 +3316,7 @@ class SourceDetectionWindow(StepWindowBase):
             self.results_table.setItem(row, 4, QTableWidgetItem(result.get('filter', '')))
             self.results_table.setItem(row, 5, QTableWidgetItem(f"{float(result.get('sigma_used', 3.2)):.1f}"))
 
-    def update_summary_from_results(self):
+    def update_summary_from_results(self, title: str = "Detection Loaded"):
         """Update summary label from detection_results"""
         if not self.detection_results:
             self.summary_label.setText("No detection run yet")
@@ -2020,7 +3326,7 @@ class SourceDetectionWindow(StepWindowBase):
         fwhm_values = [r.get('fwhm_arcsec', 0.0) for r in self.detection_results.values() if r.get('fwhm_arcsec', 0.0) > 0]
         median_fwhm = float(np.median(fwhm_values)) if fwhm_values else 0.0
         self.summary_label.setText(
-            f"Detection Loaded\n"
+            f"{title}\n"
             f"{'─' * 30}\n"
             f"Files processed: {len(self.detection_results)}\n"
             f"Total sources: {total_sources}\n"
@@ -2044,6 +3350,7 @@ class SourceDetectionWindow(StepWindowBase):
             self.log("Restored previous detection results")
             self.save_state()
             self.update_navigation_buttons()
+            self._refresh_qc_panel()
         except Exception as e:
             self.log(f"ERROR undo: {e}")
 
@@ -2060,6 +3367,45 @@ class SourceDetectionWindow(StepWindowBase):
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
 
+    def clear_detection_cache(self):
+        cache_dir = self.params.P.cache_dir
+        if not cache_dir.exists():
+            self.log("Cache directory not found.")
+            return
+        step4_out = step4_dir(self.params.P.result_dir)
+        patterns = [
+            "detect_*.csv",
+            "detect_*.json",
+            "detect_peak_*.csv",
+            "detect_prev_peak_*.csv",
+            "detect_tmp_peak_*.csv",
+        ]
+        removed = 0
+        for pattern in patterns:
+            for path in cache_dir.glob(pattern):
+                try:
+                    path.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+            if step4_out.exists():
+                for path in step4_out.glob(pattern):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except Exception:
+                        pass
+        self.detection_results = {}
+        self.previous_detection_results = None
+        self.populate_results_table()
+        self.update_summary_from_results()
+        self.update_overlay()
+        self.btn_undo.setEnabled(False)
+        self.save_state()
+        self.update_navigation_buttons()
+        self._refresh_qc_panel()
+        self.log(f"Detection cache cleared: {removed} files removed.")
+
     def open_parameters_dialog(self):
         """Open detection parameters dialog"""
         dialog = QDialog(self)
@@ -2074,6 +3420,15 @@ class SourceDetectionWindow(StepWindowBase):
         layout.addWidget(info)
 
         form = QFormLayout()
+
+        # Detection engine
+        self.param_engine = QComboBox()
+        self.param_engine.addItems(["dao", "segm", "peak"])
+        current_engine = str(getattr(self.params.P, "detect_engine", "dao")).strip().lower()
+        idx = self.param_engine.findText(current_engine)
+        if idx >= 0:
+            self.param_engine.setCurrentIndex(idx)
+        form.addRow("Detection Engine:", self.param_engine)
 
         # Detection sigma (base)
         self.param_detect_sigma = QDoubleSpinBox()
@@ -2176,9 +3531,7 @@ class SourceDetectionWindow(StepWindowBase):
 
         # Background
         self.param_bkg2d = QCheckBox("Enable")
-        self.param_bkg2d.setChecked(
-            bool(getattr(self.params.P, "bkg2d_enable", getattr(self.params.P, "bkg2d_in_detect", True)))
-        )
+        self.param_bkg2d.setChecked(getattr(self.params.P, 'bkg2d_in_detect', True))
         form2.addRow("2D Background:", self.param_bkg2d)
 
         self.param_bkg_box = QSpinBox()
@@ -2313,6 +3666,7 @@ class SourceDetectionWindow(StepWindowBase):
 
     def save_parameters(self, dialog):
         """Save detection parameters"""
+        self.params.P.detect_engine = self.param_engine.currentText().strip().lower()
         self.params.P.detect_sigma = self.param_detect_sigma.value()
         self.params.P.minarea_pix = self.param_minarea.value()
         self.params.P.deblend_enable = self.param_deblend.isChecked()
@@ -2320,9 +3674,7 @@ class SourceDetectionWindow(StepWindowBase):
         self.params.P.deblend_cont = self.param_deblend_cont.value()
         self.params.P.deblend_max_labels = self.param_deblend_max_labels.value()
         self.params.P.deblend_label_hard_max = self.param_deblend_label_hard_max.value()
-        bkg_enabled = self.param_bkg2d.isChecked()
-        self.params.P.bkg2d_enable = bkg_enabled
-        self.params.P.bkg2d_in_detect = bkg_enabled
+        self.params.P.bkg2d_in_detect = self.param_bkg2d.isChecked()
         self.params.P.bkg2d_box = self.param_bkg_box.value()
         self.params.P.dao_refine_enable = self.param_dao_enable.isChecked()
         self.params.P.dao_fwhm_px = self.param_dao_fwhm.value()
@@ -2346,6 +3698,7 @@ class SourceDetectionWindow(StepWindowBase):
             val = spin.value()
             self.filter_sigma_map[filt] = val
 
+        self.persist_params()
         self.save_state()
 
         QMessageBox.information(dialog, "Success", "Parameters saved!")
@@ -2362,6 +3715,7 @@ class SourceDetectionWindow(StepWindowBase):
             "n_files": len(self.detection_results),
             "use_cropped": self.use_cropped,
             "filter_sigma_map": self.filter_sigma_map,
+            "detect_engine": getattr(self.params.P, "detect_engine", "dao"),
             "detect_sigma": self.params.P.detect_sigma,
             "minarea_pix": self.params.P.minarea_pix,
             "deblend_enable": self.params.P.deblend_enable,
@@ -2387,6 +3741,8 @@ class SourceDetectionWindow(StepWindowBase):
             "peak_sharp_lo": getattr(self.params.P, "peak_sharp_lo", 0.12),
             "peak_skip_if_nsrc_ge": getattr(self.params.P, "peak_skip_if_nsrc_ge", 4500),
         }
+        if hasattr(self, "qc_panel") and self.qc_panel is not None:
+            state_data["qc_state"] = self.qc_panel.export_state()
         self.project_state.store_step_data("source_detection", state_data)
 
     def restore_state(self):
@@ -2397,6 +3753,7 @@ class SourceDetectionWindow(StepWindowBase):
             if 'filter_sigma_map' in state_data:
                 self.filter_sigma_map = state_data['filter_sigma_map']
             for key in [
+                "detect_engine",
                 "detect_sigma",
                 "minarea_pix",
                 "deblend_enable",
@@ -2424,3 +3781,5 @@ class SourceDetectionWindow(StepWindowBase):
             ]:
                 if key in state_data:
                     setattr(self.params.P, key, state_data[key])
+            if "qc_state" in state_data and hasattr(self, "qc_panel") and self.qc_panel is not None:
+                self.qc_panel.restore_state(state_data["qc_state"])

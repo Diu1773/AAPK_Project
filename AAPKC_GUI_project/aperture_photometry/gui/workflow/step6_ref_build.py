@@ -18,7 +18,6 @@ import numpy as np
 import pandas as pd
 
 from astropy.io import fits
-from astropy.table import Table
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
@@ -46,6 +45,7 @@ from ...utils.step_paths import (
     legacy_step7_wcs_dir,
 )
 from ...utils.qc_utils import filter_files_by_qc
+from ...utils.io_utils import parse_int64_series, read_ecsv_int64_source_id
 
 
 def _safe_float(x, default=np.nan):
@@ -504,11 +504,7 @@ class RefBuildWorker(QThread):
         if not gaia_path.exists():
             return None
         try:
-            tab = Table.read(str(gaia_path), format="ascii.ecsv")
-            cols = [c.lower() for c in tab.colnames]
-            if cols != list(tab.colnames):
-                tab.rename_columns(tab.colnames, cols)
-            df = tab.to_pandas()
+            df = read_ecsv_int64_source_id(gaia_path)
             if "ra" not in df.columns or "dec" not in df.columns:
                 return None
             return df
@@ -562,7 +558,7 @@ class RefBuildWorker(QThread):
         gaia_idx = idx[ok]
 
         if "source_id" in gaia_df.columns:
-            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").astype("Int64")
+            gaia_sid = parse_int64_series(gaia_df["source_id"])
             out.loc[match_idx, "gaia_source_id"] = pd.array(
                 gaia_sid.iloc[np.asarray(gaia_idx, dtype=int)].tolist(),
                 dtype="Int64",
@@ -600,7 +596,7 @@ class RefBuildWorker(QThread):
         This ensures consistent source_id across all frames for Gaia-matched sources.
         """
         out = df.copy()
-        old_ids = pd.to_numeric(out.get("source_id"), errors="coerce")
+        old_ids = parse_int64_series(out["source_id"]) if "source_id" in out.columns else pd.Series(dtype="Int64")
 
         # Check if gaia_source_id column exists
         if "gaia_source_id" not in out.columns:
@@ -609,14 +605,14 @@ class RefBuildWorker(QThread):
 
         # Filter by magnitude limit if gaia_G is available
         n_trimmed = 0
-        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
+        gaia_sid = parse_int64_series(out["gaia_source_id"])
         if "gaia_G" in out.columns and gaia_mag_limit > 0:
             gaia_g = pd.to_numeric(out["gaia_G"], errors="coerce")
             too_faint = gaia_g > gaia_mag_limit
             n_trimmed = int((too_faint & gaia_sid.notna() & (gaia_sid > 0)).sum())
             # Clear Gaia ID for sources fainter than limit
             out.loc[too_faint, "gaia_source_id"] = pd.NA
-            gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
+            gaia_sid = parse_int64_series(out["gaia_source_id"])
 
         # Identify sources with valid Gaia source_id
         has_gaia = gaia_sid.notna() & (gaia_sid > 0)
@@ -642,12 +638,12 @@ class RefBuildWorker(QThread):
         sid_map = {}
         id_map = {}
         if old_ids is not None:
-            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy(dtype=float)
-            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy(dtype=float)
+            old_vals = parse_int64_series(old_ids)
+            new_vals = parse_int64_series(out["source_id"])
             id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy(dtype=float)
-            for o, n, i in zip(old_vals, new_vals, id_vals):
-                if np.isfinite(o):
-                    sid_map[int(o)] = int(n) if np.isfinite(n) else int(o)
+            for o, n, i in zip(old_vals.tolist(), new_vals.tolist(), id_vals):
+                if pd.notna(o):
+                    sid_map[int(o)] = int(n) if pd.notna(n) else int(o)
                     id_map[int(o)] = int(i) if np.isfinite(i) else int(o)
 
         n_gaia = int(has_gaia.sum())
@@ -703,14 +699,17 @@ class RefBuildWorker(QThread):
         new["source_id"] = np.nan
         new["ID"] = np.nan
 
-        base_ids = pd.to_numeric(base.loc[base_mask, "source_id"], errors="coerce").to_numpy()
+        base_sid = parse_int64_series(base.loc[base_mask, "source_id"])
+        base_ids = base_sid.to_numpy(dtype="int64", na_value=0)
         match_idx = np.where(new_mask)[0]
         ok_idx = match_idx[ok]
         if len(ok_idx):
             new.loc[ok_idx, "source_id"] = base_ids[idx[ok]]
             new.loc[ok_idx, "ID"] = base_ids[idx[ok]]
 
-        next_id = int(pd.to_numeric(base["source_id"], errors="coerce").max() or 0) + 1
+        base_sid_all = parse_int64_series(base["source_id"])
+        base_sid_valid = base_sid_all[base_sid_all.notna()]
+        next_id = int(base_sid_valid.max()) + 1 if len(base_sid_valid) else 1
         new_rows = []
         for i in match_idx[~ok]:
             sid = next_id
@@ -722,7 +721,7 @@ class RefBuildWorker(QThread):
         if new_rows:
             base = pd.concat([base] + new_rows, ignore_index=True)
 
-        new["source_id"] = pd.to_numeric(new["source_id"], errors="coerce").astype("Int64")
+        new["source_id"] = parse_int64_series(new["source_id"])
         new["ID"] = pd.to_numeric(new["ID"], errors="coerce").astype("Int64")
         return base, new
 
@@ -1399,13 +1398,13 @@ class RefBuildWorker(QThread):
             if self.ref_per_date and sid_map:
                 for date_key in ref_catalogs_by_date:
                     df_date = ref_catalogs_by_date[date_key].copy()
-                    old_sid = pd.to_numeric(df_date.get("source_id"), errors="coerce")
-                    if old_sid is not None:
-                        mapped_sid = old_sid.map(sid_map)
-                        mapped_id = old_sid.map(id_map)
+                    old_sid = parse_int64_series(df_date["source_id"]) if "source_id" in df_date.columns else pd.Series(dtype="Int64")
+                    if len(old_sid):
+                        mapped_sid = old_sid.map(lambda x: sid_map.get(int(x), pd.NA) if pd.notna(x) else pd.NA)
+                        mapped_id = old_sid.map(lambda x: id_map.get(int(x), pd.NA) if pd.notna(x) else pd.NA)
                         # Fallback to original IDs if mapping missing
-                        df_date["source_id"] = mapped_sid.where(mapped_sid.notna(), old_sid)
-                        df_date["ID"] = mapped_id.where(mapped_id.notna(), old_sid)
+                        df_date["source_id"] = parse_int64_series(mapped_sid.where(mapped_sid.notna(), old_sid))
+                        df_date["ID"] = pd.to_numeric(mapped_id.where(mapped_id.notna(), old_sid), errors="coerce").astype("Int64")
                     ref_catalogs_by_date[date_key] = df_date
 
         if "phot_g_mean_mag" in master_df.columns:

@@ -1,8 +1,8 @@
 """
 Step-specific output path helpers.
 
-These helpers keep output locations consistent with documentation:
-most steps write directly under result_dir, with a few dedicated subfolders.
+Each step writes to a dedicated subdirectory under result_dir,
+matching AAPKL's directory layout for consistency.
 """
 
 from __future__ import annotations
@@ -11,6 +11,19 @@ from pathlib import Path
 from typing import Optional, Union
 
 PathLike = Union[str, Path]
+
+# Step directory names
+STEP4_DIRNAME = "step4_detection"
+STEP5_DIRNAME = "step5_wcs"
+STEP6_DIRNAME = "step6_refbuild"
+STEP7_DIRNAME = "step7_idmatch"
+STEP8_DIRNAME = "step8_selection"
+STEP9_DIRNAME = "step9_photometry"
+
+# Legacy directory names (pre-refactor)
+LEGACY_STEP5_REFBUILD_DIRNAME = "step5_refbuild"
+LEGACY_STEP7_WCS_DIRNAME = "step7_wcs"
+LEGACY_STEP7_REFBUILD_DIRNAME = "step7_refbuild"
 
 
 def _as_path(result_dir: Optional[PathLike]) -> Path:
@@ -42,53 +55,53 @@ def crop_is_active(result_dir: Optional[PathLike]) -> bool:
 
 
 def step4_dir(result_dir: Optional[PathLike]) -> Path:
-    """
-    Step 4 output directory with compatibility fallback.
-
-    Newer layouts may use a dedicated subdirectory, while legacy runs write
-    directly to result_dir.
-    """
+    """Step 4 output directory with compatibility fallback."""
     root = _as_path(result_dir)
-    candidate = root / "step4_detection"
+    candidate = root / STEP4_DIRNAME
     return candidate if candidate.exists() else root
 
 
 def step5_dir(result_dir: Optional[PathLike]) -> Path:
-    return _as_path(result_dir)
+    """Step 5: WCS Plate Solving outputs."""
+    return _as_path(result_dir) / STEP5_DIRNAME
 
 
 def step6_dir(result_dir: Optional[PathLike]) -> Path:
-    return _as_path(result_dir)
+    """Step 6: Reference Build outputs."""
+    return _as_path(result_dir) / STEP6_DIRNAME
 
 
 def step7_dir(result_dir: Optional[PathLike]) -> Path:
-    return _as_path(result_dir)
+    """Step 7: Star ID Matching outputs."""
+    return _as_path(result_dir) / STEP7_DIRNAME
 
 
 def legacy_step5_refbuild_dir(result_dir: Optional[PathLike]) -> Path:
     root = _as_path(result_dir)
-    candidate = root / "step5_refbuild"
+    candidate = root / LEGACY_STEP5_REFBUILD_DIRNAME
     return candidate if candidate.exists() else root
 
 
 def legacy_step7_wcs_dir(result_dir: Optional[PathLike]) -> Path:
     root = _as_path(result_dir)
-    candidate = root / "step7_wcs"
+    candidate = root / LEGACY_STEP7_WCS_DIRNAME
     return candidate if candidate.exists() else root
 
 
 def legacy_step7_refbuild_dir(result_dir: Optional[PathLike]) -> Path:
     root = _as_path(result_dir)
-    candidate = root / "step7_refbuild"
+    candidate = root / LEGACY_STEP7_REFBUILD_DIRNAME
     return candidate if candidate.exists() else root
 
 
 def step8_dir(result_dir: Optional[PathLike]) -> Path:
-    return _as_path(result_dir)
+    """Step 8: Master ID Editor outputs."""
+    return _as_path(result_dir) / STEP8_DIRNAME
 
 
 def step9_dir(result_dir: Optional[PathLike]) -> Path:
-    return _as_path(result_dir)
+    """Step 9: Forced Photometry outputs."""
+    return _as_path(result_dir) / STEP9_DIRNAME
 
 
 def step11_dir(result_dir: Optional[PathLike]) -> Path:

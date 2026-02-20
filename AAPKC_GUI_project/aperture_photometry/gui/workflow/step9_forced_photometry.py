@@ -27,15 +27,19 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QDialog, QFormLayout, QDialogButtonBox, QProgressBar,
     QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QTabWidget,
+    QSplitter, QListWidget
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from .step_window_base import StepWindowBase
 from .aperture_photometry_worker import ApertureWorker
-from ...utils.step_paths import step2_cropped_dir, step5_dir, step7_dir, step9_dir, crop_is_active
+from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step9_dir, crop_is_active
 from ...utils.constants import get_parallel_workers
 from ...utils import normalize_filter_name
+from ...utils.io_utils import read_csv_int64_source_id, parse_int64_series
 
 
 def _as_bool(x, default=False):
@@ -69,6 +73,56 @@ def _is_up_to_date(out_path, deps):
         return True
     except Exception:
         return False
+
+
+def _norm_path_key(path_value) -> str:
+    if path_value is None:
+        return ""
+    try:
+        s = str(path_value).strip().replace("\\", "/")
+    except Exception:
+        s = str(path_value).replace("\\", "/")
+    if len(s) >= 3 and s[1] == ":" and s[2] == "/" and s[0].isalpha():
+        s = f"/mnt/{s[0].lower()}/{s[3:]}"
+    while "//" in s:
+        s = s.replace("//", "/")
+    if len(s) > 1 and s.endswith("/"):
+        s = s[:-1]
+    return s.lower()
+
+
+def _build_source_signature(path: Path, *, use_cropped: bool) -> dict:
+    sig = {
+        "cache_schema": 1,
+        "source_path": _norm_path_key(path),
+        "source_use_cropped": bool(use_cropped),
+        "source_size": None,
+        "source_mtime_ns": None,
+    }
+    try:
+        st = path.stat()
+        sig["source_size"] = int(st.st_size)
+        sig["source_mtime_ns"] = int(st.st_mtime_ns)
+    except Exception:
+        pass
+    return sig
+
+
+def _source_signature_compatible(saved_sig: dict, current_sig: dict) -> bool:
+    if not isinstance(saved_sig, dict) or not isinstance(current_sig, dict):
+        return False
+    if bool(saved_sig.get("source_use_cropped", None)) != bool(current_sig.get("source_use_cropped", None)):
+        return False
+    if _norm_path_key(saved_sig.get("source_path")) != _norm_path_key(current_sig.get("source_path")):
+        return False
+    try:
+        saved_size = int(saved_sig.get("source_size"))
+        curr_size = int(current_sig.get("source_size"))
+    except Exception:
+        return False
+    if saved_size <= 0 or curr_size <= 0:
+        return False
+    return saved_size == curr_size
 
 
 def _get_filter_lower(fits_path: Path):
@@ -243,7 +297,7 @@ class ForcedPhotometryWorker(QThread):
             output_dir.mkdir(parents=True, exist_ok=True)
             cache_dir = self.cache_dir
 
-            master_path = step7_dir(result_dir) / "master_catalog.tsv"
+            master_path = step6_dir(result_dir) / "master_catalog.tsv"
             if not master_path.exists():
                 master_path = result_dir / "master_catalog.tsv"
             if not master_path.exists():
@@ -285,25 +339,45 @@ class ForcedPhotometryWorker(QThread):
                 if legacy_ap.exists():
                     ap_path = legacy_ap
             if not ap_path.exists():
-                ap_worker = ApertureWorker(
-                    self.file_list,
-                    self.params,
-                    self.data_dir,
-                    self.result_dir,
-                    self.cache_dir,
-                    self.use_cropped
+                raise RuntimeError(
+                    "aperture_by_frame.csv not found. "
+                    f"Looked for: '{output_dir / 'aperture_by_frame.csv'}', '{result_dir / 'aperture_by_frame.csv'}'. "
+                    "Run Step9 Apcorr tab first."
                 )
-                ap_worker.run()
-            if not ap_path.exists():
-                raise RuntimeError("aperture_by_frame.csv not found (auto-build failed)")
 
             df_ap = pd.read_csv(ap_path)
+            required_ap_cols = {"file", "r_ap", "r_in", "r_out"}
+            missing_ap_cols = sorted(list(required_ap_cols - set(df_ap.columns)))
+            if missing_ap_cols:
+                raise RuntimeError(
+                    f"aperture_by_frame.csv is invalid: missing columns {missing_ap_cols} "
+                    f"(file='{ap_path}')."
+                )
+            if df_ap.empty:
+                raise RuntimeError(
+                    f"aperture_by_frame.csv is empty (file='{ap_path}'). "
+                    "Run Step9 Apcorr tab again and check Step5/Step7 inputs."
+                )
+
+            # Normalize file key to basename for robust matching.
+            df_ap = df_ap.copy()
+            df_ap["file"] = df_ap["file"].astype(str).map(lambda s: Path(str(s)).name)
+
             apcorr_path = output_dir / "apcorr_summary.csv"
             if not apcorr_path.exists():
                 legacy_apcorr = result_dir / "apcorr_summary.csv"
                 if legacy_apcorr.exists():
                     apcorr_path = legacy_apcorr
+            if ap_mode in ("apcorr", "auto") and (not apcorr_path.exists()):
+                raise RuntimeError(
+                    "apcorr_summary.csv not found. "
+                    f"Looked for: '{output_dir / 'apcorr_summary.csv'}', '{result_dir / 'apcorr_summary.csv'}'. "
+                    "Run Step9 Apcorr tab first."
+                )
             apcorr_df = pd.read_csv(apcorr_path) if apcorr_path.exists() else None
+            if apcorr_df is not None and (not apcorr_df.empty) and ("file" in apcorr_df.columns):
+                apcorr_df = apcorr_df.copy()
+                apcorr_df["file"] = apcorr_df["file"].astype(str).map(lambda s: Path(str(s)).name)
 
             # frame sourceid->ID mapping
             frame_map_path = step7_dir(result_dir) / "frame_sourceid_to_ID.tsv"
@@ -311,15 +385,18 @@ class ForcedPhotometryWorker(QThread):
                 frame_map_path = result_dir / "frame_sourceid_to_ID.tsv"
             df_frame_map = pd.read_csv(frame_map_path, sep="\t") if frame_map_path.exists() else None
 
-            sourceid_to_ID_path = step7_dir(result_dir) / "sourceid_to_ID.csv"
+            sourceid_to_ID_path = step6_dir(result_dir) / "sourceid_to_ID.csv"
             if not sourceid_to_ID_path.exists():
                 sourceid_to_ID_path = result_dir / "sourceid_to_ID.csv"
             sid2id = None
             if sourceid_to_ID_path.exists():
                 try:
-                    df_sid2id = pd.read_csv(sourceid_to_ID_path)
+                    df_sid2id = read_csv_int64_source_id(sourceid_to_ID_path)
                     if {"source_id", "ID"} <= set(df_sid2id.columns):
-                        sid2id = dict(zip(df_sid2id["source_id"].astype(np.int64), df_sid2id["ID"].astype(int)))
+                        sid_series = parse_int64_series(df_sid2id["source_id"])
+                        id_series = pd.to_numeric(df_sid2id["ID"], errors="coerce")
+                        valid = sid_series.notna() & id_series.notna()
+                        sid2id = dict(zip(sid_series.loc[valid].astype("int64"), id_series.loc[valid].astype(int)))
                 except Exception:
                     sid2id = None
 
@@ -385,7 +462,7 @@ class ForcedPhotometryWorker(QThread):
                                 "y": pd.to_numeric(sub[c_y], errors="coerce"),
                             })
                             if c_sid:
-                                out["source_id"] = pd.to_numeric(sub[c_sid], errors="coerce").astype("Int64")
+                                out["source_id"] = parse_int64_series(sub[c_sid])
                             if c_sep:
                                 out["sep_arcsec"] = pd.to_numeric(sub[c_sep], errors="coerce")
                             out = out.dropna(subset=["ID", "x", "y"])
@@ -396,9 +473,8 @@ class ForcedPhotometryWorker(QThread):
                 p = idmatch_dir / f"idmatch_{fname}.csv"
                 if p.exists():
                     try:
-                        df = pd.read_csv(p)
+                        df = read_csv_int64_source_id(p)
                         if {"source_id", "x", "y"} <= set(df.columns):
-                            df["source_id"] = pd.to_numeric(df["source_id"], errors="coerce").astype("Int64")
                             if sid2id is None:
                                 return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
                             df["ID"] = df["source_id"].map(sid2id)
@@ -447,13 +523,14 @@ class ForcedPhotometryWorker(QThread):
 
             frames = list(self.file_list)
             total = len(frames)
-            counters = {"cached": 0, "processed": 0, "no_targets": 0, "no_aperture": 0}
+            counters = {"cached": 0, "processed": 0, "no_targets": 0, "no_aperture": 0, "stopped": 0}
             completed_count = [0]  # Use list for mutable in closure
 
             # Per-frame processing function (for parallel execution)
             def process_single_frame(fname):
                 if self._stop_requested:
-                    return fname, None, None, None, "stopped"
+                    dbg_row = dict(file=fname, cached=False, reason="stop_requested")
+                    return fname, None, dbg_row, [], "stopped"
 
                 if self.use_cropped:
                     cropped_dir = step2_cropped_dir(result_dir)
@@ -464,14 +541,26 @@ class ForcedPhotometryWorker(QThread):
                     fpath = self.data_dir / fname
 
                 out_tsv = output_dir / f"{fname}_photometry.tsv"
-                deps = [fpath, master_path, ap_path]
-                if (cache_dir / "idmatch" / f"idmatch_{fname}.csv").exists():
-                    deps.append(cache_dir / "idmatch" / f"idmatch_{fname}.csv")
+                sig_json = output_dir / f"{fname}_photometry.sig.json"
+                source_sig = _build_source_signature(fpath, use_cropped=bool(self.use_cropped))
+                deps = [master_path, ap_path]
+                idmatch_path = cache_dir / "idmatch" / f"idmatch_{fname}.csv"
+                if idmatch_path.exists():
+                    deps.append(idmatch_path)
 
                 this_filter = _get_filter_lower(fpath)
 
                 # Check cache
-                if resume and (not force_rephot) and out_tsv.exists() and _is_up_to_date(out_tsv, deps):
+                cache_ok = False
+                if resume and (not force_rephot) and out_tsv.exists():
+                    cache_ok = _is_up_to_date(out_tsv, deps)
+                    if cache_ok and sig_json.exists():
+                        try:
+                            saved_sig = json.loads(sig_json.read_text(encoding="utf-8"))
+                            cache_ok = _source_signature_compatible(saved_sig, source_sig)
+                        except Exception:
+                            cache_ok = False
+                if cache_ok:
                     n, n_goodmag, n_fail, targets = _cached_counts(fname, out_tsv)
                     idx_row = dict(
                         file=fname, filter=this_filter,
@@ -512,9 +601,9 @@ class ForcedPhotometryWorker(QThread):
                 if apcorr_df is not None and ap_mode in ("apcorr", "auto"):
                     row_apc = apcorr_df[apcorr_df["file"].astype(str) == str(fname)]
                     if not row_apc.empty:
-                        c_apcorr = float(row_apc["apcorr"].values[0]) if "apcorr" in row_apc.columns else np.nan
-                        rel_sc = float(row_apc["rel_scatter"].values[0]) if "rel_scatter" in row_apc.columns else np.nan
-                        apply_flag = bool(row_apc["apply"].values[0]) if "apply" in row_apc.columns else False
+                        c_apcorr = _safe_float(row_apc["apcorr"].values[0], np.nan) if "apcorr" in row_apc.columns else np.nan
+                        rel_sc = _safe_float(row_apc["rel_scatter"].values[0], np.nan) if "rel_scatter" in row_apc.columns else np.nan
+                        apply_flag = _as_bool(row_apc["apply"].values[0], False) if "apply" in row_apc.columns else False
 
                 rows = []
                 frame_fail_rows = []
@@ -526,6 +615,15 @@ class ForcedPhotometryWorker(QThread):
                     id2sid = dict(zip(tgt["ID"].astype(int), tgt["source_id"].astype("Int64")))
 
                 for _, tr in tgt.iterrows():
+                    if self._stop_requested:
+                        dbg_row = dict(
+                            file=fname, cached=False,
+                            targets=n_tgt, out_rows=len(rows),
+                            n_goodmag=n_goodmag, n_fail=n_fail,
+                            apcorr_applied=bool(apply_flag),
+                            reason="stop_requested"
+                        )
+                        return fname, None, dbg_row, frame_fail_rows, "stopped"
                     ID = int(tr["ID"])
                     x0 = float(tr["x"])
                     y0 = float(tr["y"])
@@ -603,6 +701,10 @@ class ForcedPhotometryWorker(QThread):
                 df_out = pd.DataFrame(rows)
                 with self._write_lock:
                     df_out.to_csv(out_tsv, sep="\t", index=False, na_rep="NaN")
+                    try:
+                        sig_json.write_text(json.dumps(source_sig, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
 
                 idx_row = dict(
                     file=fname, filter=this_filter,
@@ -614,6 +716,8 @@ class ForcedPhotometryWorker(QThread):
                     targets=n_tgt, out_rows=len(df_out),
                     n_goodmag=n_goodmag, n_fail=n_fail,
                     apcorr_applied=bool(apply_flag),
+                    apcorr=float(c_apcorr) if np.isfinite(c_apcorr) else None,
+                    rel_scatter=float(rel_sc) if np.isfinite(rel_sc) else None,
                     sky_sigma_source=_sky_src, sky_frame_e=float(sky_frame_e) if np.isfinite(sky_frame_e) else None
                 )
                 return fname, idx_row, dbg_row, frame_fail_rows, "processed"
@@ -625,9 +729,6 @@ class ForcedPhotometryWorker(QThread):
                 future_to_fname = {executor.submit(process_single_frame, f): f for f in frames}
 
                 for future in as_completed(future_to_fname):
-                    if self._stop_requested:
-                        break
-
                     try:
                         fname, idx_row, dbg_row, fail_rows, status = future.result()
 
@@ -640,6 +741,8 @@ class ForcedPhotometryWorker(QThread):
                             counters["no_targets"] += 1
                         elif status == "no_aperture":
                             counters["no_aperture"] += 1
+                        elif status == "stopped":
+                            counters["stopped"] += 1
 
                         # Collect results
                         if idx_row:
@@ -664,6 +767,49 @@ class ForcedPhotometryWorker(QThread):
                                 "targets": idx_row.get("targets", 0),
                                 "status": status,
                             })
+
+                        # Detailed per-frame log
+                        filt = str((idx_row or {}).get("filter", "unknown"))
+                        if status == "processed" and idx_row:
+                            n_rows = int(_safe_float(idx_row.get("n", 0), 0.0))
+                            n_good = int(_safe_float(idx_row.get("n_goodmag", 0), 0.0))
+                            n_fail = int(_safe_float(idx_row.get("n_fail", 0), 0.0))
+                            n_tgt = int(_safe_float(idx_row.get("targets", 0), 0.0))
+                            ap_applied = bool((dbg_row or {}).get("apcorr_applied", False))
+                            apcorr_val = _safe_float((dbg_row or {}).get("apcorr", np.nan), np.nan)
+                            rel_sc = _safe_float((dbg_row or {}).get("rel_scatter", np.nan), np.nan)
+                            ap_label = "on" if ap_applied else "off"
+                            if np.isfinite(apcorr_val):
+                                ap_label += f" c={apcorr_val:.4f}"
+                            if np.isfinite(rel_sc):
+                                ap_label += f" rs={rel_sc:.4f}"
+                            self._log(
+                                f"[Frame {completed_count[0]}/{total}] OK {fname} | "
+                                f"f={filt} targets={n_tgt} rows={n_rows} good={n_good} fail={n_fail} "
+                                f"apcorr={ap_label}"
+                            )
+                        elif status == "cached" and idx_row:
+                            n_good = int(_safe_float(idx_row.get("n_goodmag", 0), 0.0))
+                            n_tgt = int(_safe_float(idx_row.get("targets", 0), 0.0))
+                            self._log(
+                                f"[Frame {completed_count[0]}/{total}] CACHE {fname} | "
+                                f"f={filt} targets={n_tgt} good={n_good}"
+                            )
+                        elif status == "no_targets":
+                            self._log(
+                                f"[Frame {completed_count[0]}/{total}] SKIP {fname} | "
+                                "reason=no_targets (Step7 mapping empty)"
+                            )
+                        elif status == "no_aperture":
+                            self._log(
+                                f"[Frame {completed_count[0]}/{total}] SKIP {fname} | "
+                                "reason=no_aperture_by_frame (run Apcorr first)"
+                            )
+                        elif status == "stopped":
+                            self._log(
+                                f"[Frame {completed_count[0]}/{total}] STOP {fname} | "
+                                "stop requested"
+                            )
 
                     except Exception as e:
                         self._log(f"Error processing {future_to_fname[future]}: {e}")
@@ -704,6 +850,7 @@ class ForcedPhotometryWorker(QThread):
                 "Done | "
                 f"processed={counters['processed']} | cached={counters['cached']} | "
                 f"no_targets={counters['no_targets']} | no_aperture={counters['no_aperture']} | "
+                f"stopped={counters['stopped']} | "
                 f"fail_rows={len(_fail_rows_all)}"
             )
             self._log(f"Saved: {idx_path.name}, {debug_json.name}")
@@ -714,6 +861,7 @@ class ForcedPhotometryWorker(QThread):
                 "cached": counters["cached"],
                 "no_targets": counters["no_targets"],
                 "no_aperture": counters["no_aperture"],
+                "stopped": counters["stopped"],
                 "fail_rows": len(_fail_rows_all),
             })
         except Exception as e:
@@ -728,9 +876,15 @@ class ForcedPhotometryWindow(StepWindowBase):
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
         self.worker = None
+        self.apcorr_worker = None
+        self._pending_phot_after_apcorr = False
         self.file_list = []
         self.use_cropped = False
         self.log_window = None
+        self._apcorr_summary_df = pd.DataFrame()
+        self._growth_curve_df = pd.DataFrame()
+        self._apcorr_filter_by_file = {}
+        self._filter_cache = {}
 
         super().__init__(
             step_index=8,
@@ -748,32 +902,6 @@ class ForcedPhotometryWindow(StepWindowBase):
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         self.content_layout.addWidget(info)
 
-        control_layout = QHBoxLayout()
-        btn_params = QPushButton("Photometry Parameters")
-        btn_params.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 8px 15px; }")
-        btn_params.clicked.connect(self.open_parameters_dialog)
-        control_layout.addWidget(btn_params)
-
-        control_layout.addStretch()
-
-        self.btn_run = QPushButton("Run Photometry")
-        self.btn_run.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 20px; }")
-        self.btn_run.clicked.connect(self.run_photometry)
-        control_layout.addWidget(self.btn_run)
-
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setStyleSheet("QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 8px 15px; }")
-        self.btn_stop.clicked.connect(self.stop_photometry)
-        self.btn_stop.setEnabled(False)
-        control_layout.addWidget(self.btn_stop)
-
-        btn_log = QPushButton("Log")
-        btn_log.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 15px; }")
-        btn_log.clicked.connect(self.show_log_window)
-        control_layout.addWidget(btn_log)
-
-        self.content_layout.addLayout(control_layout)
-
         progress_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimum(0)
@@ -785,6 +913,33 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.progress_label.setMinimumWidth(350)
         progress_layout.addWidget(self.progress_label)
         self.content_layout.addLayout(progress_layout)
+
+        self.main_tabs = QTabWidget()
+        self.content_layout.addWidget(self.main_tabs)
+
+        # Photometry tab
+        summary_tab = QWidget()
+        summary_layout = QVBoxLayout(summary_tab)
+        phot_control = QHBoxLayout()
+        self.btn_phot_params = QPushButton("Photometry Parameters")
+        self.btn_phot_params.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_phot_params.clicked.connect(self.open_parameters_dialog)
+        phot_control.addWidget(self.btn_phot_params)
+        phot_control.addStretch()
+        self.btn_run_phot = QPushButton("Run Photometry")
+        self.btn_run_phot.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 20px; }")
+        self.btn_run_phot.clicked.connect(self.run_photometry)
+        phot_control.addWidget(self.btn_run_phot)
+        self.btn_stop_phot = QPushButton("Stop")
+        self.btn_stop_phot.setStyleSheet("QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_stop_phot.clicked.connect(self.stop_photometry)
+        self.btn_stop_phot.setEnabled(False)
+        phot_control.addWidget(self.btn_stop_phot)
+        self.btn_log_phot = QPushButton("Log")
+        self.btn_log_phot.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_log_phot.clicked.connect(self.show_log_window)
+        phot_control.addWidget(self.btn_log_phot)
+        summary_layout.addLayout(phot_control)
 
         table_group = QGroupBox("Per-Frame Photometry Summary")
         table_layout = QVBoxLayout(table_group)
@@ -801,7 +956,102 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.frame_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.frame_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table_layout.addWidget(self.frame_table)
-        self.content_layout.addWidget(table_group)
+        summary_layout.addWidget(table_group)
+
+        # Apcorr tab — growth curve based optimal aperture finder
+        apcorr_tab = QWidget()
+        apcorr_layout = QVBoxLayout(apcorr_tab)
+        apcorr_control_run = QHBoxLayout()
+        self.btn_apcorr_params = QPushButton("Apcorr Parameters")
+        self.btn_apcorr_params.setStyleSheet("QPushButton { background-color: #795548; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_apcorr_params.clicked.connect(self.open_parameters_dialog)
+        apcorr_control_run.addWidget(self.btn_apcorr_params)
+        apcorr_control_run.addStretch()
+        self.btn_run_apcorr = QPushButton("Run Apcorr")
+        self.btn_run_apcorr.setStyleSheet("QPushButton { background-color: #2E7D32; color: white; font-weight: bold; padding: 8px 20px; }")
+        self.btn_run_apcorr.clicked.connect(self.run_apcorr)
+        apcorr_control_run.addWidget(self.btn_run_apcorr)
+        self.btn_stop_apcorr = QPushButton("Stop")
+        self.btn_stop_apcorr.setStyleSheet("QPushButton { background-color: #c62828; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_stop_apcorr.clicked.connect(self.stop_apcorr)
+        self.btn_stop_apcorr.setEnabled(False)
+        apcorr_control_run.addWidget(self.btn_stop_apcorr)
+        self.btn_log_apcorr = QPushButton("Log")
+        self.btn_log_apcorr.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_log_apcorr.clicked.connect(self.show_log_window)
+        apcorr_control_run.addWidget(self.btn_log_apcorr)
+        apcorr_layout.addLayout(apcorr_control_run)
+
+        apcorr_note = QLabel("Growth curve: finds optimal aperture (min error) and computes aperture correction.")
+        apcorr_note.setStyleSheet("QLabel { background-color: #FFF8E1; padding: 8px; border-radius: 4px; }")
+        apcorr_layout.addWidget(apcorr_note)
+
+        apcorr_control = QHBoxLayout()
+        self.apcorr_status = QLabel("growth curve: not loaded")
+        apcorr_control.addWidget(self.apcorr_status)
+        apcorr_control.addStretch()
+        self.btn_refresh_apcorr = QPushButton("Refresh")
+        self.btn_refresh_apcorr.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 6px 12px; }")
+        self.btn_refresh_apcorr.clicked.connect(self.update_apcorr_tables)
+        apcorr_control.addWidget(self.btn_refresh_apcorr)
+        apcorr_layout.addLayout(apcorr_control)
+
+        # Splitter: left=dual-subplot plot, right=frame list + per-frame table
+        self.apcorr_splitter = QSplitter(Qt.Horizontal)
+
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        self.apcorr_fig = Figure(figsize=(6.4, 5.6))
+        self.apcorr_canvas = FigureCanvas(self.apcorr_fig)
+        self.apcorr_ax_mag = self.apcorr_fig.add_subplot(211)   # growth curve (mag)
+        self.apcorr_ax_err = self.apcorr_fig.add_subplot(212)   # error U-shape
+        self.apcorr_fig.subplots_adjust(hspace=0.35)
+        plot_layout.addWidget(self.apcorr_canvas)
+        self.apcorr_splitter.addWidget(plot_panel)
+
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.addWidget(QLabel("Frames"))
+        self.apcorr_file_list = QListWidget()
+        self.apcorr_file_list.currentTextChanged.connect(self._on_apcorr_file_changed)
+        side_layout.addWidget(self.apcorr_file_list, stretch=1)
+
+        side_layout.addWidget(QLabel("Growth Curve (selected frame)"))
+        self.apcorr_file_cand_table = QTableWidget()
+        self.apcorr_file_cand_table.setColumnCount(7)
+        self.apcorr_file_cand_table.setHorizontalHeaderLabels([
+            "scale", "r (px)", "med_mag", "med_mag_err",
+            "med_SNR", "n_stars", "selected"
+        ])
+        for col in range(7):
+            mode = QHeaderView.Stretch if col in (0, 1) else QHeaderView.ResizeToContents
+            self.apcorr_file_cand_table.horizontalHeader().setSectionResizeMode(col, mode)
+        self.apcorr_file_cand_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        side_layout.addWidget(self.apcorr_file_cand_table, stretch=2)
+        self.apcorr_splitter.addWidget(side_panel)
+
+        self.apcorr_splitter.setStretchFactor(0, 3)
+        self.apcorr_splitter.setStretchFactor(1, 2)
+        apcorr_layout.addWidget(self.apcorr_splitter, stretch=1)
+
+        # Summary table: one row per frame
+        apcorr_sel_group = QGroupBox("Growth Curve Summary")
+        apcorr_sel_layout = QVBoxLayout(apcorr_sel_group)
+        self.apcorr_table = QTableWidget()
+        self.apcorr_table.setColumnCount(9)
+        self.apcorr_table.setHorizontalHeaderLabels([
+            "Frame", "FWHM(px)", "Opt r(px)", "Opt scale",
+            "Apcorr", "SNR_opt", "mag_err_opt", "n_stars", "apply"
+        ])
+        self.apcorr_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 9):
+            self.apcorr_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.apcorr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        apcorr_sel_layout.addWidget(self.apcorr_table)
+        apcorr_layout.addWidget(apcorr_sel_group)
+        self.main_tabs.addTab(apcorr_tab, "Apcorr QC")
+        self.main_tabs.addTab(summary_tab, "Photometry")
+        self.main_tabs.setCurrentIndex(0)
 
         self.log_window = QWidget(self, Qt.Window)
         self.log_window.setWindowTitle("Photometry Log")
@@ -814,6 +1064,7 @@ class ForcedPhotometryWindow(StepWindowBase):
 
         self.populate_file_list()
         self.update_frame_table()
+        self.update_apcorr_tables()
 
     def log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -839,6 +1090,63 @@ class ForcedPhotometryWindow(StepWindowBase):
             files = self.file_manager.filenames
             self.use_cropped = False
         self.file_list = list(files)
+
+    def _step9_artifact_path(self, filename: str) -> Path:
+        p = step9_dir(self.params.P.result_dir) / filename
+        if p.exists():
+            return p
+        legacy = self.params.P.result_dir / filename
+        if legacy.exists():
+            return legacy
+        return p
+
+    def _apcorr_prereq_ok(self):
+        ap_path = self._step9_artifact_path("aperture_by_frame.csv")
+        if not ap_path.exists():
+            return False, f"Missing aperture file: {ap_path}"
+
+        try:
+            df_ap = pd.read_csv(ap_path)
+        except Exception as e:
+            return False, f"Failed to read aperture file: {ap_path} ({e})"
+
+        required_cols = {"file", "r_ap", "r_in", "r_out"}
+        missing_cols = sorted(list(required_cols - set(df_ap.columns)))
+        if missing_cols:
+            return False, f"Invalid aperture file (missing {missing_cols}): {ap_path}"
+        if df_ap.empty:
+            return False, f"Aperture file is empty: {ap_path}"
+
+        if self.file_list:
+            want = set(str(f) for f in self.file_list)
+            have = set(df_ap["file"].astype(str).map(lambda s: Path(str(s)).name))
+            if not (want & have):
+                return False, (
+                    f"Aperture file has no matching rows for current frames "
+                    f"(need {len(want)} frames, overlap=0): {ap_path}"
+                )
+
+        ap_mode = str(getattr(self.params.P, "aperture_mode", getattr(self.params.P, "ap_mode", "apcorr"))).strip().lower()
+        if ap_mode in ("apcorr", "auto"):
+            apcorr_path = self._step9_artifact_path("apcorr_summary.csv")
+            if not apcorr_path.exists():
+                return False, f"Missing apcorr summary: {apcorr_path}"
+            try:
+                df_apc = pd.read_csv(apcorr_path)
+            except Exception as e:
+                return False, f"Failed to read apcorr summary: {apcorr_path} ({e})"
+            if df_apc.empty:
+                return False, f"Apcorr summary is empty: {apcorr_path}"
+            if "file" in df_apc.columns and self.file_list:
+                want = set(str(f) for f in self.file_list)
+                have = set(df_apc["file"].astype(str).map(lambda s: Path(str(s)).name))
+                if not (want & have):
+                    return False, (
+                        f"Apcorr summary has no matching rows for current frames "
+                        f"(need {len(want)} frames, overlap=0): {apcorr_path}"
+                    )
+
+        return True, ""
 
     def open_parameters_dialog(self):
         dialog = QDialog(self)
@@ -912,6 +1220,23 @@ class ForcedPhotometryWindow(StepWindowBase):
         scale_form.addRow("Annulus sigma clip:", self.param_sigma_clip)
 
         layout.addWidget(scale_group)
+
+        apcorr_group = QGroupBox("Apcorr Gate")
+        apcorr_form = QFormLayout(apcorr_group)
+        self.param_apcorr_apply = QCheckBox("Enable")
+        self.param_apcorr_apply.setChecked(bool(getattr(self.params.P, "apcorr_apply", True)))
+        apcorr_form.addRow("Apply Apcorr:", self.param_apcorr_apply)
+        self.param_apcorr_min_n = QSpinBox()
+        self.param_apcorr_min_n.setRange(3, 500)
+        self.param_apcorr_min_n.setValue(int(getattr(self.params.P, "apcorr_use_min_n", 20)))
+        apcorr_form.addRow("Apcorr Min N:", self.param_apcorr_min_n)
+        self.param_apcorr_scatter = QDoubleSpinBox()
+        self.param_apcorr_scatter.setRange(0.01, 1.0)
+        self.param_apcorr_scatter.setSingleStep(0.01)
+        self.param_apcorr_scatter.setValue(float(getattr(self.params.P, "apcorr_scatter_max", 0.05)))
+        apcorr_form.addRow("Apcorr Scatter Max:", self.param_apcorr_scatter)
+        layout.addWidget(apcorr_group)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: self.save_parameters(dialog))
         buttons.rejected.connect(dialog.reject)
@@ -930,6 +1255,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.params.P.annulus_min_gap_px = self.param_ann_gap.value()
         self.params.P.annulus_min_width_px = self.param_ann_minw.value()
         self.params.P.annulus_sigma_clip = self.param_sigma_clip.value()
+        self.params.P.apcorr_apply = self.param_apcorr_apply.isChecked()
+        self.params.P.apcorr_use_min_n = self.param_apcorr_min_n.value()
+        self.params.P.apcorr_scatter_max = self.param_apcorr_scatter.value()
         self.save_state()
         saved = self.persist_params()
         msg = "Parameters saved to TOML." if saved else "Parameters saved (TOML save failed)."
@@ -940,9 +1268,21 @@ class ForcedPhotometryWindow(StepWindowBase):
         if not self.file_list:
             QMessageBox.warning(self, "Warning", "No files to process")
             return
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Apcorr is running. Stop/finish Apcorr first.")
+            return
         if self.worker and self.worker.isRunning():
             return
 
+        ok, reason = self._apcorr_prereq_ok()
+        if not ok:
+            self.log(f"[AUTO] Photometry prerequisite missing: {reason}")
+            self.log("[AUTO] Running Apcorr first to generate required files.")
+            self._pending_phot_after_apcorr = True
+            self.run_apcorr()
+            return
+
+        self._pending_phot_after_apcorr = False
         self.log_text.clear()
         self.log(
             "Params | "
@@ -968,8 +1308,10 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.worker.error.connect(self.on_error)
         self.worker.log.connect(self.log)
 
-        self.btn_run.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.btn_run_phot.setEnabled(False)
+        self.btn_stop_phot.setEnabled(True)
+        if hasattr(self, "btn_run_apcorr"):
+            self.btn_run_apcorr.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(self.file_list))
         self.progress_label.setText(f"0/{len(self.file_list)} | Starting...")
@@ -979,6 +1321,85 @@ class ForcedPhotometryWindow(StepWindowBase):
     def stop_photometry(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
+
+    def run_apcorr(self):
+        if not self.file_list:
+            QMessageBox.warning(self, "Warning", "No files to process")
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Photometry is running. Stop/finish photometry first.")
+            return
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            return
+
+        if hasattr(self, "apcorr_table"):
+            self.apcorr_table.setRowCount(0)
+        if hasattr(self, "apcorr_status"):
+            self.apcorr_status.setText("growth curve: running...")
+        self.log("Start Apcorr build (aperture_by_frame + apcorr_summary)")
+
+        self.apcorr_worker = ApertureWorker(
+            self.file_list,
+            self.params,
+            self.params.P.data_dir,
+            self.params.P.result_dir,
+            self.params.P.cache_dir,
+            self.use_cropped
+        )
+        self.apcorr_worker.progress.connect(self.on_apcorr_progress)
+        self.apcorr_worker.finished.connect(self.on_apcorr_finished)
+        self.apcorr_worker.error.connect(self.on_apcorr_error)
+
+        self.btn_run_apcorr.setEnabled(False)
+        self.btn_stop_apcorr.setEnabled(True)
+        if hasattr(self, "btn_run_phot"):
+            self.btn_run_phot.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.file_list))
+        self.progress_label.setText(f"0/{len(self.file_list)} | Apcorr...")
+        self.apcorr_worker.start()
+        self.show_log_window()
+
+    def stop_apcorr(self):
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            self.apcorr_worker.stop()
+
+    def on_apcorr_progress(self, current, total, filename):
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(f"{current}/{total} | Apcorr {filename}")
+
+    def on_apcorr_finished(self, summary):
+        if hasattr(self, "btn_run_apcorr"):
+            self.btn_run_apcorr.setEnabled(True)
+        if hasattr(self, "btn_stop_apcorr"):
+            self.btn_stop_apcorr.setEnabled(False)
+        if hasattr(self, "btn_run_phot"):
+            self.btn_run_phot.setEnabled(True)
+        self.progress_label.setText("Done")
+        self.log(f"Apcorr done: {summary}")
+        self._cleanup_apcorr_worker(timeout_ms=5000)
+        self.update_apcorr_tables()
+        self.save_state()
+        self.update_navigation_buttons()
+
+        if self._pending_phot_after_apcorr:
+            ok, reason = self._apcorr_prereq_ok()
+            if ok:
+                self.log("Apcorr prerequisite ready. Starting photometry automatically.")
+                self._pending_phot_after_apcorr = False
+                self.run_photometry()
+            else:
+                self._pending_phot_after_apcorr = False
+                self.log(f"[AUTO] Apcorr finished but prerequisite check failed: {reason}")
+                QMessageBox.warning(
+                    self,
+                    "Apcorr Incomplete",
+                    "Apcorr run finished, but required files for photometry are still invalid.\n"
+                    f"{reason}"
+                )
+
+    def on_apcorr_error(self, filename, error):
+        self.log(f"APCORR ERROR {filename}: {error}")
 
     def on_progress(self, current, total, filename):
         self.progress_bar.setValue(current)
@@ -1003,8 +1424,10 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.frame_table.scrollToBottom()
 
     def on_finished(self, summary):
-        self.btn_run.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        self.btn_run_phot.setEnabled(True)
+        self.btn_stop_phot.setEnabled(False)
+        if hasattr(self, "btn_run_apcorr"):
+            self.btn_run_apcorr.setEnabled(True)
         self.progress_label.setText("Done")
         self.log(f"Photometry done: {summary}")
 
@@ -1035,6 +1458,7 @@ class ForcedPhotometryWindow(StepWindowBase):
             except Exception:
                 pass
         self.save_state()
+        self.update_apcorr_tables()
         self.update_navigation_buttons()
 
     def on_error(self, filename, error):
@@ -1063,6 +1487,26 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.worker = None
         return True
 
+    def _cleanup_apcorr_worker(self, timeout_ms=5000):
+        if not self.apcorr_worker:
+            return True
+        worker = self.apcorr_worker
+        if worker.isRunning():
+            try:
+                worker.stop()
+            except Exception:
+                pass
+            worker.quit()
+            if not worker.wait(int(timeout_ms)):
+                self.log("Apcorr worker is still running; close is deferred.")
+                return False
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        self.apcorr_worker = None
+        return True
+
     def show_log_window(self):
         self.log_window.show()
         self.log_window.raise_()
@@ -1089,7 +1533,7 @@ class ForcedPhotometryWindow(StepWindowBase):
             idx["filter"] = idx["FILTER"]
         if "file" in idx.columns:
             def _frame_num(val):
-                m = re.search(r"(\\d+)", str(val))
+                m = re.search(r"(\d+)", str(val))
                 return int(m.group(1)) if m else 0
             idx["_frame_num"] = idx["file"].map(_frame_num)
             order_base = idx.sort_values(["_frame_num", "file"])
@@ -1124,15 +1568,334 @@ class ForcedPhotometryWindow(StepWindowBase):
             self.frame_table.setItem(r, 4, QTableWidgetItem(_fmt_count(row.get("n_fail", 0))))
             self.frame_table.setItem(r, 5, QTableWidgetItem(_fmt_count(row.get("targets", 0))))
 
+    def _refresh_apcorr_filter_map(self):
+        mapping = {}
+        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
+        if not idx_path.exists():
+            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        if idx_path.exists():
+            try:
+                idx = pd.read_csv(idx_path)
+                if {"file", "filter"} <= set(idx.columns):
+                    for _, row in idx.iterrows():
+                        mapping[str(row["file"])] = str(row["filter"]).strip().lower()
+            except Exception:
+                pass
+        self._apcorr_filter_by_file = mapping
+
+    def _filter_color(self, filt: str) -> str:
+        key = str(filt or "unknown").strip().lower()
+        palette = {
+            "u": "#8E24AA",
+            "g": "#43A047",
+            "r": "#E53935",
+            "i": "#3949AB",
+            "z": "#6D4C41",
+            "y": "#00897B",
+            "ha": "#FB8C00",
+            "oiii": "#00ACC1",
+            "sii": "#6D4C41",
+            "unknown": "#546E7A",
+        }
+        return palette.get(key, "#546E7A")
+
+    def _filter_from_filename(self, fname: str) -> str:
+        stem = Path(str(fname)).stem.lower()
+        m = re.search(r"(?:^|[_-])([ugrizy])(?:[_-]|$)", stem)
+        if m:
+            return normalize_filter_name(m.group(1))
+        tokens = [t for t in re.split(r"[^a-z0-9]+", stem) if t]
+        for tok in reversed(tokens):
+            norm = normalize_filter_name(tok)
+            if norm and norm != "unknown":
+                return norm
+        return "unknown"
+
+    def _resolve_filter_for_file(self, fname: str) -> str:
+        key = str(fname)
+        if key in self._apcorr_filter_by_file:
+            v = str(self._apcorr_filter_by_file.get(key, "")).strip().lower()
+            if v:
+                return v
+        if key in self._filter_cache:
+            return self._filter_cache[key]
+
+        filt = self._filter_from_filename(key)
+        if filt == "unknown":
+            try:
+                data_dir = Path(self.params.P.data_dir)
+            except Exception:
+                data_dir = Path(".")
+            probe_paths = []
+            if self.use_cropped:
+                crop_dir = step2_cropped_dir(self.params.P.result_dir)
+                probe_paths.append(crop_dir / key)
+                probe_paths.append((self.params.P.result_dir / "cropped") / key)
+            probe_paths.append(data_dir / key)
+            for probe in probe_paths:
+                if probe.exists():
+                    filt = _get_filter_lower(probe)
+                    if filt and filt != "unknown":
+                        break
+        filt = str(filt or "unknown").strip().lower()
+        self._filter_cache[key] = filt
+        return filt
+
+    def update_apcorr_tables(self):
+        if not hasattr(self, "apcorr_table"):
+            return
+
+        base_dir = step9_dir(self.params.P.result_dir)
+        sum_path = base_dir / "apcorr_summary.csv"
+        gc_path = base_dir / "growth_curve.csv"
+        if not sum_path.exists():
+            sum_path = self.params.P.result_dir / "apcorr_summary.csv"
+        if not gc_path.exists():
+            gc_path = self.params.P.result_dir / "growth_curve.csv"
+
+        # Load summary
+        if sum_path.exists():
+            try:
+                df_sum = pd.read_csv(sum_path)
+            except Exception:
+                df_sum = pd.DataFrame()
+        else:
+            df_sum = pd.DataFrame()
+
+        # Load growth curve data
+        if gc_path.exists():
+            try:
+                df_gc = pd.read_csv(gc_path)
+            except Exception:
+                df_gc = pd.DataFrame()
+        else:
+            df_gc = pd.DataFrame()
+
+        self._apcorr_summary_df = df_sum.copy()
+        self._growth_curve_df = df_gc.copy()
+        self._refresh_apcorr_filter_map()
+
+        # Fill summary table
+        self.apcorr_table.setRowCount(0)
+        if not df_sum.empty:
+            for _, row in df_sum.iterrows():
+                r = self.apcorr_table.rowCount()
+                self.apcorr_table.insertRow(r)
+                vals = [
+                    str(row.get("file", "")),
+                    f"{row.get('fwhm_used', np.nan):.2f}" if np.isfinite(float(row.get("fwhm_used", np.nan))) else "",
+                    f"{row.get('r_optimal', np.nan):.2f}" if np.isfinite(float(row.get("r_optimal", np.nan))) else "",
+                    f"{row.get('optimal_scale', np.nan):.2f}" if np.isfinite(float(row.get("optimal_scale", np.nan))) else "",
+                    f"{row.get('apcorr', np.nan):.4f}" if np.isfinite(float(row.get("apcorr", np.nan))) else "",
+                    f"{row.get('snr_optimal', np.nan):.1f}" if np.isfinite(float(row.get("snr_optimal", np.nan))) else "",
+                    f"{row.get('mag_err_optimal', np.nan):.4f}" if np.isfinite(float(row.get("mag_err_optimal", np.nan))) else "",
+                    str(int(row.get("n_used", 0))) if np.isfinite(float(row.get("n_used", 0))) else "0",
+                    str(row.get("apply", False)),
+                ]
+                for c, text in enumerate(vals):
+                    self.apcorr_table.setItem(r, c, QTableWidgetItem(text))
+
+        # Status bar
+        if hasattr(self, "apcorr_status"):
+            if not df_sum.empty:
+                status = f"growth curve: {len(df_sum)} frames"
+                if "apply" in df_sum.columns:
+                    try:
+                        n_apply = int(df_sum["apply"].astype(str).str.lower().isin(["1", "true", "yes", "y"]).sum())
+                        status += f", apply={n_apply}"
+                        if n_apply == 0:
+                            status += " (all false: tune scatter_max/min_n)"
+                    except Exception:
+                        pass
+                self.apcorr_status.setText(status)
+            else:
+                self.apcorr_status.setText("growth curve: not found")
+
+        # Populate frame list
+        if hasattr(self, "apcorr_file_list"):
+            files = []
+            if not df_gc.empty and "file" in df_gc.columns:
+                files = sorted([str(x) for x in pd.unique(df_gc["file"].astype(str)) if str(x).strip()])
+            elif not df_sum.empty and "file" in df_sum.columns:
+                files = sorted([str(x) for x in pd.unique(df_sum["file"].astype(str)) if str(x).strip()])
+            self.apcorr_file_list.blockSignals(True)
+            self.apcorr_file_list.clear()
+            if files:
+                self.apcorr_file_list.addItems(files)
+            self.apcorr_file_list.blockSignals(False)
+            if files:
+                self.apcorr_file_list.setCurrentRow(0)
+                self._on_apcorr_file_changed(files[0])
+            else:
+                if hasattr(self, "apcorr_file_cand_table"):
+                    self.apcorr_file_cand_table.setRowCount(0)
+                self._clear_apcorr_plot("No growth curve data")
+
+    def _clear_apcorr_plot(self, message: str):
+        if not hasattr(self, "apcorr_ax_mag"):
+            return
+        for ax in (self.apcorr_ax_mag, self.apcorr_ax_err):
+            ax.clear()
+            ax.text(0.5, 0.5, message, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=9, color="#888")
+            ax.set_axis_off()
+        self.apcorr_canvas.draw_idle()
+
+    def _on_apcorr_file_changed(self, filename: str):
+        if not filename or not hasattr(self, "apcorr_file_cand_table"):
+            return
+
+        df_gc = getattr(self, "_growth_curve_df", None)
+        if df_gc is None or df_gc.empty or "file" not in df_gc.columns:
+            self.apcorr_file_cand_table.setRowCount(0)
+            self._clear_apcorr_plot("No growth curve data")
+            return
+
+        sub = df_gc[df_gc["file"].astype(str) == str(filename)].copy()
+        if sub.empty:
+            self.apcorr_file_cand_table.setRowCount(0)
+            self._clear_apcorr_plot("No growth curve data for this frame")
+            return
+
+        sub = sub.sort_values("r_px", kind="stable")
+
+        # Fill per-frame table
+        self.apcorr_file_cand_table.setRowCount(0)
+        for _, row in sub.iterrows():
+            r = self.apcorr_file_cand_table.rowCount()
+            self.apcorr_file_cand_table.insertRow(r)
+            vals = [
+                f"{row.get('scale', np.nan):.2f}" if np.isfinite(float(row.get("scale", np.nan))) else "",
+                f"{row.get('r_px', np.nan):.2f}" if np.isfinite(float(row.get("r_px", np.nan))) else "",
+                f"{row.get('median_mag', np.nan):.4f}" if np.isfinite(float(row.get("median_mag", np.nan))) else "",
+                f"{row.get('median_mag_err', np.nan):.4f}" if np.isfinite(float(row.get("median_mag_err", np.nan))) else "",
+                f"{row.get('median_snr', np.nan):.1f}" if np.isfinite(float(row.get("median_snr", np.nan))) else "",
+                str(int(row.get("n_stars", 0))) if np.isfinite(float(row.get("n_stars", 0))) else "0",
+                str(row.get("selected", False)),
+            ]
+            for c, text in enumerate(vals):
+                self.apcorr_file_cand_table.setItem(r, c, QTableWidgetItem(text))
+
+        # --- Plot ---
+        if not hasattr(self, "apcorr_ax_mag"):
+            return
+
+        ax_mag = self.apcorr_ax_mag
+        ax_err = self.apcorr_ax_err
+        ax_mag.clear()
+        ax_err.clear()
+
+        r_px = pd.to_numeric(sub["r_px"], errors="coerce").to_numpy(float)
+        med_mag = pd.to_numeric(sub.get("median_mag", np.nan), errors="coerce").to_numpy(float)
+        med_err = pd.to_numeric(sub.get("median_mag_err", np.nan), errors="coerce").to_numpy(float)
+        sel_mask = sub.get("selected", False)
+        if hasattr(sel_mask, "map"):
+            sel_mask = sel_mask.map(lambda v: _as_bool(v, False)).to_numpy(bool)
+        else:
+            sel_mask = np.zeros(len(sub), dtype=bool)
+
+        finite_mag = np.isfinite(r_px) & np.isfinite(med_mag)
+        finite_err = np.isfinite(r_px) & np.isfinite(med_err)
+
+        if not np.any(finite_mag) and not np.any(finite_err):
+            self._clear_apcorr_plot("No finite growth curve points")
+            return
+
+        filt_sel = self._resolve_filter_for_file(filename)
+        color_sel = self._filter_color(filt_sel)
+
+        # Get summary info for this frame
+        df_sum = getattr(self, "_apcorr_summary_df", pd.DataFrame())
+        apply_on = False
+        r_optimal = np.nan
+        apcorr_val = np.nan
+        if not df_sum.empty and "file" in df_sum.columns:
+            frame_sum = df_sum[df_sum["file"].astype(str) == str(filename)]
+            if not frame_sum.empty:
+                row_s = frame_sum.iloc[0]
+                apply_on = _as_bool(row_s.get("apply", False), False)
+                r_optimal = float(row_s.get("r_optimal", np.nan))
+                apcorr_val = float(row_s.get("apcorr", np.nan))
+
+        # --- Top subplot: Growth Curve (Magnitude vs Aperture Radius) ---
+        if np.any(finite_mag):
+            ax_mag.plot(r_px[finite_mag], med_mag[finite_mag], "-o",
+                        color=color_sel, linewidth=1.5, markersize=5,
+                        markeredgecolor="white", markeredgewidth=0.5,
+                        label=f"{filt_sel}")
+            if np.any(finite_err & finite_mag):
+                both = finite_mag & finite_err
+                ax_mag.errorbar(r_px[both], med_mag[both],
+                                yerr=med_err[both],
+                                fmt="none", ecolor=color_sel, alpha=0.3,
+                                capsize=2, linewidth=0.7)
+
+        # Mark optimal aperture
+        if np.isfinite(r_optimal):
+            ax_mag.axvline(r_optimal, color="#E53935", linewidth=1.5,
+                           linestyle="--", alpha=0.8, label=f"optimal r={r_optimal:.1f} px")
+            # Shade optimal region
+            ax_mag.axvspan(r_optimal * 0.9, r_optimal * 1.1,
+                           color="#E53935", alpha=0.08)
+
+        ax_mag.invert_yaxis()  # brighter = up
+        ax_mag.set_ylabel("Median Magnitude (inst)", fontsize=9)
+        title_str = f"{filename} | filter={filt_sel}"
+        if np.isfinite(apcorr_val):
+            title_str += f" | apcorr={apcorr_val:.4f}"
+        title_str += f" | apply={'ON' if apply_on else 'OFF'}"
+        ax_mag.set_title(title_str, fontsize=9)
+        ax_mag.grid(True, alpha=0.25)
+        ax_mag.legend(fontsize=8, frameon=False, loc="upper right")
+
+        # --- Bottom subplot: Error curve (U-shape) ---
+        if np.any(finite_err):
+            ax_err.plot(r_px[finite_err], med_err[finite_err], "-s",
+                        color="#1565C0", linewidth=1.8, markersize=5,
+                        markeredgecolor="white", markeredgewidth=0.5,
+                        label="median mag_err")
+
+        # Mark optimal (minimum error)
+        if np.isfinite(r_optimal) and np.any(finite_err):
+            opt_err_val = med_err[sel_mask & finite_err]
+            if len(opt_err_val) > 0:
+                ax_err.plot(r_optimal, opt_err_val[0], "o",
+                            color="#E53935", markersize=10, markeredgecolor="white",
+                            markeredgewidth=1.5, zorder=5,
+                            label=f"min err={opt_err_val[0]:.4f}")
+            ax_err.axvline(r_optimal, color="#E53935", linewidth=1.5,
+                           linestyle="--", alpha=0.8)
+            ax_err.axvspan(r_optimal * 0.9, r_optimal * 1.1,
+                           color="#E53935", alpha=0.08)
+
+        ax_err.set_xlabel("Aperture radius (px)", fontsize=9)
+        ax_err.set_ylabel("Median mag error", fontsize=9)
+        ax_err.set_title("Error vs Aperture (U-shape: Poisson left, sky noise right)", fontsize=9)
+        ax_err.grid(True, alpha=0.25)
+        ax_err.legend(fontsize=8, frameon=False, loc="upper right")
+
+        self.apcorr_fig.tight_layout()
+        self.apcorr_canvas.draw_idle()
+
     def closeEvent(self, event):
         """Ensure worker thread is stopped before closing window"""
         if self.worker and self.worker.isRunning():
             self.stop_photometry()
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            self.stop_apcorr()
         if not self._cleanup_worker(timeout_ms=10000):
             QMessageBox.warning(
                 self,
                 "Background Task Running",
                 "Photometry worker is still stopping. Please wait a few seconds and close again.",
+            )
+            event.ignore()
+            return
+        if not self._cleanup_apcorr_worker(timeout_ms=10000):
+            QMessageBox.warning(
+                self,
+                "Background Task Running",
+                "Apcorr worker is still stopping. Please wait a few seconds and close again.",
             )
             event.ignore()
             return
@@ -1155,6 +1918,9 @@ class ForcedPhotometryWindow(StepWindowBase):
             "annulus_min_gap_px": getattr(self.params.P, "annulus_min_gap_px", 6.0),
             "annulus_min_width_px": getattr(self.params.P, "annulus_min_width_px", 12.0),
             "annulus_sigma_clip": getattr(self.params.P, "annulus_sigma_clip", 3.0),
+            "apcorr_apply": getattr(self.params.P, "apcorr_apply", True),
+            "apcorr_use_min_n": getattr(self.params.P, "apcorr_use_min_n", 20),
+            "apcorr_scatter_max": getattr(self.params.P, "apcorr_scatter_max", 0.05),
         }
         self.project_state.store_step_data("forced_photometry", state_data)
 

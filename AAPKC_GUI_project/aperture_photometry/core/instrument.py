@@ -58,7 +58,7 @@ class InstrumentConfig:
         else:
             try:
                 self.binning = int(float(getattr(params.P, "binning_default", 2) or 2))
-            except:
+            except (TypeError, ValueError):
                 self.binning = 2
 
         # Calculate pixel scale and FOV
