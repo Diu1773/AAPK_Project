@@ -37,6 +37,14 @@ class DetectEngine(str, Enum):
     PEAK = "peak"
 
 
+class DetectMode(str, Enum):
+    """Detection preset mode"""
+    NORMAL = "normal"
+    CROWDED = "crowded"
+    FAINT = "faint"
+    CUSTOM = "custom"
+
+
 class BkgEdgeMethod(str, Enum):
     """Background 2D edge handling method"""
     PAD = "pad"
@@ -132,6 +140,10 @@ class ParallelConfig(BaseModel):
     resume_mode: bool = Field(
         default=True,
         description="Skip completed steps on restart"
+    )
+    step9_use_cache: bool = Field(
+        default=False,
+        description="Enable cache reuse specifically for Step9 forced photometry"
     )
     force_redetect: bool = Field(
         default=False,
@@ -440,6 +452,10 @@ class DetectionConfig(BaseModel):
     """Source detection configuration"""
     model_config = ConfigDict(validate_assignment=True)
 
+    mode: DetectMode = Field(
+        default=DetectMode.NORMAL,
+        description="Detection preset mode (normal/crowded/faint/custom)"
+    )
     engine: DetectEngine = Field(
         default=DetectEngine.SEGM,
         description="Detection engine (segm or peak)"
@@ -827,6 +843,34 @@ class GAIAConfig(BaseModel):
         default=True,
         description="Allow GAIA queries without cache"
     )
+    derived_enable: bool = Field(
+        default=True,
+        description="Write GAIA derived CSV (pmem + derived physics) in Step5"
+    )
+    pmem_method: str = Field(
+        default="gmm3d",
+        description="GAIA membership method for Step5 derived catalog: gmm3d|none"
+    )
+    pmem_ruwe_max: float = Field(
+        default=2.0,
+        ge=0.5, le=10.0,
+        description="RUWE upper bound for membership model fit"
+    )
+    pmem_min_visibility_periods: float = Field(
+        default=8.0,
+        ge=0.0, le=100.0,
+        description="Minimum visibility_periods_used for membership model fit"
+    )
+    pmem_min_valid: int = Field(
+        default=30,
+        ge=10, le=100000,
+        description="Minimum finite stars for pm/parallax membership estimation"
+    )
+    pmem_min_fit: int = Field(
+        default=25,
+        ge=10, le=100000,
+        description="Minimum stars used by membership model fit after weak quality cuts"
+    )
     snr_calib_min: float = Field(
         default=20.0,
         ge=1.0,
@@ -846,6 +890,61 @@ class IDMatchConfig(BaseModel):
     """Source ID matching configuration"""
     model_config = ConfigDict(validate_assignment=True)
 
+    mode: str = Field(
+        default="normal",
+        description="Matching mode: normal | crowded | faint | custom"
+    )
+    gaia_g_limit: float = Field(
+        default=18.0,
+        ge=10.0, le=25.0,
+        description="Gaia G magnitude limit for Gaia-only reference mode"
+    )
+    use_gaia_refs_only: bool = Field(
+        default=False,
+        description="Use only Gaia-linked reference entries"
+    )
+    match_r_fwhm: float = Field(
+        default=0.8,
+        ge=0.1, le=5.0,
+        description="Auto-match radius scale in units of FWHM"
+    )
+    two_pass_enable: bool = Field(
+        default=True,
+        description="Enable two-pass matching (tight then loose)"
+    )
+    tight_radius_arcsec: float = Field(
+        default=1.0,
+        ge=0.1, le=30.0,
+        description="Pass-1 tight match radius (arcsec)"
+    )
+    loose_radius_arcsec: float = Field(
+        default=3.0,
+        ge=0.1, le=60.0,
+        description="Pass-2 loose match radius (arcsec)"
+    )
+    adaptive_retry_threshold: float = Field(
+        default=0.5,
+        ge=0.0, le=1.0,
+        description="Retry with wider radius when match_rate falls below this threshold"
+    )
+    fwhm_adaptive_floor: bool = Field(
+        default=True,
+        description="Scale matching radii with FWHM when possible"
+    )
+    geom_correction_enable: bool = Field(
+        default=True,
+        description="Enable affine/shift geometric correction before pass 2"
+    )
+    min_correction_pairs: int = Field(
+        default=3,
+        ge=2, le=200,
+        description="Minimum seed pairs to enable geometric correction"
+    )
+    min_affine_pairs: int = Field(
+        default=6,
+        ge=3, le=200,
+        description="Minimum seed pairs to enable affine correction"
+    )
     tol_px: float = Field(
         default=2.0,
         ge=0.1, le=20.0,
@@ -863,6 +962,35 @@ class IDMatchConfig(BaseModel):
     use_qc_pass_only: bool = Field(
         default=True,
         description="Only use QC-passed frames for ID matching"
+    )
+    use_wcs_qc_gate: bool = Field(
+        default=True,
+        description="Apply frame-level WCS QC gate before ID matching"
+    )
+    wcs_qc_min_match_rate: float = Field(
+        default=0.20,
+        ge=0.0, le=1.0,
+        description="Minimum WCS QC match rate"
+    )
+    wcs_qc_min_match_n: int = Field(
+        default=20,
+        ge=0, le=100000,
+        description="Minimum WCS QC match count"
+    )
+    wcs_qc_max_rms_px: float = Field(
+        default=2.5,
+        ge=0.0, le=50.0,
+        description="Maximum WCS QC RMS (px)"
+    )
+    wcs_qc_min_inlier_rate: float = Field(
+        default=0.50,
+        ge=0.0, le=1.0,
+        description="Minimum WCS QC inlier rate"
+    )
+    wcs_qc_max_p99_px: float = Field(
+        default=5.0,
+        ge=0.0, le=100.0,
+        description="Maximum WCS QC p99 residual (px)"
     )
 
 
@@ -931,6 +1059,15 @@ class MasterEditorConfig(BaseModel):
         default=2.0,
         ge=0.1, le=10.0,
         description="Max separation for adding GAIA sources (arcsec)"
+    )
+    membership_overlay_enable: bool = Field(
+        default=False,
+        description="Enable membership-based color overlay in Step8 editor"
+    )
+    membership_threshold: float = Field(
+        default=0.5,
+        ge=0.0, le=1.0,
+        description="Membership probability threshold for member color"
     )
 
 
@@ -1067,6 +1204,14 @@ class CMDConfig(BaseModel):
         default=5000,
         ge=100,
         description="Maximum sources for CMD"
+    )
+    membership_mode: str = Field(
+        default="off",
+        description="Gaia membership mode for CMD viewer: off|loose|normal|strict"
+    )
+    membership_compare: bool = Field(
+        default=True,
+        description="Overlay all stars(gray) and selected members(color) in CMD viewer"
     )
     zp: ZPConfig = Field(default_factory=ZPConfig)
     color: ColorConfig = Field(default_factory=ColorConfig)
@@ -1398,7 +1543,11 @@ class Parameters(BaseModel):
         print(f"CACHE_DIR     : {self.cache_dir}")
         print(f"TARGET        : {self.target.name}")
         print(f"parallel_mode : {self.parallel.mode.value} | max_workers={self.parallel.max_workers}")
-        print(f"resume_mode   : {self.parallel.resume_mode} | force_redetect={self.parallel.force_redetect}")
+        print(
+            f"resume_mode   : {self.parallel.resume_mode} | step9_use_cache={self.parallel.step9_use_cache} | "
+            f"force_redetect={self.parallel.force_redetect}"
+        )
+        print(f"idmatch_mode  : {self.idmatch.mode} | gaia_only={self.idmatch.use_gaia_refs_only}")
         print(f"FWHM range    : {self.fwhm.px_min:.2f} ~ {self.fwhm.px_max:.2f} px")
         print(f"detect_sigma  : base={self.detection.sigma}")
         print(f"camera        : gain={self.instrument.gain_e_per_adu} e-/ADU | rdnoise={self.instrument.rdnoise_e} e-")

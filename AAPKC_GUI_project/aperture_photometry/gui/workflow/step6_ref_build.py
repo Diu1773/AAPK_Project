@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QFormLayout, QProgressBar, QDoubleSpinBox, QSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QWidget,
-    QDialog, QDialogButtonBox, QTabWidget, QCheckBox, QComboBox
+    QDialog, QDialogButtonBox, QTabWidget, QCheckBox, QComboBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -498,6 +498,28 @@ class RefBuildWorker(QThread):
             return None
 
     def _load_gaia_table(self) -> Optional[pd.DataFrame]:
+        derived_df = None
+        derived_candidates = [
+            step5_dir(self.result_dir) / "gaia_derived.csv",
+            self.result_dir / "gaia_derived.csv",
+        ]
+        for dpath in derived_candidates:
+            if not dpath.exists():
+                continue
+            try:
+                ddf = pd.read_csv(dpath)
+            except Exception:
+                continue
+            if ddf.empty:
+                continue
+            if "source_id" in ddf.columns:
+                ddf["source_id"] = parse_int64_series(ddf["source_id"]).astype("Int64")
+                ddf = ddf[ddf["source_id"].notna()].copy()
+            derived_df = ddf
+            if ("ra" in ddf.columns) and ("dec" in ddf.columns):
+                return ddf
+            break
+
         gaia_path = step5_dir(self.result_dir) / "gaia_fov.ecsv"
         if not gaia_path.exists():
             gaia_path = legacy_step7_wcs_dir(self.result_dir) / "gaia_fov.ecsv"
@@ -507,6 +529,12 @@ class RefBuildWorker(QThread):
             df = read_ecsv_int64_source_id(gaia_path)
             if "ra" not in df.columns or "dec" not in df.columns:
                 return None
+            if (derived_df is not None) and ("source_id" in df.columns) and ("source_id" in derived_df.columns):
+                df["source_id"] = parse_int64_series(df["source_id"]).astype("Int64")
+                add_cols = [c for c in derived_df.columns if c not in df.columns and c != "source_id"]
+                if add_cols:
+                    use = derived_df[["source_id"] + add_cols].drop_duplicates(subset=["source_id"], keep="first")
+                    df = df.merge(use, on="source_id", how="left")
             return df
         except Exception:
             return None
@@ -549,9 +577,28 @@ class RefBuildWorker(QThread):
         out["gaia_source_id"] = pd.Series(pd.array([pd.NA] * len(out), dtype="Int64"), index=out.index)
         out["gaia_ra_deg"] = np.nan
         out["gaia_dec_deg"] = np.nan
-        out["phot_g_mean_mag"] = np.nan
-        out["phot_bp_mean_mag"] = np.nan
-        out["phot_rp_mean_mag"] = np.nan
+        _GAIA_FLOAT_COLS = [
+            # photometry
+            "phot_g_mean_mag", "phot_bp_mean_mag", "phot_rp_mean_mag",
+            "phot_g_mean_flux_over_error", "phot_bp_mean_flux_over_error", "phot_rp_mean_flux_over_error",
+            "bp_rp",
+            # quality
+            "ruwe", "visibility_periods_used",
+            # astrometry (membership set B)
+            "parallax", "parallax_error",
+            "pmra", "pmra_error", "pmdec", "pmdec_error",
+            "radial_velocity", "radial_velocity_error",
+            # astrophysical params (set C)
+            "teff_gspphot", "logg_gspphot", "mh_gspphot",
+            "distance_gspphot", "azero_gspphot", "ag_gspphot",
+            # derived / membership
+            "gaia_pmem",
+            "distance_pc", "distance_modulus", "abs_g_mag", "parallax_snr",
+            "pm_total_masyr", "vtan_kms",
+        ]
+
+        for col in _GAIA_FLOAT_COLS:
+            out[col] = np.nan
 
         src_idx = np.where(src_mask)[0]
         match_idx = src_idx[ok]
@@ -567,15 +614,10 @@ class RefBuildWorker(QThread):
         out.loc[match_idx, "gaia_ra_deg"] = gaia_ra[gaia_idx]
         out.loc[match_idx, "gaia_dec_deg"] = gaia_dec[gaia_idx]
 
-        if "phot_g_mean_mag" in gaia_df.columns:
-            g = pd.to_numeric(gaia_df["phot_g_mean_mag"], errors="coerce").to_numpy()
-            out.loc[match_idx, "phot_g_mean_mag"] = g[gaia_idx]
-        if "phot_bp_mean_mag" in gaia_df.columns:
-            bp = pd.to_numeric(gaia_df["phot_bp_mean_mag"], errors="coerce").to_numpy()
-            out.loc[match_idx, "phot_bp_mean_mag"] = bp[gaia_idx]
-        if "phot_rp_mean_mag" in gaia_df.columns:
-            rp = pd.to_numeric(gaia_df["phot_rp_mean_mag"], errors="coerce").to_numpy()
-            out.loc[match_idx, "phot_rp_mean_mag"] = rp[gaia_idx]
+        for col in _GAIA_FLOAT_COLS:
+            if col in gaia_df.columns:
+                vals = pd.to_numeric(gaia_df[col], errors="coerce").to_numpy()
+                out.loc[match_idx, col] = vals[gaia_idx]
 
         out["gaia_G"] = out["phot_g_mean_mag"]
         out["gaia_BP"] = out["phot_bp_mean_mag"]
@@ -1648,8 +1690,15 @@ class RefBuildWindow(StepWindowBase):
         self.plot_date_combo.addItem("All")
         self.plot_date_combo.currentIndexChanged.connect(self._on_plot_date_changed)
         plot_controls.addWidget(self.plot_date_combo)
+        btn_save_plot = QPushButton("Save QC Plot")
+        btn_save_plot.clicked.connect(self.save_qc_plot_image)
+        plot_controls.addWidget(btn_save_plot)
         plot_controls.addStretch()
         plot_layout.addLayout(plot_controls)
+        self.plot_help_label = QLabel("")
+        self.plot_help_label.setWordWrap(True)
+        self.plot_help_label.setStyleSheet("QLabel { color: #455A64; font-size: 9pt; }")
+        plot_layout.addWidget(self.plot_help_label)
         self.plot_canvas = FigureCanvas(Figure(figsize=(8, 4)))
         self.plot_canvas.setMinimumHeight(260)
         plot_layout.addWidget(self.plot_canvas)
@@ -1834,6 +1883,8 @@ class RefBuildWindow(StepWindowBase):
         form = QFormLayout()
         layout.addLayout(form)
 
+        form.addRow(QLabel("── Frame selection ─────────────────────"))
+
         sat_spin = QDoubleSpinBox()
         sat_spin.setRange(0.0, 100.0)
         sat_spin.setDecimals(1)
@@ -1851,6 +1902,8 @@ class RefBuildWindow(StepWindowBase):
         per_date_check = QCheckBox("Per-date reference (default)")
         per_date_check.setChecked(bool(getattr(self.params.P, "ref_per_date", True)))
         form.addRow("Per-date reference:", per_date_check)
+
+        form.addRow(QLabel("── Reference catalog quality ───────────"))
 
         max_src_spin = QSpinBox()
         max_src_spin.setRange(0, 50000)
@@ -1892,6 +1945,8 @@ class RefBuildWindow(StepWindowBase):
         peak_spin.setValue(float(getattr(self.params.P, "ref_cat_min_peak_adu", 0.0)))
         form.addRow("Ref min peak/flux (0=off):", peak_spin)
 
+        form.addRow(QLabel("── Gaia / hybrid reference ─────────────"))
+
         match_r_spin = QDoubleSpinBox()
         match_r_spin.setRange(0.1, 30.0)
         match_r_spin.setDecimals(2)
@@ -1904,6 +1959,8 @@ class RefBuildWindow(StepWindowBase):
         gaia_query_mag_spin.setSingleStep(0.5)
         gaia_query_mag_spin.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
         form.addRow("Gaia Query Mag Max (Step5):", gaia_query_mag_spin)
+
+        form.addRow(QLabel("── WCS match quality gate ──────────────"))
 
         min_rate_spin = QDoubleSpinBox()
         min_rate_spin.setRange(0.0, 1.0)
@@ -2151,11 +2208,14 @@ class RefBuildWindow(StepWindowBase):
             self.stats_table.setColumnCount(0)
             return
 
+        df["qc_pass"] = self._compute_qc_pass_mask(df).astype(bool)
+
         preferred_cols = [
             "date_key",
             "file",
             "filter",
             "wcs_ok",
+            "qc_pass",
             "match_rate_eff",
             "match_rate",
             "match_rate_cat",
@@ -2178,14 +2238,23 @@ class RefBuildWindow(StepWindowBase):
 
         self.stats_table.setColumnCount(len(cols))
         self.stats_table.setRowCount(len(df))
-        self.stats_table.setHorizontalHeaderLabels(cols)
+        header_map = {
+            "match_rate_eff": "match_rate_eff (Gaia)",
+            "match_rate": "match_rate_det (Gaia/det)",
+            "match_rate_cat": "match_rate_cat (Gaia/cat)",
+            "n_match": "n_match (Gaia)",
+            "qc_pass": "qc_pass (Step6 gate)",
+        }
+        self.stats_table.setHorizontalHeaderLabels([header_map.get(c, c) for c in cols])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.stats_table.horizontalHeader().setStretchLastSection(True)
 
         for r, (_, row) in enumerate(df.iterrows()):
             for c, col in enumerate(cols):
                 val = row.get(col, "")
-                if isinstance(val, float):
+                if col in ("wcs_ok", "qc_pass"):
+                    text = "Y" if bool(val) else ""
+                elif isinstance(val, float):
                     if "rate" in col or "sep_" in col:
                         text = f"{val:.3f}" if np.isfinite(val) else ""
                     else:
@@ -2194,9 +2263,86 @@ class RefBuildWindow(StepWindowBase):
                     text = str(val)
                 self.stats_table.setItem(r, c, QTableWidgetItem(text))
 
+    def _compute_qc_pass_mask(self, df: pd.DataFrame) -> pd.Series:
+        if df is None or df.empty:
+            return pd.Series(dtype=bool)
+
+        work = df.copy()
+        pass_mask = pd.Series(True, index=work.index, dtype=bool)
+
+        if "wcs_ok" in work.columns:
+            pass_mask &= work["wcs_ok"].fillna(False).astype(bool)
+
+        if "match_rate" in work.columns:
+            work["match_rate"] = pd.to_numeric(work["match_rate"], errors="coerce")
+        else:
+            work["match_rate"] = np.nan
+        if "match_rate_cat" in work.columns:
+            work["match_rate_cat"] = pd.to_numeric(work["match_rate_cat"], errors="coerce")
+        else:
+            work["match_rate_cat"] = np.nan
+        if "match_rate_eff" in work.columns:
+            work["match_rate_eff"] = pd.to_numeric(work["match_rate_eff"], errors="coerce")
+        else:
+            work["match_rate_eff"] = np.nan
+        work["match_rate_eff"] = pd.concat(
+            [work["match_rate"], work["match_rate_cat"], work["match_rate_eff"]],
+            axis=1,
+        ).max(axis=1, skipna=True)
+
+        if "n_match" in work.columns:
+            work["n_match"] = pd.to_numeric(work["n_match"], errors="coerce")
+        else:
+            work["n_match"] = np.nan
+        if "sep_med_arcsec" in work.columns:
+            work["sep_med_arcsec"] = pd.to_numeric(work["sep_med_arcsec"], errors="coerce")
+        else:
+            work["sep_med_arcsec"] = np.nan
+        if "sep_p90_arcsec" in work.columns:
+            work["sep_p90_arcsec"] = pd.to_numeric(work["sep_p90_arcsec"], errors="coerce")
+        else:
+            work["sep_p90_arcsec"] = np.nan
+        if "dup_rate" in work.columns:
+            work["dup_rate"] = pd.to_numeric(work["dup_rate"], errors="coerce")
+        else:
+            work["dup_rate"] = np.nan
+
+        min_rate = float(getattr(self.params.P, "ref_wcs_min_match_rate", 0.2))
+        min_match = int(getattr(self.params.P, "ref_wcs_min_match_n", 50))
+        max_sep_med = float(getattr(self.params.P, "ref_wcs_max_sep_med_arcsec", 1.5))
+        max_sep_p90 = float(getattr(self.params.P, "ref_wcs_max_sep_p90_arcsec", 2.5))
+        max_dup = float(getattr(self.params.P, "ref_wcs_max_dup_rate", 0.1))
+
+        if min_rate > 0 and work["match_rate_eff"].notna().any():
+            pass_mask &= work["match_rate_eff"] >= min_rate
+        if min_match > 0 and work["n_match"].notna().any():
+            pass_mask &= work["n_match"] >= min_match
+        if np.isfinite(max_sep_med) and max_sep_med > 0 and work["sep_med_arcsec"].notna().any():
+            pass_mask &= work["sep_med_arcsec"] <= max_sep_med
+        if np.isfinite(max_sep_p90) and max_sep_p90 > 0 and work["sep_p90_arcsec"].notna().any():
+            pass_mask &= work["sep_p90_arcsec"] <= max_sep_p90
+        if np.isfinite(max_dup) and max_dup > 0 and work["dup_rate"].notna().any():
+            pass_mask &= work["dup_rate"] <= max_dup
+
+        return pass_mask.fillna(False).astype(bool)
+
+    def _qc_help_text(self) -> str:
+        min_rate = float(getattr(self.params.P, "ref_wcs_min_match_rate", 0.2))
+        min_match = int(getattr(self.params.P, "ref_wcs_min_match_n", 50))
+        max_sep_med = float(getattr(self.params.P, "ref_wcs_max_sep_med_arcsec", 1.5))
+        max_sep_p90 = float(getattr(self.params.P, "ref_wcs_max_sep_p90_arcsec", 2.5))
+        max_dup = float(getattr(self.params.P, "ref_wcs_max_dup_rate", 0.1))
+        return (
+            "match_rate*는 Gaia 기준 매칭률입니다 (frame ID 매칭률 아님). "
+            f"QC pass: mr_eff>={min_rate:.2f}, n_match>={min_match}, "
+            f"sep_med<={max_sep_med:.2f}\", sep_p90<={max_sep_p90:.2f}\", dup<={max_dup:.2f}"
+        )
+
     def _update_plot_tab(self, summary: Optional[dict] = None) -> None:
         if not hasattr(self, "plot_canvas") or self.plot_canvas is None:
             return
+        if hasattr(self, "plot_help_label"):
+            self.plot_help_label.setText(self._qc_help_text())
         fig = self.plot_canvas.figure
         fig.clear()
         ax1 = fig.add_subplot(1, 2, 1)
@@ -2281,6 +2427,7 @@ class RefBuildWindow(StepWindowBase):
             df_plot = df[df["date_key"].astype(str) == str(selected_date)]
             if df_plot.empty:
                 df_plot = df
+        qc_pass = self._compute_qc_pass_mask(df_plot) if not df_plot.empty else pd.Series(dtype=bool)
 
         for flt in filters:
             sub = df_plot[df_plot["filter"] == flt] if "filter" in df_plot.columns else df_plot
@@ -2301,6 +2448,13 @@ class RefBuildWindow(StepWindowBase):
                 color=color_map.get(flt, "#90A4AE"),
                 edgecolors="none",
             )
+
+        min_rate = float(getattr(self.params.P, "ref_wcs_min_match_rate", 0.2))
+        max_sep_med = float(getattr(self.params.P, "ref_wcs_max_sep_med_arcsec", 1.5))
+        if np.isfinite(min_rate) and min_rate > 0:
+            ax1.axhline(min_rate, color="#C62828", linestyle="--", linewidth=1.0, alpha=0.7)
+        if np.isfinite(max_sep_med) and max_sep_med > 0:
+            ax1.axvline(max_sep_med, color="#C62828", linestyle="--", linewidth=1.0, alpha=0.7)
 
         selected_frames: Dict[str, str] = {}
         if summary and isinstance(summary, dict):
@@ -2342,9 +2496,11 @@ class RefBuildWindow(StepWindowBase):
                 s=140, marker="*", color="#FF5252", edgecolors="#212121", linewidths=0.8, zorder=5
             )
 
-        ax1.set_title("Match Rate Eff vs Sep (arcsec)")
+        pass_n = int(qc_pass.sum()) if len(qc_pass) else 0
+        total_n = len(df_plot)
+        ax1.set_title(f"Gaia Match Rate Eff vs Sep (QC pass {pass_n}/{total_n})")
         ax1.set_xlabel("Sep med (arcsec)")
-        ax1.set_ylabel("Match rate (effective)")
+        ax1.set_ylabel("Gaia match rate (effective)")
         ax1.grid(True, alpha=0.2)
         ax1.legend(fontsize=7, loc="best")
 
@@ -2355,6 +2511,35 @@ class RefBuildWindow(StepWindowBase):
 
         fig.tight_layout()
         self.plot_canvas.draw_idle()
+
+    def save_qc_plot_image(self):
+        if not hasattr(self, "plot_canvas") or self.plot_canvas is None:
+            return
+        out_dir = step6_dir(self.params.P.result_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        date_tag = "all"
+        if hasattr(self, "plot_date_combo") and self.plot_date_combo.count():
+            txt = self.plot_date_combo.currentText().strip()
+            if txt and txt != "All":
+                date_tag = txt
+        safe_tag = re.sub(r"[^0-9A-Za-z_.-]+", "_", date_tag).strip("_") or "all"
+        default_name = out_dir / f"ref_qc_plot_{safe_tag}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Step6 QC Plot",
+            str(default_name),
+            "PNG Image (*.png);;PDF Document (*.pdf);;SVG Image (*.svg)"
+        )
+        if not path:
+            return
+        try:
+            self.plot_canvas.figure.savefig(path, dpi=180, bbox_inches="tight")
+            self.log(f"[REF][QC] plot saved: {path}")
+            QMessageBox.information(self, "Saved", f"QC plot saved:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", f"Failed to save QC plot:\n{e}")
 
     def _on_plot_date_changed(self, index: int) -> None:
         if index < 0:

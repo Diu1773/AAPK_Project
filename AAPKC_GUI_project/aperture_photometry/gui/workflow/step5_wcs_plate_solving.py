@@ -161,6 +161,304 @@ def _coerce_source_id_int64(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _logpdf_gauss(x: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
+    d = x.shape[1]
+    cov_r = np.asarray(cov, float) + np.eye(d) * 1e-6
+    sign, logdet = np.linalg.slogdet(cov_r)
+    if sign <= 0:
+        return np.full(x.shape[0], -np.inf, dtype=float)
+    try:
+        inv = np.linalg.inv(cov_r)
+    except Exception:
+        return np.full(x.shape[0], -np.inf, dtype=float)
+    diff = x - mu[None, :]
+    q = np.einsum("ni,ij,nj->n", diff, inv, diff)
+    return -0.5 * (d * np.log(2.0 * np.pi) + logdet + q)
+
+
+def _fit_two_component_gmm(x_fit: np.ndarray):
+    n, d = x_fit.shape
+    if n < max(30, d * 8):
+        return None
+
+    center = np.nanmedian(x_fit, axis=0)
+    mad = np.nanmedian(np.abs(x_fit - center), axis=0)
+    mad = np.where(np.isfinite(mad) & (mad > 1e-6), mad, 1.0)
+    z = (x_fit - center[None, :]) / mad[None, :]
+    d2 = np.sum(z * z, axis=1)
+    q40 = float(np.nanquantile(d2, 0.40))
+    m0 = d2 <= q40
+    if m0.sum() < max(12, d * 3) or m0.sum() > (n - max(12, d * 3)):
+        order = np.argsort(d2)
+        m0 = np.zeros(n, dtype=bool)
+        m0[order[: max(n // 2, 1)]] = True
+    m1 = ~m0
+
+    def _cov(arr: np.ndarray) -> np.ndarray:
+        if arr.shape[0] < (d + 1):
+            return np.eye(d, dtype=float)
+        c = np.cov(arr, rowvar=False)
+        if np.ndim(c) == 0:
+            c = np.eye(d, dtype=float) * float(c)
+        return np.asarray(c, float) + np.eye(d, dtype=float) * 1e-4
+
+    pi = np.array([max(m0.mean(), 1e-3), max(m1.mean(), 1e-3)], dtype=float)
+    pi /= pi.sum()
+    mu = np.vstack([
+        np.nanmean(x_fit[m0], axis=0),
+        np.nanmean(x_fit[m1], axis=0),
+    ])
+    cov = np.stack([_cov(x_fit[m0]), _cov(x_fit[m1])], axis=0)
+    last_ll = -np.inf
+
+    for _ in range(80):
+        lp0 = np.log(max(pi[0], 1e-9)) + _logpdf_gauss(x_fit, mu[0], cov[0])
+        lp1 = np.log(max(pi[1], 1e-9)) + _logpdf_gauss(x_fit, mu[1], cov[1])
+        m = np.maximum(lp0, lp1)
+        e0 = np.exp(lp0 - m)
+        e1 = np.exp(lp1 - m)
+        den = e0 + e1 + 1e-12
+        r0 = e0 / den
+        r1 = e1 / den
+        nk = np.array([r0.sum(), r1.sum()], dtype=float)
+        if np.any(nk < (d + 2)):
+            break
+        pi = nk / float(n)
+        mu[0] = (r0[:, None] * x_fit).sum(axis=0) / nk[0]
+        mu[1] = (r1[:, None] * x_fit).sum(axis=0) / nk[1]
+        for k, rk in enumerate((r0, r1)):
+            diff = x_fit - mu[k][None, :]
+            cov[k] = (diff.T * rk).dot(diff) / max(nk[k], 1.0)
+            cov[k] += np.eye(d, dtype=float) * 1e-4
+        ll = float(np.sum(m + np.log(den)))
+        if np.isfinite(last_ll):
+            if abs(ll - last_ll) < 1e-4 * max(1.0, abs(last_ll)):
+                break
+        last_ll = ll
+
+    det0 = abs(float(np.linalg.det(cov[0])))
+    det1 = abs(float(np.linalg.det(cov[1])))
+    cluster_idx = 0 if det0 <= det1 else 1
+    return {
+        "pi": pi,
+        "mu": mu,
+        "cov": cov,
+        "cluster_idx": int(cluster_idx),
+    }
+
+
+def _compute_gaia_pmem_gmm(
+    df: pd.DataFrame,
+    *,
+    ruwe_max: float = 2.0,
+    vpu_min: float = 8.0,
+    min_valid: int = 30,
+    min_fit: int = 25,
+) -> tuple[np.ndarray, str]:
+    pmem = np.full(len(df), np.nan, dtype=float)
+    req = ("pmra", "pmdec", "parallax")
+    if not all(c in df.columns for c in req):
+        return pmem, "pm/parallax columns missing"
+
+    pmra = pd.to_numeric(df["pmra"], errors="coerce").to_numpy(float)
+    pmdec = pd.to_numeric(df["pmdec"], errors="coerce").to_numpy(float)
+    plx = pd.to_numeric(df["parallax"], errors="coerce").to_numpy(float)
+    finite = np.isfinite(pmra) & np.isfinite(pmdec) & np.isfinite(plx)
+    n_valid = int(finite.sum())
+    if n_valid < max(10, int(min_valid)):
+        return pmem, f"too_few_valid:{n_valid}"
+
+    fit_mask = finite.copy()
+    if np.isfinite(ruwe_max) and ruwe_max > 0 and ("ruwe" in df.columns):
+        ruwe = pd.to_numeric(df["ruwe"], errors="coerce").to_numpy(float)
+        fit_mask &= (~np.isfinite(ruwe)) | (ruwe <= float(ruwe_max))
+    if np.isfinite(vpu_min) and vpu_min > 0 and ("visibility_periods_used" in df.columns):
+        vpu = pd.to_numeric(df["visibility_periods_used"], errors="coerce").to_numpy(float)
+        fit_mask &= (~np.isfinite(vpu)) | (vpu >= float(vpu_min))
+    if int(fit_mask.sum()) < max(10, int(min_fit)):
+        fit_mask = finite.copy()
+
+    x_fit = np.column_stack([pmra[fit_mask], pmdec[fit_mask], plx[fit_mask]])
+    model = _fit_two_component_gmm(x_fit)
+    if model is None:
+        return pmem, "gmm_fit_failed"
+
+    x_all = np.column_stack([pmra[finite], pmdec[finite], plx[finite]])
+    pi = np.asarray(model["pi"], float)
+    mu = np.asarray(model["mu"], float)
+    cov = np.asarray(model["cov"], float)
+    k_cluster = int(model["cluster_idx"])
+
+    lp0 = np.log(max(pi[0], 1e-9)) + _logpdf_gauss(x_all, mu[0], cov[0])
+    lp1 = np.log(max(pi[1], 1e-9)) + _logpdf_gauss(x_all, mu[1], cov[1])
+    m = np.maximum(lp0, lp1)
+    e0 = np.exp(lp0 - m)
+    e1 = np.exp(lp1 - m)
+    den = e0 + e1 + 1e-12
+    r0 = e0 / den
+    r1 = e1 / den
+    p_cluster = r0 if k_cluster == 0 else r1
+
+    pmem[finite] = np.clip(p_cluster, 0.0, 1.0)
+    note = f"gaia_gmm_3d(valid={n_valid}, fit={int(fit_mask.sum())})"
+    return pmem, note
+
+
+def _build_gaia_derived_df(
+    gaia_df: pd.DataFrame,
+    *,
+    pmem_method: str = "gmm3d",
+    pmem_ruwe_max: float = 2.0,
+    pmem_vpu_min: float = 8.0,
+    pmem_min_valid: int = 30,
+    pmem_min_fit: int = 25,
+) -> tuple[pd.DataFrame, str]:
+    base_cols = [
+        "source_id", "ra", "dec",
+        "phot_g_mean_mag", "phot_bp_mean_mag", "phot_rp_mean_mag", "bp_rp",
+        "parallax", "parallax_error",
+        "pmra", "pmra_error", "pmdec", "pmdec_error",
+        "ruwe", "visibility_periods_used",
+        "radial_velocity", "radial_velocity_error",
+        "teff_gspphot", "logg_gspphot", "mh_gspphot",
+        "distance_gspphot", "azero_gspphot", "ag_gspphot",
+    ]
+    extra_cols = [
+        "gaia_pmem",
+        "distance_pc", "distance_modulus", "abs_g_mag", "parallax_snr",
+        "pm_total_masyr", "vtan_kms",
+    ]
+    out_cols = base_cols + extra_cols
+    if gaia_df is None or gaia_df.empty:
+        return pd.DataFrame(columns=out_cols), "empty"
+
+    df = gaia_df.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    if "source_id" not in df.columns:
+        return pd.DataFrame(columns=out_cols), "source_id_missing"
+    sid = parse_int64_series(df["source_id"])
+    valid_sid = sid.notna()
+    df = df.loc[valid_sid].copy()
+    sid = sid.loc[valid_sid]
+    if len(df) == 0:
+        return pd.DataFrame(columns=out_cols), "empty_after_source_id"
+    df["source_id"] = sid.astype("int64")
+
+    out = pd.DataFrame(index=df.index)
+    for c in base_cols:
+        if c in df.columns:
+            out[c] = df[c]
+
+    plx = pd.to_numeric(df["parallax"], errors="coerce").to_numpy(float) if "parallax" in df.columns else np.full(len(df), np.nan)
+    plx_err = pd.to_numeric(df["parallax_error"], errors="coerce").to_numpy(float) if "parallax_error" in df.columns else np.full(len(df), np.nan)
+    gmag = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce").to_numpy(float) if "phot_g_mean_mag" in df.columns else np.full(len(df), np.nan)
+    pmra = pd.to_numeric(df["pmra"], errors="coerce").to_numpy(float) if "pmra" in df.columns else np.full(len(df), np.nan)
+    pmdec = pd.to_numeric(df["pmdec"], errors="coerce").to_numpy(float) if "pmdec" in df.columns else np.full(len(df), np.nan)
+
+    distance_pc = np.full(len(df), np.nan, dtype=float)
+    m_plx = np.isfinite(plx) & (plx > 0)
+    distance_pc[m_plx] = 1000.0 / plx[m_plx]
+    out["distance_pc"] = distance_pc
+
+    dist_mod = np.full(len(df), np.nan, dtype=float)
+    m_dm = np.isfinite(distance_pc) & (distance_pc > 0)
+    dist_mod[m_dm] = 5.0 * np.log10(distance_pc[m_dm]) - 5.0
+    out["distance_modulus"] = dist_mod
+
+    abs_g = np.full(len(df), np.nan, dtype=float)
+    m_abs = np.isfinite(gmag) & np.isfinite(dist_mod)
+    abs_g[m_abs] = gmag[m_abs] - dist_mod[m_abs]
+    out["abs_g_mag"] = abs_g
+
+    plx_snr = np.full(len(df), np.nan, dtype=float)
+    m_plx_snr = np.isfinite(plx) & np.isfinite(plx_err) & (plx_err > 0)
+    plx_snr[m_plx_snr] = plx[m_plx_snr] / plx_err[m_plx_snr]
+    out["parallax_snr"] = plx_snr
+
+    pm_total = np.full(len(df), np.nan, dtype=float)
+    m_pm = np.isfinite(pmra) & np.isfinite(pmdec)
+    pm_total[m_pm] = np.sqrt(pmra[m_pm] ** 2 + pmdec[m_pm] ** 2)
+    out["pm_total_masyr"] = pm_total
+
+    vtan = np.full(len(df), np.nan, dtype=float)
+    m_vtan = np.isfinite(pm_total) & np.isfinite(distance_pc)
+    vtan[m_vtan] = 4.74047 * (pm_total[m_vtan] / 1000.0) * distance_pc[m_vtan]
+    out["vtan_kms"] = vtan
+
+    method_key = str(pmem_method).strip().lower()
+    if method_key in ("", "none", "off", "disable", "disabled"):
+        out["gaia_pmem"] = np.full(len(df), np.nan, dtype=float)
+        note = "pmem_disabled"
+    elif method_key in ("gmm", "gmm3d", "gmm_3d", "gaia_gmm_3d"):
+        p, note = _compute_gaia_pmem_gmm(
+            df,
+            ruwe_max=float(pmem_ruwe_max),
+            vpu_min=float(pmem_vpu_min),
+            min_valid=int(pmem_min_valid),
+            min_fit=int(pmem_min_fit),
+        )
+        out["gaia_pmem"] = p
+    else:
+        out["gaia_pmem"] = np.full(len(df), np.nan, dtype=float)
+        note = f"unknown_method:{method_key}"
+
+    for c in out_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = out[out_cols].copy()
+    return out.reset_index(drop=True), note
+
+
+def _save_gaia_derived_catalog(
+    *,
+    result_dir: Path,
+    gaia_df: pd.DataFrame,
+    params,
+    center: SkyCoord | None,
+    radius_deg: float,
+    source_tag: str,
+):
+    p = getattr(params, "P", params)
+    if not bool(getattr(p, "gaia_derived_enable", True)):
+        return
+
+    method = str(getattr(p, "gaia_pmem_method", "gmm3d")).strip().lower() or "gmm3d"
+    ruwe_max = float(getattr(p, "gaia_pmem_ruwe_max", 2.0))
+    vpu_min = float(getattr(p, "gaia_pmem_min_visibility_periods", 8.0))
+    min_valid = int(getattr(p, "gaia_pmem_min_valid", 30))
+    min_fit = int(getattr(p, "gaia_pmem_min_fit", 25))
+
+    out_df, pmem_note = _build_gaia_derived_df(
+        gaia_df,
+        pmem_method=method,
+        pmem_ruwe_max=ruwe_max,
+        pmem_vpu_min=vpu_min,
+        pmem_min_valid=min_valid,
+        pmem_min_fit=min_fit,
+    )
+
+    step5_out = step5_dir(Path(result_dir))
+    step5_out.mkdir(parents=True, exist_ok=True)
+    out_csv = step5_out / "gaia_derived.csv"
+    out_meta = step5_out / "gaia_derived_meta.json"
+
+    out_df.to_csv(out_csv, index=False, na_rep="NaN")
+    meta = {
+        "source": str(source_tag),
+        "n_rows": int(len(out_df)),
+        "center_ra_deg": float(center.ra.deg) if center is not None else None,
+        "center_dec_deg": float(center.dec.deg) if center is not None else None,
+        "radius_deg": float(radius_deg),
+        "pmem_method": method,
+        "pmem_note": pmem_note,
+        "pmem_ruwe_max": ruwe_max,
+        "pmem_min_visibility_periods": vpu_min,
+        "pmem_min_valid": int(min_valid),
+        "pmem_min_fit": int(min_fit),
+    }
+    out_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
 def _canonicalize_windows_path_case(path_value) -> Path:
     """Best-effort case normalization for Windows paths.
 
@@ -988,8 +1286,14 @@ class WcsWorker(QThread):
     SELECT
       source_id, ra, dec,
       phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
-      pmra, pmdec, pmra_error, pmdec_error,
-      parallax, parallax_error
+      phot_g_mean_flux_over_error, phot_bp_mean_flux_over_error, phot_rp_mean_flux_over_error,
+      bp_rp,
+      ruwe, visibility_periods_used,
+      parallax, parallax_error,
+      pmra, pmra_error, pmdec, pmdec_error,
+      radial_velocity, radial_velocity_error,
+      teff_gspphot, logg_gspphot, mh_gspphot,
+      distance_gspphot, azero_gspphot, ag_gspphot
     FROM gaiadr3.gaia_source
     WHERE 1=CONTAINS(
         POINT('ICRS', ra, dec),
@@ -1132,7 +1436,19 @@ class WcsWorker(QThread):
                 self._log("[Gaia] legacy cache rejected: field coverage mismatch; re-querying Gaia.")
 
         if cache_valid and df_cache is not None:
-            return _filter_cache_by_mag(df_cache), "cache"
+            df_use = _filter_cache_by_mag(df_cache)
+            try:
+                _save_gaia_derived_catalog(
+                    result_dir=self.result_dir,
+                    gaia_df=df_use,
+                    params=self.params,
+                    center=center,
+                    radius_deg=radius_deg,
+                    source_tag="cache",
+                )
+            except Exception:
+                pass
+            return df_use, "cache"
         if not _HAS_GAIA:
             if allow_no_cache:
                 return pd.DataFrame(), "no_gaia_module"
@@ -1160,6 +1476,17 @@ class WcsWorker(QThread):
                     }, indent=2), encoding="utf-8")
                 except Exception:
                     pass
+                try:
+                    _save_gaia_derived_catalog(
+                        result_dir=self.result_dir,
+                        gaia_df=df,
+                        params=self.params,
+                        center=center,
+                        radius_deg=radius_deg,
+                        source_tag="query",
+                    )
+                except Exception:
+                    pass
                 return df, "query"
             except Exception as e:
                 if self._stop_requested:
@@ -1179,7 +1506,19 @@ class WcsWorker(QThread):
             cached_mag_max = _cache_mag_max(df_cache, None)
             mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
             if mag_ok:
-                return _filter_cache_by_mag(df_cache), "cache(after_fail)"
+                df_use = _filter_cache_by_mag(df_cache)
+                try:
+                    _save_gaia_derived_catalog(
+                        result_dir=self.result_dir,
+                        gaia_df=df_use,
+                        params=self.params,
+                        center=center,
+                        radius_deg=radius_deg,
+                        source_tag="cache(after_fail)",
+                    )
+                except Exception:
+                    pass
+                return df_use, "cache(after_fail)"
             if allow_no_cache:
                 if last_err is None:
                     return pd.DataFrame(), f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f}"
@@ -2015,8 +2354,14 @@ class AstrometryNetWorker(QThread):
     SELECT
       source_id, ra, dec,
       phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
-      pmra, pmdec, pmra_error, pmdec_error,
-      parallax, parallax_error
+      phot_g_mean_flux_over_error, phot_bp_mean_flux_over_error, phot_rp_mean_flux_over_error,
+      bp_rp,
+      ruwe, visibility_periods_used,
+      parallax, parallax_error,
+      pmra, pmra_error, pmdec, pmdec_error,
+      radial_velocity, radial_velocity_error,
+      teff_gspphot, logg_gspphot, mh_gspphot,
+      distance_gspphot, azero_gspphot, ag_gspphot
     FROM gaiadr3.gaia_source
     WHERE 1=CONTAINS(
         POINT('ICRS', ra, dec),
@@ -2156,7 +2501,19 @@ class AstrometryNetWorker(QThread):
                 self._log("[Gaia] legacy cache rejected: field coverage mismatch; re-querying Gaia.")
 
         if cache_valid and df_cache is not None:
-            return _filter_cache_by_mag(df_cache), "cache"
+            df_use = _filter_cache_by_mag(df_cache)
+            try:
+                _save_gaia_derived_catalog(
+                    result_dir=self.result_dir,
+                    gaia_df=df_use,
+                    params=self.params,
+                    center=center,
+                    radius_deg=radius_deg,
+                    source_tag="cache",
+                )
+            except Exception:
+                pass
+            return df_use, "cache"
         if not _HAS_GAIA:
             if allow_no_cache:
                 return pd.DataFrame(), "no_gaia_module"
@@ -2183,6 +2540,17 @@ class AstrometryNetWorker(QThread):
                     }, indent=2), encoding="utf-8")
                 except Exception:
                     pass
+                try:
+                    _save_gaia_derived_catalog(
+                        result_dir=self.result_dir,
+                        gaia_df=df,
+                        params=self.params,
+                        center=center,
+                        radius_deg=radius_deg,
+                        source_tag="query",
+                    )
+                except Exception:
+                    pass
                 return df, "query"
             except Exception as e:
                 if self._stop_requested:
@@ -2202,7 +2570,19 @@ class AstrometryNetWorker(QThread):
             cached_mag_max = _cache_mag_max(df_cache, None)
             mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
             if mag_ok:
-                return _filter_cache_by_mag(df_cache), "cache(after_fail)"
+                df_use = _filter_cache_by_mag(df_cache)
+                try:
+                    _save_gaia_derived_catalog(
+                        result_dir=self.result_dir,
+                        gaia_df=df_use,
+                        params=self.params,
+                        center=center,
+                        radius_deg=radius_deg,
+                        source_tag="cache(after_fail)",
+                    )
+                except Exception:
+                    pass
+                return df_use, "cache(after_fail)"
             if allow_no_cache:
                 if last_err is None:
                     return pd.DataFrame(), f"cache_too_shallow:{cached_mag_max:.2f}<{mag_max:.2f}"
@@ -4125,6 +4505,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         layout = QVBoxLayout(dialog)
         wcs_form = QFormLayout()
 
+        wcs_form.addRow(QLabel("── ASTAP core ─────────────────────────"))
+
         self.param_astap_exe = QLineEdit(str(getattr(self.params.P, "astap_exe", "astap_cli.exe")))
         wcs_form.addRow("ASTAP CLI Path:", self.param_astap_exe)
 
@@ -4172,6 +4554,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_max_workers.setValue(int(getattr(self.params.P, "wcs_max_workers", 1)))
         wcs_form.addRow("Max Workers:", self.param_max_workers)
 
+        wcs_form.addRow(QLabel("── QC gate / refine ───────────────────"))
+
         self.param_require_qc = QCheckBox("Enable")
         self.param_require_qc.setChecked(bool(getattr(self.params.P, "wcs_require_qc_pass", True)))
         wcs_form.addRow("QC Pass Only:", self.param_require_qc)
@@ -4195,6 +4579,18 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_refine_min_match.setRange(5, 500)
         self.param_refine_min_match.setValue(int(getattr(self.params.P, "wcs_refine_min_match", 50)))
         wcs_form.addRow("Refine Min Match:", self.param_refine_min_match)
+
+        wcs_form.addRow(QLabel("── Gaia query / hybrid ID ─────────────"))
+        gaia_help = QLabel(
+            "Step5 outputs:\n"
+            "1) gaia_fov.ecsv (raw Gaia query/cache)\n"
+            "2) gaia_derived.csv (gaia_pmem + derived physics: distance_pc, abs_g_mag, "
+            "pm_total_masyr, vtan_kms, ...)\n"
+            "Downstream steps (6/8/10/tools) prioritize gaia_derived.csv."
+        )
+        gaia_help.setWordWrap(True)
+        gaia_help.setStyleSheet("color: #555;")
+        wcs_form.addRow("Help:", gaia_help)
 
         self.param_gaia_fudge = QDoubleSpinBox()
         self.param_gaia_fudge.setRange(0.5, 3.0)
@@ -4268,6 +4664,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
 
+        form.addRow(QLabel("── Astrometry.net core ─────────────────"))
+
         self.param_astnet_enable = QCheckBox("Enable")
         self.param_astnet_enable.setChecked(bool(getattr(self.params.P, "astnet_local_enable", False)))
         form.addRow("Enable Local Solve:", self.param_astnet_enable)
@@ -4306,6 +4704,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_radius.setValue(float(getattr(self.params.P, "astnet_local_radius_deg", 8.0)))
         form.addRow("Radius (deg):", self.param_astnet_radius)
 
+        form.addRow(QLabel("── Gaia / WCS-QC settings ──────────────"))
+
         self.param_astnet_wcs_qc_match_radius = QDoubleSpinBox()
         self.param_astnet_wcs_qc_match_radius.setRange(0.5, 15.0)
         self.param_astnet_wcs_qc_match_radius.setDecimals(2)
@@ -4334,6 +4734,16 @@ class WcsPlateSolvingWindow(StepWindowBase):
             float(getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0))
         )
         form.addRow("Gaia Match Tol (Ref, arcsec):", self.param_astnet_ref_gaia_match_tol)
+
+        gaia_help = QLabel(
+            "Step5 outputs:\n"
+            "1) gaia_fov.ecsv (raw Gaia query/cache)\n"
+            "2) gaia_derived.csv (gaia_pmem + derived physics)\n"
+            "Downstream steps (6/8/10/tools) prioritize gaia_derived.csv."
+        )
+        gaia_help.setWordWrap(True)
+        gaia_help.setStyleSheet("color: #555;")
+        form.addRow("Help:", gaia_help)
 
         self.param_astnet_gaia_g_limit = QDoubleSpinBox()
         self.param_astnet_gaia_g_limit.setRange(10.0, 25.0)
@@ -4364,6 +4774,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_gaia_allow_no_cache = QCheckBox("Allow")
         self.param_astnet_gaia_allow_no_cache.setChecked(bool(getattr(self.params.P, "gaia_allow_no_cache", True)))
         form.addRow("Gaia Allow No Cache:", self.param_astnet_gaia_allow_no_cache)
+
+        form.addRow(QLabel("── Outputs / cache ─────────────────────"))
 
         self.param_astnet_keep_outputs = QCheckBox("Keep")
         self.param_astnet_keep_outputs.setChecked(bool(getattr(self.params.P, "astnet_local_keep_outputs", True)))

@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QFormLayout, QProgressBar,
     QDoubleSpinBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QWidget, QDialog, QDialogButtonBox, QTabWidget, QComboBox, QCheckBox
+    QAbstractItemView, QWidget, QDialog, QDialogButtonBox, QTabWidget, QComboBox, QCheckBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -77,6 +77,98 @@ def _coalesce_int(x, default: int) -> int:
         return int(float(s))
     except Exception:
         return int(default)
+
+
+_IDMATCH_MODE_PRESETS = {
+    "normal": {
+        "idmatch_use_qc_pass_only": True,
+        "idmatch_use_wcs_qc_gate": True,
+        "idmatch_use_gaia_refs_only": False,
+        "idmatch_gaia_g_limit": 18.0,
+        "idmatch_tol_arcsec": 0.0,
+        "idmatch_match_r_fwhm": 0.8,
+        "idmatch_two_pass_enable": True,
+        "idmatch_tight_radius_arcsec": 1.0,
+        "idmatch_loose_radius_arcsec": 3.0,
+        "idmatch_adaptive_retry_threshold": 0.5,
+        "idmatch_fwhm_adaptive_floor": True,
+        "idmatch_geom_correction_enable": True,
+        "idmatch_min_correction_pairs": 3,
+        "idmatch_min_affine_pairs": 6,
+    },
+    "crowded": {
+        "idmatch_use_qc_pass_only": True,
+        "idmatch_use_wcs_qc_gate": True,
+        "idmatch_use_gaia_refs_only": False,
+        "idmatch_gaia_g_limit": 18.0,
+        "idmatch_tol_arcsec": 0.0,
+        "idmatch_match_r_fwhm": 0.7,
+        "idmatch_two_pass_enable": True,
+        "idmatch_tight_radius_arcsec": 0.8,
+        "idmatch_loose_radius_arcsec": 2.2,
+        "idmatch_adaptive_retry_threshold": 0.35,
+        "idmatch_fwhm_adaptive_floor": True,
+        "idmatch_geom_correction_enable": True,
+        "idmatch_min_correction_pairs": 4,
+        "idmatch_min_affine_pairs": 8,
+    },
+    "faint": {
+        "idmatch_use_qc_pass_only": False,
+        "idmatch_use_wcs_qc_gate": False,
+        "idmatch_use_gaia_refs_only": False,
+        "idmatch_gaia_g_limit": 20.0,
+        "idmatch_tol_arcsec": 0.0,
+        "idmatch_match_r_fwhm": 1.2,
+        "idmatch_two_pass_enable": True,
+        "idmatch_tight_radius_arcsec": 1.5,
+        "idmatch_loose_radius_arcsec": 5.0,
+        "idmatch_adaptive_retry_threshold": 0.8,
+        "idmatch_fwhm_adaptive_floor": True,
+        "idmatch_geom_correction_enable": True,
+        "idmatch_min_correction_pairs": 2,
+        "idmatch_min_affine_pairs": 4,
+    },
+}
+
+
+def _normalize_idmatch_mode(value) -> str:
+    s = str(value or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "standard": "normal",
+        "dense": "crowded",
+        "cluster": "crowded",
+        "dim": "faint",
+        "deep": "faint",
+        "custom": "custom",
+    }
+    s = aliases.get(s, s)
+    if s in _IDMATCH_MODE_PRESETS:
+        return s
+    if s == "custom":
+        return s
+    return "normal"
+
+
+def _get_idmatch_mode_preset(mode: str) -> dict:
+    mode_key = _normalize_idmatch_mode(mode)
+    return dict(_IDMATCH_MODE_PRESETS.get(mode_key, _IDMATCH_MODE_PRESETS["normal"]))
+
+
+def _get_idmatch_mode_from_params(params_obj) -> str:
+    mode = getattr(params_obj, "idmatch_mode", None)
+    cfg = getattr(params_obj, "idmatch", None)
+    if mode in (None, "") and cfg is not None and hasattr(cfg, "mode"):
+        mode = getattr(cfg, "mode")
+    return _normalize_idmatch_mode(mode)
+
+
+def _set_idmatch_mode_params(params_obj, mode: str) -> dict:
+    preset = _get_idmatch_mode_preset(mode)
+    for key, value in preset.items():
+        setattr(params_obj, key, value)
+    setattr(params_obj, "idmatch_mode", _normalize_idmatch_mode(mode))
+    return preset
 
 
 def _norm_path_key(path_value) -> str:
@@ -767,8 +859,10 @@ class IdMatchWorker(QThread):
             self._log(f"[WARN] Could not open log file: {e}")
 
         match_radius_arcsec = _safe_float(getattr(self.params.P, "idmatch_tol_arcsec", None), np.nan)
+        mode_key = _get_idmatch_mode_from_params(self.params.P)
         self._log(
-            "[IDMATCH] params: wcs_match_radius_arcsec={r}, match_r_fwhm={mf:.2f}".format(
+            "[IDMATCH] params: mode={mode}, wcs_match_radius_arcsec={r}, match_r_fwhm={mf:.2f}".format(
+                mode=mode_key,
                 r=(f"{match_radius_arcsec:.2f}" if np.isfinite(match_radius_arcsec) else "auto"),
                 mf=self.match_r_fwhm,
             )
@@ -1403,6 +1497,13 @@ class StarIdMatchingWindow(StepWindowBase):
         )
         btn_log.clicked.connect(self.show_log_window)
         control_layout.addWidget(btn_log)
+        btn_help = QPushButton("?")
+        btn_help.setFixedWidth(28)
+        btn_help.setToolTip(
+            "Step7 지표 도움말: match_rate(ID), 매칭 기준, dx/dy 의미"
+        )
+        btn_help.clicked.connect(self.show_idmatch_help_dialog)
+        control_layout.addWidget(btn_help)
 
         self.content_layout.addLayout(control_layout)
 
@@ -1425,7 +1526,7 @@ class StarIdMatchingWindow(StepWindowBase):
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(5)
         self.results_table.setHorizontalHeaderLabels([
-            "File", "Filter", "N_det", "N_match", "Rate"
+            "File", "Filter", "N_det", "N_match", "ID Match Rate"
         ])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.results_table.horizontalHeader().setStretchLastSection(True)
@@ -1450,8 +1551,15 @@ class StarIdMatchingWindow(StepWindowBase):
         self.plot_date_combo.addItem("All")
         self.plot_date_combo.currentIndexChanged.connect(self._on_plot_date_changed)
         plot_controls.addWidget(self.plot_date_combo)
+        btn_save_plot = QPushButton("Save QC Plot")
+        btn_save_plot.clicked.connect(self.save_qc_plot_image)
+        plot_controls.addWidget(btn_save_plot)
         plot_controls.addStretch()
         plot_layout.addLayout(plot_controls)
+        self.plot_help_label = QLabel("")
+        self.plot_help_label.setWordWrap(True)
+        self.plot_help_label.setStyleSheet("QLabel { color: #455A64; font-size: 9pt; }")
+        plot_layout.addWidget(self.plot_help_label)
         self.plot_canvas = FigureCanvas(Figure(figsize=(8, 4)))
         self.plot_canvas.setMinimumHeight(260)
         plot_layout.addWidget(self.plot_canvas)
@@ -1471,8 +1579,18 @@ class StarIdMatchingWindow(StepWindowBase):
     def open_parameters_dialog(self):
         idmatch_cfg = getattr(self.params.P, "idmatch", None)
 
-        def _cfg(key, default):
-            return getattr(idmatch_cfg, key, default) if idmatch_cfg is not None else default
+        def _cfg(key, flat_key, default):
+            if idmatch_cfg is not None and hasattr(idmatch_cfg, key):
+                return getattr(idmatch_cfg, key, default)
+            return getattr(self.params.P, flat_key, default)
+
+        def _set_cfg_if_exists(key, value):
+            if idmatch_cfg is None or (not hasattr(idmatch_cfg, key)):
+                return
+            try:
+                setattr(idmatch_cfg, key, value)
+            except Exception:
+                pass
 
         dialog = QDialog(self)
         dialog.setWindowTitle("ID Match Parameters")
@@ -1483,7 +1601,21 @@ class StarIdMatchingWindow(StepWindowBase):
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         layout.addLayout(form)
 
-        # --- Basic ---
+        mode_combo = QComboBox()
+        mode_combo.addItem("Normal (권장)", "normal")
+        mode_combo.addItem("Crowded Field (혼잡장)", "crowded")
+        mode_combo.addItem("Faint Field (희미한 장)", "faint")
+        mode_combo.addItem("Custom (고급 수동)", "custom")
+        mode_now = _get_idmatch_mode_from_params(self.params.P)
+        mode_idx = mode_combo.findData(mode_now)
+        mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        form.addRow("Matching mode:", mode_combo)
+
+        mode_note = QLabel("Normal/Crowded/Faint 모드에서는 핵심 값만 자동 세팅됩니다. 수동 조정은 Custom에서만 사용합니다.")
+        mode_note.setWordWrap(True)
+        mode_note.setStyleSheet("QLabel { color: #455A64; font-size: 9pt; }")
+        form.addRow("", mode_note)
+
         arcsec_spin = QDoubleSpinBox()
         arcsec_spin.setRange(0.0, 30.0)
         arcsec_spin.setDecimals(2)
@@ -1507,27 +1639,25 @@ class StarIdMatchingWindow(StepWindowBase):
         gaia_g_spin.setDecimals(2)
         gaia_g_spin.setSingleStep(0.5)
         gaia_g_spin.setValue(_coalesce_float(getattr(self.params.P, "idmatch_gaia_g_limit", None), 25.0))
-        gaia_g_spin.setEnabled(gaia_only_chk.isChecked())
-        gaia_only_chk.toggled.connect(gaia_g_spin.setEnabled)
         form.addRow("Gaia G limit (Gaia-only mode):", gaia_g_spin)
 
         form.addRow(QLabel("── Two-pass matching ──────────────────"))
 
         two_pass_chk = QCheckBox("Enable two-pass matching")
-        two_pass_chk.setChecked(bool(_cfg("two_pass_enable", True)))
+        two_pass_chk.setChecked(bool(_cfg("two_pass_enable", "idmatch_two_pass_enable", True)))
         form.addRow("", two_pass_chk)
 
         tight_spin = QDoubleSpinBox()
         tight_spin.setRange(0.1, 20.0)
         tight_spin.setDecimals(2)
-        tight_spin.setValue(float(_cfg("tight_radius_arcsec", 1.0)))
+        tight_spin.setValue(float(_cfg("tight_radius_arcsec", "idmatch_tight_radius_arcsec", 1.0)))
         tight_spin.setToolTip("Pass 1 radius (high-confidence seeds). Floored by FWHM × 0.4 if adaptive floor is on.")
         form.addRow("Tight radius (arcsec):", tight_spin)
 
         loose_spin = QDoubleSpinBox()
         loose_spin.setRange(0.1, 30.0)
         loose_spin.setDecimals(2)
-        loose_spin.setValue(float(_cfg("loose_radius_arcsec", 3.0)))
+        loose_spin.setValue(float(_cfg("loose_radius_arcsec", "idmatch_loose_radius_arcsec", 3.0)))
         loose_spin.setToolTip("Pass 2 radius. Floored by FWHM-based match radius if adaptive floor is on.")
         form.addRow("Loose radius (arcsec):", loose_spin)
 
@@ -1535,33 +1665,67 @@ class StarIdMatchingWindow(StepWindowBase):
         retry_spin.setRange(0.0, 1.0)
         retry_spin.setDecimals(2)
         retry_spin.setSingleStep(0.05)
-        retry_spin.setValue(float(_cfg("adaptive_retry_threshold", 0.5)))
+        retry_spin.setValue(float(_cfg("adaptive_retry_threshold", "idmatch_adaptive_retry_threshold", 0.5)))
         retry_spin.setToolTip("If match_rate < threshold after pass 2, retry with 2× loose radius. Set 0 to disable.")
         form.addRow("Adaptive retry threshold (0=off):", retry_spin)
 
         form.addRow(QLabel("── Geometric correction ───────────────"))
 
         fwhm_floor_chk = QCheckBox("FWHM-adaptive radius floor")
-        fwhm_floor_chk.setChecked(bool(_cfg("fwhm_adaptive_floor", True)))
+        fwhm_floor_chk.setChecked(bool(_cfg("fwhm_adaptive_floor", "idmatch_fwhm_adaptive_floor", True)))
         fwhm_floor_chk.setToolTip("Floor tight/loose radii to FWHM-based size so they scale with the PSF.")
         form.addRow("", fwhm_floor_chk)
 
         geom_chk = QCheckBox("Geometric correction (affine/shift)")
-        geom_chk.setChecked(bool(_cfg("geom_correction_enable", True)))
+        geom_chk.setChecked(bool(_cfg("geom_correction_enable", "idmatch_geom_correction_enable", True)))
         geom_chk.setToolTip("Use pass-1 seed pairs to correct WCS distortion before pass 2.")
         form.addRow("", geom_chk)
 
         min_corr_spin = QSpinBox()
         min_corr_spin.setRange(2, 50)
-        min_corr_spin.setValue(int(_cfg("min_correction_pairs", 3)))
+        min_corr_spin.setValue(int(_cfg("min_correction_pairs", "idmatch_min_correction_pairs", 3)))
         min_corr_spin.setToolTip("Minimum pass-1 pairs required to apply shift/affine correction.")
         form.addRow("Min correction pairs:", min_corr_spin)
 
         min_affine_spin = QSpinBox()
         min_affine_spin.setRange(3, 100)
-        min_affine_spin.setValue(int(_cfg("min_affine_pairs", 6)))
+        min_affine_spin.setValue(int(_cfg("min_affine_pairs", "idmatch_min_affine_pairs", 6)))
         min_affine_spin.setToolTip("Minimum pass-1 pairs to use full affine. Below this: global shift only.")
         form.addRow("Min affine pairs:", min_affine_spin)
+
+        manual_widgets = [
+            arcsec_spin, match_r_spin, gaia_only_chk, gaia_g_spin,
+            two_pass_chk, tight_spin, loose_spin, retry_spin,
+            fwhm_floor_chk, geom_chk, min_corr_spin, min_affine_spin,
+        ]
+
+        def _apply_mode_to_widgets(mode_key: str):
+            preset = _get_idmatch_mode_preset(mode_key)
+            arcsec_spin.setValue(float(preset["idmatch_tol_arcsec"]))
+            match_r_spin.setValue(float(preset["idmatch_match_r_fwhm"]))
+            gaia_only_chk.setChecked(bool(preset["idmatch_use_gaia_refs_only"]))
+            gaia_g_spin.setValue(float(preset["idmatch_gaia_g_limit"]))
+            two_pass_chk.setChecked(bool(preset["idmatch_two_pass_enable"]))
+            tight_spin.setValue(float(preset["idmatch_tight_radius_arcsec"]))
+            loose_spin.setValue(float(preset["idmatch_loose_radius_arcsec"]))
+            retry_spin.setValue(float(preset["idmatch_adaptive_retry_threshold"]))
+            fwhm_floor_chk.setChecked(bool(preset["idmatch_fwhm_adaptive_floor"]))
+            geom_chk.setChecked(bool(preset["idmatch_geom_correction_enable"]))
+            min_corr_spin.setValue(int(preset["idmatch_min_correction_pairs"]))
+            min_affine_spin.setValue(int(preset["idmatch_min_affine_pairs"]))
+
+        def _refresh_mode_ui():
+            mode_key = _normalize_idmatch_mode(mode_combo.currentData())
+            is_custom = (mode_key == "custom")
+            if not is_custom:
+                _apply_mode_to_widgets(mode_key)
+            for w in manual_widgets:
+                w.setEnabled(is_custom)
+            gaia_g_spin.setEnabled(is_custom and gaia_only_chk.isChecked())
+
+        mode_combo.currentIndexChanged.connect(lambda *_: _refresh_mode_ui())
+        gaia_only_chk.toggled.connect(lambda *_: _refresh_mode_ui())
+        _refresh_mode_ui()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1569,21 +1733,47 @@ class StarIdMatchingWindow(StepWindowBase):
         layout.addWidget(buttons)
 
         if dialog.exec_() == QDialog.Accepted:
-            self.params.P.idmatch_tol_arcsec = arcsec_spin.value()
-            self.params.P.idmatch_match_r_fwhm = match_r_spin.value()
-            self.params.P.idmatch_use_gaia_refs_only = gaia_only_chk.isChecked()
-            self.params.P.idmatch_gaia_g_limit = gaia_g_spin.value()
-            if idmatch_cfg is not None:
-                setattr(idmatch_cfg, "two_pass_enable", two_pass_chk.isChecked())
-                setattr(idmatch_cfg, "tight_radius_arcsec", tight_spin.value())
-                setattr(idmatch_cfg, "loose_radius_arcsec", loose_spin.value())
-                setattr(idmatch_cfg, "adaptive_retry_threshold", retry_spin.value())
-                setattr(idmatch_cfg, "fwhm_adaptive_floor", fwhm_floor_chk.isChecked())
-                setattr(idmatch_cfg, "geom_correction_enable", geom_chk.isChecked())
-                setattr(idmatch_cfg, "min_correction_pairs", min_corr_spin.value())
-                setattr(idmatch_cfg, "min_affine_pairs", min_affine_spin.value())
+            mode_key = _normalize_idmatch_mode(mode_combo.currentData())
+            self.params.P.idmatch_mode = mode_key
+            if mode_key == "custom":
+                self.params.P.idmatch_tol_arcsec = arcsec_spin.value()
+                self.params.P.idmatch_match_r_fwhm = match_r_spin.value()
+                self.params.P.idmatch_use_gaia_refs_only = gaia_only_chk.isChecked()
+                self.params.P.idmatch_gaia_g_limit = gaia_g_spin.value()
+                self.params.P.idmatch_two_pass_enable = two_pass_chk.isChecked()
+                self.params.P.idmatch_tight_radius_arcsec = tight_spin.value()
+                self.params.P.idmatch_loose_radius_arcsec = loose_spin.value()
+                self.params.P.idmatch_adaptive_retry_threshold = retry_spin.value()
+                self.params.P.idmatch_fwhm_adaptive_floor = fwhm_floor_chk.isChecked()
+                self.params.P.idmatch_geom_correction_enable = geom_chk.isChecked()
+                self.params.P.idmatch_min_correction_pairs = min_corr_spin.value()
+                self.params.P.idmatch_min_affine_pairs = min_affine_spin.value()
+            else:
+                _set_idmatch_mode_params(self.params.P, mode_key)
+
+            _set_cfg_if_exists("mode", self.params.P.idmatch_mode)
+            _set_cfg_if_exists("tol_arcsec", self.params.P.idmatch_tol_arcsec)
+            _set_cfg_if_exists("use_gaia_refs_only", self.params.P.idmatch_use_gaia_refs_only)
+            _set_cfg_if_exists("gaia_g_limit", self.params.P.idmatch_gaia_g_limit)
+            _set_cfg_if_exists("match_r_fwhm", self.params.P.idmatch_match_r_fwhm)
+            _set_cfg_if_exists("two_pass_enable", self.params.P.idmatch_two_pass_enable)
+            _set_cfg_if_exists("tight_radius_arcsec", self.params.P.idmatch_tight_radius_arcsec)
+            _set_cfg_if_exists("loose_radius_arcsec", self.params.P.idmatch_loose_radius_arcsec)
+            _set_cfg_if_exists("adaptive_retry_threshold", self.params.P.idmatch_adaptive_retry_threshold)
+            _set_cfg_if_exists("fwhm_adaptive_floor", self.params.P.idmatch_fwhm_adaptive_floor)
+            _set_cfg_if_exists("geom_correction_enable", self.params.P.idmatch_geom_correction_enable)
+            _set_cfg_if_exists("min_correction_pairs", self.params.P.idmatch_min_correction_pairs)
+            _set_cfg_if_exists("min_affine_pairs", self.params.P.idmatch_min_affine_pairs)
+            _set_cfg_if_exists(
+                "use_qc_pass_only",
+                bool(getattr(self.params.P, "idmatch_use_qc_pass_only", True)),
+            )
+            _set_cfg_if_exists(
+                "use_wcs_qc_gate",
+                bool(getattr(self.params.P, "idmatch_use_wcs_qc_gate", True)),
+            )
             self.persist_params()
-            QMessageBox.information(dialog, "Saved", "Parameters saved.")
+            QMessageBox.information(dialog, "Saved", f"Parameters saved. mode={self.params.P.idmatch_mode}")
 
     def run_idmatch(self):
         if self.worker and self.worker.isRunning():
@@ -1620,7 +1810,20 @@ class StarIdMatchingWindow(StepWindowBase):
             return
 
         idmatch_cfg = getattr(self.params.P, "idmatch", None)
-        use_qc = bool(getattr(idmatch_cfg, "use_qc_pass_only", getattr(self.params.P, "idmatch_use_qc_pass_only", True)))
+        mode_key = _get_idmatch_mode_from_params(self.params.P)
+        if mode_key != "custom":
+            preset = _set_idmatch_mode_params(self.params.P, mode_key)
+            self.log(f"[IDMATCH][MODE] {mode_key} preset active: tight={preset['idmatch_tight_radius_arcsec']:.2f}\" "
+                     f"loose={preset['idmatch_loose_radius_arcsec']:.2f}\"")
+
+        def _cfg_or_flat(cfg_key: str, flat_key: str, default):
+            if mode_key != "custom":
+                return getattr(self.params.P, flat_key, default)
+            if idmatch_cfg is not None and hasattr(idmatch_cfg, cfg_key):
+                return getattr(idmatch_cfg, cfg_key, default)
+            return getattr(self.params.P, flat_key, default)
+
+        use_qc = bool(_cfg_or_flat("use_qc_pass_only", "idmatch_use_qc_pass_only", True))
         files, qc_info = filter_files_by_qc(Path(self.params.P.result_dir), files, require_qc=use_qc)
         if use_qc:
             if qc_info.get("applied"):
@@ -1633,53 +1836,12 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Warning", "No frames after QC filter.")
             return
 
-        use_wcs_qc_gate = bool(
-            getattr(
-                idmatch_cfg,
-                "use_wcs_qc_gate",
-                getattr(self.params.P, "idmatch_use_wcs_qc_gate", True),
-            )
-        )
-        wcs_qc_min_rate = _coalesce_float(
-            getattr(
-                idmatch_cfg,
-                "wcs_qc_min_match_rate",
-                getattr(self.params.P, "idmatch_wcs_qc_min_match_rate", 0.20),
-            ),
-            0.20,
-        )
-        wcs_qc_min_n = _coalesce_int(
-            getattr(
-                idmatch_cfg,
-                "wcs_qc_min_match_n",
-                getattr(self.params.P, "idmatch_wcs_qc_min_match_n", 20),
-            ),
-            20,
-        )
-        wcs_qc_max_rms = _coalesce_float(
-            getattr(
-                idmatch_cfg,
-                "wcs_qc_max_rms_px",
-                getattr(self.params.P, "idmatch_wcs_qc_max_rms_px", 2.5),
-            ),
-            2.5,
-        )
-        wcs_qc_min_inlier = _coalesce_float(
-            getattr(
-                idmatch_cfg,
-                "wcs_qc_min_inlier_rate",
-                getattr(self.params.P, "idmatch_wcs_qc_min_inlier_rate", 0.50),
-            ),
-            0.50,
-        )
-        wcs_qc_max_p99 = _coalesce_float(
-            getattr(
-                idmatch_cfg,
-                "wcs_qc_max_p99_px",
-                getattr(self.params.P, "idmatch_wcs_qc_max_p99_px", 5.0),
-            ),
-            5.0,
-        )
+        use_wcs_qc_gate = bool(_cfg_or_flat("use_wcs_qc_gate", "idmatch_use_wcs_qc_gate", True))
+        wcs_qc_min_rate = _coalesce_float(_cfg_or_flat("wcs_qc_min_match_rate", "idmatch_wcs_qc_min_match_rate", 0.20), 0.20)
+        wcs_qc_min_n = _coalesce_int(_cfg_or_flat("wcs_qc_min_match_n", "idmatch_wcs_qc_min_match_n", 20), 20)
+        wcs_qc_max_rms = _coalesce_float(_cfg_or_flat("wcs_qc_max_rms_px", "idmatch_wcs_qc_max_rms_px", 2.5), 2.5)
+        wcs_qc_min_inlier = _coalesce_float(_cfg_or_flat("wcs_qc_min_inlier_rate", "idmatch_wcs_qc_min_inlier_rate", 0.50), 0.50)
+        wcs_qc_max_p99 = _coalesce_float(_cfg_or_flat("wcs_qc_max_p99_px", "idmatch_wcs_qc_max_p99_px", 5.0), 5.0)
         files, wcs_qc_info = filter_files_by_wcs_qc(
             Path(self.params.P.result_dir),
             files,
@@ -1749,14 +1911,16 @@ class StarIdMatchingWindow(StepWindowBase):
             return
 
         # Get two-pass matching parameters from config
-        two_pass_enable = bool(getattr(idmatch_cfg, "two_pass_enable", True)) if idmatch_cfg else True
-        tight_radius_arcsec = _coalesce_float(getattr(idmatch_cfg, "tight_radius_arcsec", None), 1.0) if idmatch_cfg else 1.0
-        loose_radius_arcsec = _coalesce_float(getattr(idmatch_cfg, "loose_radius_arcsec", None), 3.0) if idmatch_cfg else 3.0
-        min_correction_pairs = _coalesce_int(getattr(idmatch_cfg, "min_correction_pairs", None), 3) if idmatch_cfg else 3
-        min_affine_pairs = _coalesce_int(getattr(idmatch_cfg, "min_affine_pairs", None), 6) if idmatch_cfg else 6
-        adaptive_retry_threshold = _coalesce_float(getattr(idmatch_cfg, "adaptive_retry_threshold", None), 0.5) if idmatch_cfg else 0.5
-        fwhm_adaptive_floor = bool(getattr(idmatch_cfg, "fwhm_adaptive_floor", True)) if idmatch_cfg else True
-        geom_correction_enable = bool(getattr(idmatch_cfg, "geom_correction_enable", True)) if idmatch_cfg else True
+        two_pass_enable = bool(_cfg_or_flat("two_pass_enable", "idmatch_two_pass_enable", True))
+        tight_radius_arcsec = _coalesce_float(_cfg_or_flat("tight_radius_arcsec", "idmatch_tight_radius_arcsec", 1.0), 1.0)
+        loose_radius_arcsec = _coalesce_float(_cfg_or_flat("loose_radius_arcsec", "idmatch_loose_radius_arcsec", 3.0), 3.0)
+        min_correction_pairs = _coalesce_int(_cfg_or_flat("min_correction_pairs", "idmatch_min_correction_pairs", 3), 3)
+        min_affine_pairs = _coalesce_int(_cfg_or_flat("min_affine_pairs", "idmatch_min_affine_pairs", 6), 6)
+        adaptive_retry_threshold = _coalesce_float(
+            _cfg_or_flat("adaptive_retry_threshold", "idmatch_adaptive_retry_threshold", 0.5), 0.5
+        )
+        fwhm_adaptive_floor = bool(_cfg_or_flat("fwhm_adaptive_floor", "idmatch_fwhm_adaptive_floor", True))
+        geom_correction_enable = bool(_cfg_or_flat("geom_correction_enable", "idmatch_geom_correction_enable", True))
 
         self.worker = IdMatchWorker(
             file_list=files,
@@ -1766,7 +1930,7 @@ class StarIdMatchingWindow(StepWindowBase):
             cache_dir=self.params.P.cache_dir,
             ref_frame=str(ref_frame),
             ref_filter=str(ref_filter),
-            match_r_fwhm=_coalesce_float(getattr(self.params.P, "idmatch_match_r_fwhm", None), 0.8),
+            match_r_fwhm=_coalesce_float(_cfg_or_flat("match_r_fwhm", "idmatch_match_r_fwhm", 0.8), 0.8),
             init_r_fwhm=_coalesce_float(getattr(self.params.P, "idmatch_init_r_fwhm", None), 5.0),
             ratio_max=_coalesce_float(getattr(self.params.P, "idmatch_ratio_max", None), 0.7),
             min_pairs=_coalesce_int(getattr(self.params.P, "idmatch_min_pairs", None), 15),
@@ -1862,7 +2026,14 @@ class StarIdMatchingWindow(StepWindowBase):
         cols = ["filter", "n_frames", "wcs_ok", "match_rate_med", "match_rate_p90", "sep_med_med", "dup_rate_med"]
         self.stats_table.setColumnCount(len(cols))
         self.stats_table.setRowCount(len(rows))
-        self.stats_table.setHorizontalHeaderLabels(cols)
+        header_map = {
+            "match_rate_med": "idmatch_rate_med",
+            "match_rate_p90": "idmatch_rate_p90",
+            "sep_med_med": "sep_med_arcsec_med",
+            "dup_rate_med": "dup_rate_med",
+            "wcs_ok": "wcs_ok_count",
+        }
+        self.stats_table.setHorizontalHeaderLabels([header_map.get(c, c) for c in cols])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.stats_table.horizontalHeader().setStretchLastSection(True)
 
@@ -1875,9 +2046,43 @@ class StarIdMatchingWindow(StepWindowBase):
                     text = str(val)
                 self.stats_table.setItem(r, c, QTableWidgetItem(text))
 
+    def _qc_help_text(self) -> str:
+        mode_key = _get_idmatch_mode_from_params(self.params.P)
+        return (
+            "match_rate = n_match / n_det (Step7 ID rate, not Step6 Gaia rate). "
+            "dx_med/dy_med = median(det - ref_projected) residual in pixel."
+            + (f" 현재 mode={mode_key}." if mode_key else "")
+        )
+
+    def _idmatch_help_text(self) -> str:
+        mode_key = _get_idmatch_mode_from_params(self.params.P)
+        return (
+            "Step7 Metrics Guide\n\n"
+            "1) match_rate\n"
+            "   - match_rate = n_match / n_det\n"
+            "   - Step7 ID 매칭률(검출원 대비 source_id 매칭 비율)입니다.\n"
+            "   - Step6의 Gaia match_rate 계열과 다른 지표입니다.\n\n"
+            "2) 실제 매칭 기준\n"
+            "   - detection(x,y) -> frame WCS -> sky(ra,dec) 변환\n"
+            "   - ref_catalog(ra,dec)와 최근접 매칭\n"
+            "   - sep_arcsec <= match_r (two-pass면 tight/loose/retry 규칙 적용)\n"
+            "   - 즉, dx/dy 자체를 기준으로 매칭하지 않습니다.\n\n"
+            "3) dx_med, dy_med\n"
+            "   - dx = x_detected - x_ref_projected\n"
+            "   - dy = y_detected - y_ref_projected\n"
+            "   - 매칭된 점들의 중앙값(median)으로 프레임별 시스템 오프셋/잔차를 봅니다.\n"
+            "   - 0에서 조금 벗어나는 것은 보통 자연스러운 WCS 잔차입니다.\n\n"
+            f"Current mode: {mode_key}"
+        )
+
+    def show_idmatch_help_dialog(self):
+        QMessageBox.information(self, "Step7 Help", self._idmatch_help_text())
+
     def _update_plot_tab(self) -> None:
         if not hasattr(self, "plot_canvas") or self.plot_canvas is None:
             return
+        if hasattr(self, "plot_help_label"):
+            self.plot_help_label.setText(self._qc_help_text())
         fig = self.plot_canvas.figure
         fig.clear()
         ax1 = fig.add_subplot(1, 2, 1)
@@ -1958,9 +2163,9 @@ class StarIdMatchingWindow(StepWindowBase):
             color="#1E88E5",
             edgecolors="none",
         )
-        ax1.set_title("Match Rate vs Sep (arcsec)")
+        ax1.set_title("ID Match Rate vs Sep (arcsec)")
         ax1.set_xlabel("Sep med (arcsec)")
-        ax1.set_ylabel("Match rate")
+        ax1.set_ylabel("ID match rate (n_match / n_det)")
         ax1.grid(True, alpha=0.2)
 
         # Plot 2: dx/dy median
@@ -1992,6 +2197,35 @@ class StarIdMatchingWindow(StepWindowBase):
         fig.tight_layout()
         self.plot_canvas.draw_idle()
 
+    def save_qc_plot_image(self):
+        if not hasattr(self, "plot_canvas") or self.plot_canvas is None:
+            return
+        out_dir = step7_dir(self.params.P.result_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        date_tag = "all"
+        if hasattr(self, "plot_date_combo") and self.plot_date_combo.count():
+            txt = self.plot_date_combo.currentText().strip()
+            if txt and txt != "All":
+                date_tag = txt
+        safe_tag = re.sub(r"[^0-9A-Za-z_.-]+", "_", date_tag).strip("_") or "all"
+        default_name = out_dir / f"idmatch_qc_plot_{safe_tag}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Step7 QC Plot",
+            str(default_name),
+            "PNG Image (*.png);;PDF Document (*.pdf);;SVG Image (*.svg)"
+        )
+        if not path:
+            return
+        try:
+            self.plot_canvas.figure.savefig(path, dpi=180, bbox_inches="tight")
+            self.log(f"[IDMATCH][QC] plot saved: {path}")
+            QMessageBox.information(self, "Saved", f"QC plot saved:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", f"Failed to save QC plot:\n{e}")
+
     def _on_plot_date_changed(self, index: int) -> None:
         if index < 0:
             return
@@ -2009,6 +2243,7 @@ class StarIdMatchingWindow(StepWindowBase):
         state_data = {
             "idmatch_complete": bool(summary),
             "n_files": summary.get("total", 0) if summary else 0,
+            "idmatch_mode": str(getattr(self.params.P, "idmatch_mode", "normal")),
             "match_radius_arcsec": _coalesce_float(getattr(self.params.P, "idmatch_tol_arcsec", None), 0.0),
             "match_r_fwhm": _coalesce_float(getattr(self.params.P, "idmatch_match_r_fwhm", None), 0.8),
             "init_r_fwhm": _coalesce_float(getattr(self.params.P, "idmatch_init_r_fwhm", None), 5.0),
@@ -2025,6 +2260,8 @@ class StarIdMatchingWindow(StepWindowBase):
         state = self.project_state.get_step_data("star_id_match")
         if not state:
             return
+        if "idmatch_mode" in state:
+            self.params.P.idmatch_mode = _normalize_idmatch_mode(state["idmatch_mode"])
         if "match_r_fwhm" in state:
             self.params.P.idmatch_match_r_fwhm = _coalesce_float(state["match_r_fwhm"], 0.8)
         if "match_radius_arcsec" in state:

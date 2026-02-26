@@ -95,6 +95,14 @@ class SkyPreviewWindow(StepWindowBase):
         self._frame_key_map = {}
         self._frame_keys_by_filter = {}
         self._filter_order = []
+        # Image caches for fast frame switching (same pattern as Step8)
+        self._norm_cache: dict = {}           # (filename, stretch_idx) -> normalized float32
+        self._norm_cache_order: list = []     # LRU order
+        self._fits_cache: dict = {}           # filename -> (image_data, header)
+        self._fits_cache_order: list = []     # LRU order
+        self._display_cache: dict = {}        # (filename, stretch_idx, intensity, black) -> stretched float32
+        self._display_cache_order: list = []  # LRU order
+        self._FITS_CACHE_SIZE = max(3, int(getattr(params.P, "step3_fits_cache_size", 6)))
 
         # Stretch plot window (2D Plot)
         self.stretch_plot_dialog = None
@@ -143,10 +151,6 @@ class SkyPreviewWindow(StepWindowBase):
         self.file_combo = QComboBox()
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
         file_layout.addWidget(self.file_combo)
-
-        btn_load = QPushButton("Load Image")
-        btn_load.clicked.connect(self.load_selected_image)
-        file_layout.addWidget(btn_load)
 
         btn_params = QPushButton("⚙ Photometry Parameters")
         btn_params.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; font-weight: bold; padding: 5px 10px; }")
@@ -305,6 +309,12 @@ class SkyPreviewWindow(StepWindowBase):
         self.file_list = list(files)
         self.file_combo.clear()
         self.file_combo.addItems(files)
+        self._fits_cache.clear()
+        self._fits_cache_order.clear()
+        self._norm_cache.clear()
+        self._norm_cache_order.clear()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
         self._file_filter_map = {}
         self._file_frame_key_map = {}
         self._frame_key_map = {}
@@ -326,17 +336,10 @@ class SkyPreviewWindow(StepWindowBase):
                 self._pending_xlim = None
                 self._pending_ylim = None
 
-            # Determine path
-            if self.use_cropped and self.cropped_dir is not None:
-                file_path = self.cropped_dir / filename
-            else:
-                file_path = self.params.P.data_dir / filename
-
-            # Load FITS
-            hdul = fits.open(file_path)
-            self.image_data = hdul[0].data.astype(float).copy()
-            self.header = hdul[0].header.copy()
-            hdul.close()
+            new_data, new_header = self._load_fits_cached(filename)
+            shape_changed = (self.image_data is None or new_data.shape != self.image_data.shape)
+            self.image_data = new_data
+            self.header = new_header
 
             self.current_filename = filename
             self.current_file_index = self.file_combo.currentIndex()
@@ -346,15 +349,14 @@ class SkyPreviewWindow(StepWindowBase):
                 self._extract_frame_key(filename, self._file_filter_map.get(filename, ""))
             )
 
-            # Clear caches for new image
-            self._normalized_cache = None
-            self._imshow_obj = None
-            self.xlim_original = None
-            self.ylim_original = None
+            # Keep existing view when possible on frame switch
+            if (not keep_view) or shape_changed:
+                self._imshow_obj = None
+                self.xlim_original = None
+                self.ylim_original = None
             self.reset_stretch_plot_values()  # Reset stretch plot values for new image
 
-            # Display (full redraw for new image)
-            self.display_image(full_redraw=True)
+            self.display_image(full_redraw=(self._imshow_obj is None))
 
             # Set focus to canvas for keyboard shortcuts
             self.canvas.setFocus()
@@ -372,17 +374,41 @@ class SkyPreviewWindow(StepWindowBase):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load image:\n{str(e)}")
 
+    def _get_fits_path(self, filename: str) -> Path:
+        if self.use_cropped:
+            cropped_dir = self.cropped_dir if self.cropped_dir is not None else step2_cropped_dir(self.params.P.result_dir)
+            return cropped_dir / filename
+        return self.params.P.data_dir / filename
+
+    def _load_fits_cached(self, filename: str):
+        if filename in self._fits_cache:
+            try:
+                self._fits_cache_order.remove(filename)
+            except ValueError:
+                pass
+            self._fits_cache_order.append(filename)
+            return self._fits_cache[filename]
+
+        file_path = self._get_fits_path(filename)
+        with fits.open(file_path, memmap=False) as hdul:
+            data = np.asarray(hdul[0].data, dtype=np.float32)
+            header = hdul[0].header.copy()
+
+        while len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+            oldest = self._fits_cache_order.pop(0)
+            self._fits_cache.pop(oldest, None)
+        self._fits_cache[filename] = (data, header)
+        self._fits_cache_order.append(filename)
+        return data, header
+
     def display_image(self, full_redraw=False):
         """Display image with selected stretch"""
         if self.image_data is None:
             return
 
-        # Normalize and apply stretch
-        normalized = self.normalize_image()
-        if normalized is None:
+        stretched = self._get_stretched_display_cached()
+        if stretched is None:
             return
-
-        stretched = self.apply_stretch(normalized)
 
         # Fast update: use set_data if imshow object exists
         if self._imshow_obj is not None and not full_redraw:
@@ -394,6 +420,8 @@ class SkyPreviewWindow(StepWindowBase):
             self.ax.set_title(f"{self.current_filename} | {stretch_name}")
 
             # Use blit for even faster rendering
+            self._pending_xlim = None
+            self._pending_ylim = None
             self.canvas.draw_idle()
             return
 
@@ -443,7 +471,10 @@ class SkyPreviewWindow(StepWindowBase):
 
     def on_stretch_changed(self, index):
         """Handle stretch method change"""
-        self._normalized_cache = None  # Clear cache when method changes
+        self._norm_cache.clear()
+        self._norm_cache_order.clear()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
         self.reset_stretch_plot_values()  # Reset stretch plot values
         self.display_image()  # Just update data, not full redraw
 
@@ -452,7 +483,10 @@ class SkyPreviewWindow(StepWindowBase):
         self.stretch_slider.setValue(25)
         self.black_slider.setValue(0)
         self.scale_combo.setCurrentIndex(0)
-        self._normalized_cache = None
+        self._norm_cache.clear()
+        self._norm_cache_order.clear()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
         self.reset_stretch_plot_values()  # Reset stretch plot values
         self.display_image()
 
@@ -620,18 +654,21 @@ class SkyPreviewWindow(StepWindowBase):
         if self.image_data is None:
             return None
 
-        # Check cache
         stretch_idx = self.scale_combo.currentIndex()
-        cache_key = (id(self.image_data), stretch_idx)
-        if hasattr(self, '_normalized_cache') and self._normalized_cache is not None:
-            if self._normalized_cache[0] == cache_key:
-                return self._normalized_cache[1].copy()
+        cache_key = (self.current_filename, stretch_idx)
+        if cache_key in self._norm_cache:
+            try:
+                self._norm_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            self._norm_cache_order.append(cache_key)
+            return self._norm_cache[cache_key]
 
         finite = np.isfinite(self.image_data)
         if not finite.any():
-            return np.zeros_like(self.image_data)
+            return np.zeros_like(self.image_data, dtype=np.float32)
 
-        data = self.image_data.copy()
+        data = self.image_data
 
         if stretch_idx == 6:  # Linear (1-99%)
             vmin = np.percentile(data[finite], 1)
@@ -639,7 +676,7 @@ class SkyPreviewWindow(StepWindowBase):
         elif stretch_idx == 7:  # ZScale (IRAF)
             vmin, vmax = self.calculate_zscale()
         else:  # Auto methods - use robust background estimation
-            mean_val, median_val, std_val = sigma_clipped_stats(data[finite], sigma=3.0, maxiters=5)
+            _, median_val, std_val = sigma_clipped_stats(data[finite], sigma=3.0, maxiters=5)
             vmin = max(np.min(data[finite]), median_val - 2.8 * std_val)
             vmax = min(np.max(data[finite]), np.percentile(data[finite], 99.9))
 
@@ -649,12 +686,41 @@ class SkyPreviewWindow(StepWindowBase):
             vmax = np.max(data[finite])
 
         normalized = (data - vmin) / (vmax - vmin + 1e-10)
-        normalized = np.clip(normalized, 0, 1)
+        normalized = np.clip(normalized, 0, 1).astype(np.float32, copy=False)
 
-        # Cache the result
-        self._normalized_cache = (cache_key, normalized)
+        while len(self._norm_cache_order) >= self._FITS_CACHE_SIZE:
+            oldest = self._norm_cache_order.pop(0)
+            self._norm_cache.pop(oldest, None)
+        self._norm_cache[cache_key] = normalized
+        self._norm_cache_order.append(cache_key)
+        return normalized
 
-        return normalized.copy()
+    def _get_stretched_display_cached(self):
+        if self.image_data is None:
+            return None
+        stretch_idx = int(self.scale_combo.currentIndex())
+        intensity = int(self.stretch_slider.value())
+        black_point = int(self.black_slider.value())
+        cache_key = (self.current_filename, stretch_idx, intensity, black_point)
+        if cache_key in self._display_cache:
+            try:
+                self._display_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            self._display_cache_order.append(cache_key)
+            return self._display_cache[cache_key]
+
+        normalized = self.normalize_image()
+        if normalized is None:
+            return None
+        stretched = self.apply_stretch(normalized).astype(np.float32, copy=False)
+
+        while len(self._display_cache_order) >= self._FITS_CACHE_SIZE:
+            oldest = self._display_cache_order.pop(0)
+            self._display_cache.pop(oldest, None)
+        self._display_cache[cache_key] = stretched
+        self._display_cache_order.append(cache_key)
+        return stretched
 
     def calculate_zscale(self):
         """
@@ -684,8 +750,12 @@ class SkyPreviewWindow(StepWindowBase):
 
     def on_file_changed(self, index):
         """Handle file selection change"""
-        # Auto-load when selection changes
-        pass
+        if index < 0 or index >= len(self.file_list):
+            return
+        filename = self.file_combo.itemText(index)
+        if filename == self.current_filename and self.image_data is not None:
+            return
+        self.load_selected_image(keep_view=False)
 
     def on_button_press(self, event):
         """Handle mouse button press"""

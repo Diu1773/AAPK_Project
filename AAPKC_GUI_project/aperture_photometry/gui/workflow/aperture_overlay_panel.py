@@ -1,5 +1,5 @@
 """
-Step 10: Aperture Overlay
+Aperture Overlay Panel
 Overlay apertures/annuli and labels on a selected frame.
 """
 
@@ -29,7 +29,7 @@ from ...utils.io_utils import read_csv_int64_source_id, parse_int64_series
 
 
 class ApertureOverlayWindow(StepWindowBase):
-    """Step 10: Aperture Overlay"""
+    """Aperture Overlay panel."""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -52,7 +52,7 @@ class ApertureOverlayWindow(StepWindowBase):
         self.ax = None
 
         super().__init__(
-            step_index=9,
+            step_index=8,
             step_name="Aperture Overlay",
             params=params,
             project_state=project_state,

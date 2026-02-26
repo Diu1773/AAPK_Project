@@ -1,5 +1,5 @@
 """
-Step 9: Forced Photometry (per-frame ID-matched XY)
+Step 9-Aperture: Forced Aperture Photometry (per-frame ID-matched XY)
 Ported from AAPKI_GUI.ipynb Cell 12 (GUI adaptation).
 
 Features:
@@ -13,6 +13,7 @@ import json
 import re
 import math
 import time
+import zlib
 import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,13 +92,41 @@ def _norm_path_key(path_value) -> str:
     return s.lower()
 
 
-def _build_source_signature(path: Path, *, use_cropped: bool) -> dict:
+def _fast_file_crc32(path: Path, sample_bytes: int = 8192) -> int | None:
+    """Compute a cheap content fingerprint from head/mid/tail samples."""
+    try:
+        st = path.stat()
+        size = int(st.st_size)
+        if size <= 0:
+            return None
+        n = int(max(1024, sample_bytes))
+        crc = 0
+        with path.open("rb") as fh:
+            head = fh.read(n)
+            crc = zlib.crc32(head, crc)
+            if size > 2 * n:
+                mid_pos = max(0, size // 2 - n // 2)
+                fh.seek(mid_pos)
+                mid = fh.read(n)
+                crc = zlib.crc32(mid, crc)
+            if size > n:
+                tail_pos = max(0, size - n)
+                fh.seek(tail_pos)
+                tail = fh.read(n)
+                crc = zlib.crc32(tail, crc)
+        return int(crc & 0xFFFFFFFF)
+    except Exception:
+        return None
+
+
+def _build_source_signature(path: Path, *, use_cropped: bool, include_crc: bool = False) -> dict:
     sig = {
-        "cache_schema": 1,
+        "cache_schema": 3,
         "source_path": _norm_path_key(path),
         "source_use_cropped": bool(use_cropped),
         "source_size": None,
         "source_mtime_ns": None,
+        "source_crc32": None,
     }
     try:
         st = path.stat()
@@ -105,6 +134,8 @@ def _build_source_signature(path: Path, *, use_cropped: bool) -> dict:
         sig["source_mtime_ns"] = int(st.st_mtime_ns)
     except Exception:
         pass
+    if include_crc:
+        sig["source_crc32"] = _fast_file_crc32(path)
     return sig
 
 
@@ -122,7 +153,62 @@ def _source_signature_compatible(saved_sig: dict, current_sig: dict) -> bool:
         return False
     if saved_size <= 0 or curr_size <= 0:
         return False
-    return saved_size == curr_size
+    if saved_size != curr_size:
+        return False
+
+    # Legacy signatures (schema<3) were mtime/size-centric; keep them soft-compatible
+    # to avoid one-time cache miss storms and upgrade on first cache hit.
+    try:
+        saved_schema = int(saved_sig.get("cache_schema", 0) or 0)
+    except Exception:
+        saved_schema = 0
+    if saved_schema < 3:
+        return True
+
+    try:
+        saved_mtime_ns = int(saved_sig.get("source_mtime_ns"))
+        curr_mtime_ns = int(current_sig.get("source_mtime_ns"))
+    except Exception:
+        saved_mtime_ns = -1
+        curr_mtime_ns = -2
+    if saved_mtime_ns > 0 and curr_mtime_ns > 0 and saved_mtime_ns == curr_mtime_ns:
+        return True
+
+    saved_crc = current_crc = None
+    try:
+        saved_crc = int(saved_sig.get("source_crc32"))
+    except Exception:
+        pass
+    try:
+        current_crc = int(current_sig.get("source_crc32"))
+    except Exception:
+        pass
+    if saved_crc is None or current_crc is None:
+        return False
+    if saved_crc < 0 or current_crc < 0:
+        return False
+    return saved_crc == current_crc
+
+
+def _has_valid_crc32(value) -> bool:
+    try:
+        return int(value) >= 0
+    except Exception:
+        return False
+
+
+def _should_log_cache_detail(done_idx: int, total_frames: int, *, head_n: int, tail_n: int, every_n: int) -> bool:
+    if total_frames <= 0:
+        return True
+    idx = max(int(done_idx), 1)
+    head_n = max(int(head_n), 0)
+    tail_n = max(int(tail_n), 0)
+    every_n = int(every_n)
+    if idx <= head_n:
+        return True
+    if tail_n > 0 and idx > max(total_frames - tail_n, head_n):
+        return True
+    return bool(every_n > 0 and idx % every_n == 0)
 
 
 def _get_filter_lower(fits_path: Path):
@@ -305,7 +391,9 @@ class ForcedPhotometryWorker(QThread):
             master = pd.read_csv(master_path, sep="\t")
 
             ap_mode = str(getattr(P, "aperture_mode", getattr(P, "ap_mode", "apcorr"))).strip().lower()
-            resume = bool(getattr(P, "resume_mode", True))
+            resume_global = bool(getattr(P, "resume_mode", True))
+            step9_use_cache = bool(getattr(P, "step9_use_cache", False))
+            resume = bool(resume_global and step9_use_cache)
             force_rephot = bool(getattr(P, "force_rephot", False))
 
             GAIN = float(getattr(P, "gain_e_per_adu", 0.1))
@@ -325,10 +413,14 @@ class ForcedPhotometryWorker(QThread):
             sky_sigma_mode = str(getattr(P, "sky_sigma_mode", "local")).strip().lower()
             sky_sigma_includes_rn = bool(getattr(P, "sky_sigma_includes_rn", True))
             min_n_sky_for_local = int(getattr(P, "sky_sigma_min_n_sky", 50))
+            cache_log_every_n = max(int(getattr(P, "cache_log_every_n", 20)), 0)
+            cache_log_head_n = max(int(getattr(P, "cache_log_head_n", 3)), 0)
+            cache_log_tail_n = max(int(getattr(P, "cache_log_tail_n", 2)), 0)
 
             self._log(
                 "Start forced photometry | "
-                f"frames={len(self.file_list)} | resume={resume} | force_rephot={force_rephot} | "
+                f"frames={len(self.file_list)} | resume_global={resume_global} | "
+                f"step9_use_cache={step9_use_cache} | cache_active={resume} | force_rephot={force_rephot} | "
                 f"ap_mode={ap_mode} | ZP={ZP} (ADU/sec) | gain={GAIN} e-/ADU | "
                 f"min_snr={min_snr_for_mag} | use_cropped={self.use_cropped}"
             )
@@ -525,6 +617,8 @@ class ForcedPhotometryWorker(QThread):
             total = len(frames)
             counters = {"cached": 0, "processed": 0, "no_targets": 0, "no_aperture": 0, "stopped": 0}
             completed_count = [0]  # Use list for mutable in closure
+            cache_logs_suppressed = [0]
+            cache_sig_upgrades = [0]
 
             # Per-frame processing function (for parallel execution)
             def process_single_frame(fname):
@@ -542,7 +636,7 @@ class ForcedPhotometryWorker(QThread):
 
                 out_tsv = output_dir / f"{fname}_photometry.tsv"
                 sig_json = output_dir / f"{fname}_photometry.sig.json"
-                source_sig = _build_source_signature(fpath, use_cropped=bool(self.use_cropped))
+                source_sig = None
                 deps = [master_path, ap_path]
                 idmatch_path = cache_dir / "idmatch" / f"idmatch_{fname}.csv"
                 if idmatch_path.exists():
@@ -552,15 +646,58 @@ class ForcedPhotometryWorker(QThread):
 
                 # Check cache
                 cache_ok = False
+                saved_sig = None
+                saved_schema = 0
+                sig_upgraded = False
+                need_sig_upgrade = False
                 if resume and (not force_rephot) and out_tsv.exists():
                     cache_ok = _is_up_to_date(out_tsv, deps)
-                    if cache_ok and sig_json.exists():
-                        try:
-                            saved_sig = json.loads(sig_json.read_text(encoding="utf-8"))
+                    if cache_ok:
+                        if sig_json.exists():
+                            try:
+                                saved_sig = json.loads(sig_json.read_text(encoding="utf-8"))
+                            except Exception:
+                                # Keep cache soft (deps-based) for broken signature files.
+                                saved_sig = None
+                        if isinstance(saved_sig, dict):
+                            try:
+                                saved_schema = int(saved_sig.get("cache_schema", 0) or 0)
+                            except Exception:
+                                saved_schema = 0
+                            source_sig = _build_source_signature(
+                                fpath,
+                                use_cropped=bool(self.use_cropped),
+                                include_crc=False
+                            )
                             cache_ok = _source_signature_compatible(saved_sig, source_sig)
-                        except Exception:
-                            cache_ok = False
+                            # Schema>=3 can fall back to CRC compare only when mtime changed.
+                            if (not cache_ok) and saved_schema >= 3 and _has_valid_crc32(saved_sig.get("source_crc32")):
+                                source_sig = _build_source_signature(
+                                    fpath,
+                                    use_cropped=bool(self.use_cropped),
+                                    include_crc=True
+                                )
+                                cache_ok = _source_signature_compatible(saved_sig, source_sig)
+                            need_sig_upgrade = cache_ok and (
+                                saved_schema < 3 or (not _has_valid_crc32(saved_sig.get("source_crc32")))
+                            )
+                        else:
+                            # Missing/invalid signature: allow deps-based cache and backfill signature.
+                            need_sig_upgrade = True
                 if cache_ok:
+                    if need_sig_upgrade:
+                        if source_sig is None or (not _has_valid_crc32(source_sig.get("source_crc32"))):
+                            source_sig = _build_source_signature(
+                                fpath,
+                                use_cropped=bool(self.use_cropped),
+                                include_crc=True
+                            )
+                        try:
+                            with self._write_lock:
+                                sig_json.write_text(json.dumps(source_sig, ensure_ascii=False, indent=2), encoding="utf-8")
+                            sig_upgraded = True
+                        except Exception:
+                            sig_upgraded = False
                     n, n_goodmag, n_fail, targets = _cached_counts(fname, out_tsv)
                     idx_row = dict(
                         file=fname, filter=this_filter,
@@ -569,7 +706,8 @@ class ForcedPhotometryWorker(QThread):
                     )
                     dbg_row = dict(
                         file=fname, cached=True,
-                        n=n, n_goodmag=n_goodmag, n_fail=n_fail, targets=targets
+                        n=n, n_goodmag=n_goodmag, n_fail=n_fail, targets=targets,
+                        cache_sig_upgraded=sig_upgraded, cache_saved_schema=saved_schema
                     )
                     return fname, idx_row, dbg_row, [], "cached"
 
@@ -699,6 +837,12 @@ class ForcedPhotometryWorker(QThread):
                     ))
 
                 df_out = pd.DataFrame(rows)
+                if source_sig is None or (not _has_valid_crc32(source_sig.get("source_crc32"))):
+                    source_sig = _build_source_signature(
+                        fpath,
+                        use_cropped=bool(self.use_cropped),
+                        include_crc=True
+                    )
                 with self._write_lock:
                     df_out.to_csv(out_tsv, sep="\t", index=False, na_rep="NaN")
                     try:
@@ -749,6 +893,8 @@ class ForcedPhotometryWorker(QThread):
                             index_rows.append(idx_row)
                         if dbg_row:
                             debug_frames.append(dbg_row)
+                            if bool(dbg_row.get("cache_sig_upgraded", False)):
+                                cache_sig_upgrades[0] += 1
                         if fail_rows:
                             _fail_rows_all.extend(fail_rows)
 
@@ -791,10 +937,19 @@ class ForcedPhotometryWorker(QThread):
                         elif status == "cached" and idx_row:
                             n_good = int(_safe_float(idx_row.get("n_goodmag", 0), 0.0))
                             n_tgt = int(_safe_float(idx_row.get("targets", 0), 0.0))
-                            self._log(
-                                f"[Frame {completed_count[0]}/{total}] CACHE {fname} | "
-                                f"f={filt} targets={n_tgt} good={n_good}"
-                            )
+                            if _should_log_cache_detail(
+                                completed_count[0],
+                                total,
+                                head_n=cache_log_head_n,
+                                tail_n=cache_log_tail_n,
+                                every_n=cache_log_every_n,
+                            ):
+                                self._log(
+                                    f"[Frame {completed_count[0]}/{total}] CACHE {fname} | "
+                                    f"f={filt} targets={n_tgt} good={n_good}"
+                                )
+                            else:
+                                cache_logs_suppressed[0] += 1
                         elif status == "no_targets":
                             self._log(
                                 f"[Frame {completed_count[0]}/{total}] SKIP {fname} | "
@@ -834,7 +989,13 @@ class ForcedPhotometryWorker(QThread):
                     "bkg_use_segm_mask": bool(bkg_use_segm_mask),
                     "recenter_aperture": bool(recenter_aperture),
                     "max_recenter_shift": max_recenter_shift,
-                    "RESUME": bool(resume), "FORCE_REPHOT": bool(force_rephot),
+                    "RESUME_GLOBAL": bool(resume_global),
+                    "STEP9_USE_CACHE": bool(step9_use_cache),
+                    "RESUME_ACTIVE": bool(resume),
+                    "FORCE_REPHOT": bool(force_rephot),
+                    "cache_log_every_n": cache_log_every_n,
+                    "cache_log_head_n": cache_log_head_n,
+                    "cache_log_tail_n": cache_log_tail_n,
                 },
                 "inputs": {
                     "master_catalog": str(master_path.name),
@@ -845,6 +1006,15 @@ class ForcedPhotometryWorker(QThread):
                 "per_frame": debug_frames,
             }
             debug_json.write_text(json.dumps(debug_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            if cache_logs_suppressed[0] > 0:
+                self._log(
+                    "CACHE detail logs sampled | "
+                    f"first={cache_log_head_n} last={cache_log_tail_n} every={cache_log_every_n} | "
+                    f"suppressed={cache_logs_suppressed[0]}"
+                )
+            if cache_sig_upgrades[0] > 0:
+                self._log(f"CACHE signatures upgraded={cache_sig_upgrades[0]}")
 
             self._log(
                 "Done | "
@@ -871,7 +1041,7 @@ class ForcedPhotometryWorker(QThread):
 
 
 class ForcedPhotometryWindow(StepWindowBase):
-    """Step 9: Forced Photometry"""
+    """Step 9-Aperture: Forced Aperture Photometry"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -888,7 +1058,7 @@ class ForcedPhotometryWindow(StepWindowBase):
 
         super().__init__(
             step_index=8,
-            step_name="Forced Photometry",
+            step_name="Aperture Photometry",
             params=params,
             project_state=project_state,
             main_window=main_window
@@ -898,7 +1068,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.restore_state()
 
     def setup_step_ui(self):
-        info = QLabel("Forced photometry per frame based on ID-matched positions.")
+        info = QLabel("Forced aperture photometry per frame based on ID-matched positions.")
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         self.content_layout.addWidget(info)
 
@@ -982,7 +1152,10 @@ class ForcedPhotometryWindow(StepWindowBase):
         apcorr_control_run.addWidget(self.btn_log_apcorr)
         apcorr_layout.addLayout(apcorr_control_run)
 
-        apcorr_note = QLabel("Growth curve: finds optimal aperture (min error) and computes aperture correction.")
+        apcorr_note = QLabel(
+            "Growth curve: finds optimal aperture (min error) and computes aperture correction.\n"
+            "n_stars = valid stars at each radius, summary n_stars = valid count at optimal radius."
+        )
         apcorr_note.setStyleSheet("QLabel { background-color: #FFF8E1; padding: 8px; border-radius: 4px; }")
         apcorr_layout.addWidget(apcorr_note)
 
@@ -1021,7 +1194,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_file_cand_table.setColumnCount(7)
         self.apcorr_file_cand_table.setHorizontalHeaderLabels([
             "scale", "r (px)", "med_mag", "med_mag_err",
-            "med_SNR", "n_stars", "selected"
+            "med_SNR", "n_stars(valid)", "selected"
         ])
         for col in range(7):
             mode = QHeaderView.Stretch if col in (0, 1) else QHeaderView.ResizeToContents
@@ -1041,7 +1214,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_table.setColumnCount(9)
         self.apcorr_table.setHorizontalHeaderLabels([
             "Frame", "FWHM(px)", "Opt r(px)", "Opt scale",
-            "Apcorr", "SNR_opt", "mag_err_opt", "n_stars", "apply"
+            "Apcorr", "SNR_opt", "mag_err_opt", "n_stars(opt)", "apply"
         ])
         self.apcorr_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, 9):
@@ -1051,6 +1224,32 @@ class ForcedPhotometryWindow(StepWindowBase):
         apcorr_layout.addWidget(apcorr_sel_group)
         self.main_tabs.addTab(apcorr_tab, "Apcorr QC")
         self.main_tabs.addTab(summary_tab, "Photometry")
+
+        # Overlay tab (moved from old standalone overlay step)
+        overlay_tab = QWidget()
+        overlay_layout = QVBoxLayout(overlay_tab)
+        try:
+            from .aperture_overlay_panel import ApertureOverlayWindow
+
+            self.overlay_panel = ApertureOverlayWindow(
+                self.params, self.file_manager, self.project_state, self.main_window
+            )
+            # Embed old step window as a tab panel: hide step header/nav only.
+            for attr in ("title_label", "btn_previous", "btn_complete", "btn_next"):
+                w = getattr(self.overlay_panel, attr, None)
+                if w is not None:
+                    w.hide()
+            overlay_layout.addWidget(self.overlay_panel)
+        except Exception as e:
+            self.overlay_panel = None
+            warn = QLabel(
+                "Overlay panel failed to load.\n"
+                f"{type(e).__name__}: {e}"
+            )
+            warn.setStyleSheet("QLabel { color: #b71c1c; padding: 10px; }")
+            overlay_layout.addWidget(warn)
+
+        self.main_tabs.addTab(overlay_tab, "Overlay")
         self.main_tabs.setCurrentIndex(0)
 
         self.log_window = QWidget(self, Qt.Window)
@@ -1155,6 +1354,8 @@ class ForcedPhotometryWindow(StepWindowBase):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
 
+        form.addRow(QLabel("── Basic photometry ────────────────────"))
+
         self.param_zp = QDoubleSpinBox()
         self.param_zp.setRange(10.0, 40.0)
         self.param_zp.setValue(float(getattr(self.params.P, "zp_initial", 25.0)))
@@ -1173,9 +1374,14 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.param_ap_mode.setText(str(getattr(self.params.P, "aperture_mode", "apcorr")))
         form.addRow("Aperture Mode:", self.param_ap_mode)
 
+        form.addRow(QLabel("── Execution / cache ───────────────────"))
+
         self.param_force = QCheckBox("Force re-phot")
         self.param_force.setChecked(bool(getattr(self.params.P, "force_rephot", False)))
         form.addRow("Force:", self.param_force)
+        self.param_step9_cache = QCheckBox("Enable Step9 cache")
+        self.param_step9_cache.setChecked(bool(getattr(self.params.P, "step9_use_cache", False)))
+        form.addRow("Step9 Cache:", self.param_step9_cache)
 
         layout.addLayout(form)
 
@@ -1249,6 +1455,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.params.P.recenter_aperture = self.param_recenter.isChecked()
         self.params.P.aperture_mode = self.param_ap_mode.text().strip()
         self.params.P.force_rephot = self.param_force.isChecked()
+        self.params.P.step9_use_cache = self.param_step9_cache.isChecked()
         self.params.P.phot_aperture_scale = self.param_ap_scale.value()
         self.params.P.fitsky_annulus_scale = self.param_ann_in.value()
         self.params.P.fitsky_dannulus_scale = self.param_ann_out.value()
@@ -1287,6 +1494,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.log(
             "Params | "
             f"files={len(self.file_list)} | use_cropped={self.use_cropped} | "
+            f"step9_use_cache={getattr(self.params.P, 'step9_use_cache', False)} | "
             f"force_rephot={getattr(self.params.P, 'force_rephot', False)} | "
             f"ap_mode={getattr(self.params.P, 'aperture_mode', 'apcorr')} | "
             f"min_snr={getattr(self.params.P, 'min_snr_for_mag', 3.0)}"
@@ -1809,6 +2017,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         apply_on = False
         r_optimal = np.nan
         apcorr_val = np.nan
+        fwhm_used = np.nan
         if not df_sum.empty and "file" in df_sum.columns:
             frame_sum = df_sum[df_sum["file"].astype(str) == str(filename)]
             if not frame_sum.empty:
@@ -1816,6 +2025,7 @@ class ForcedPhotometryWindow(StepWindowBase):
                 apply_on = _as_bool(row_s.get("apply", False), False)
                 r_optimal = float(row_s.get("r_optimal", np.nan))
                 apcorr_val = float(row_s.get("apcorr", np.nan))
+                fwhm_used = float(row_s.get("fwhm_used", np.nan))
 
         # --- Top subplot: Growth Curve (Magnitude vs Aperture Radius) ---
         if np.any(finite_mag):
@@ -1838,7 +2048,14 @@ class ForcedPhotometryWindow(StepWindowBase):
             ax_mag.axvspan(r_optimal * 0.9, r_optimal * 1.1,
                            color="#E53935", alpha=0.08)
 
-        ax_mag.invert_yaxis()  # brighter = up
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            ax_mag.axvline(
+                fwhm_used, color="#6D4C41", linewidth=1.2, linestyle=":",
+                alpha=0.8, label=f"FWHM={fwhm_used:.2f} px"
+            )
+
+        # Brighter stars are lower magnitude values.
+        ax_mag.invert_yaxis()
         ax_mag.set_ylabel("Median Magnitude (inst)", fontsize=9)
         title_str = f"{filename} | filter={filt_sel}"
         if np.isfinite(apcorr_val):
@@ -1868,7 +2085,31 @@ class ForcedPhotometryWindow(StepWindowBase):
             ax_err.axvspan(r_optimal * 0.9, r_optimal * 1.1,
                            color="#E53935", alpha=0.08)
 
-        ax_err.set_xlabel("Aperture radius (px)", fontsize=9)
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            ax_err.axvline(
+                fwhm_used, color="#6D4C41", linewidth=1.2, linestyle=":",
+                alpha=0.8, label=f"FWHM={fwhm_used:.2f} px"
+            )
+
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            sec_mag = ax_mag.secondary_xaxis(
+                "top",
+                functions=(lambda x: x / fwhm_used, lambda s: s * fwhm_used),
+            )
+            sec_mag.set_xlabel("Radius (×FWHM)", fontsize=8)
+            sec_mag.tick_params(labelsize=8)
+
+            sec_err = ax_err.secondary_xaxis(
+                "top",
+                functions=(lambda x: x / fwhm_used, lambda s: s * fwhm_used),
+            )
+            sec_err.set_xlabel("Radius (×FWHM)", fontsize=8)
+            sec_err.tick_params(labelsize=8)
+
+        x_label = "Aperture radius (px)"
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            x_label += f" | FWHM={fwhm_used:.2f}px"
+        ax_err.set_xlabel(x_label, fontsize=9)
         ax_err.set_ylabel("Median mag error", fontsize=9)
         ax_err.set_title("Error vs Aperture (U-shape: Poisson left, sky noise right)", fontsize=9)
         ax_err.grid(True, alpha=0.25)
@@ -1883,6 +2124,12 @@ class ForcedPhotometryWindow(StepWindowBase):
             self.stop_photometry()
         if self.apcorr_worker and self.apcorr_worker.isRunning():
             self.stop_apcorr()
+        if getattr(self, "overlay_panel", None) is not None:
+            try:
+                if hasattr(self.overlay_panel, "log_window") and self.overlay_panel.log_window is not None:
+                    self.overlay_panel.log_window.close()
+            except Exception:
+                pass
         if not self._cleanup_worker(timeout_ms=10000):
             QMessageBox.warning(
                 self,
@@ -1910,6 +2157,7 @@ class ForcedPhotometryWindow(StepWindowBase):
     def save_state(self):
         state_data = {
             "force_rephot": getattr(self.params.P, "force_rephot", False),
+            "step9_use_cache": getattr(self.params.P, "step9_use_cache", False),
             "aperture_mode": getattr(self.params.P, "aperture_mode", "apcorr"),
             "min_snr_for_mag": getattr(self.params.P, "min_snr_for_mag", 3.0),
             "phot_aperture_scale": getattr(self.params.P, "phot_aperture_scale", 1.0),

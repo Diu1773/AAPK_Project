@@ -286,12 +286,28 @@ class ExtinctionFitWorker(QThread):
             if g_col is None or bp_col is None or rp_col is None:
                 if "source_id" not in df.columns:
                     raise RuntimeError("Gaia mags not available and source_id missing")
-                gaia_path = step5_dir(result_dir) / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    gaia_path = result_dir / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    raise RuntimeError("gaia_fov.ecsv not found")
-                gaia_df = read_ecsv_int64_source_id(gaia_path)
+                gaia_candidates = [
+                    step5_dir(result_dir) / "gaia_derived.csv",
+                    result_dir / "gaia_derived.csv",
+                    step5_dir(result_dir) / "gaia_fov.ecsv",
+                    result_dir / "gaia_fov.ecsv",
+                ]
+                gaia_df = None
+                for gaia_path in gaia_candidates:
+                    if not gaia_path.exists():
+                        continue
+                    try:
+                        if gaia_path.suffix.lower() == ".ecsv":
+                            gaia_df = read_ecsv_int64_source_id(gaia_path)
+                        else:
+                            gaia_df = pd.read_csv(gaia_path)
+                    except Exception:
+                        gaia_df = None
+                        continue
+                    if gaia_df is not None and (not gaia_df.empty):
+                        break
+                if gaia_df is None or gaia_df.empty:
+                    raise RuntimeError("step5_wcs/gaia_derived.csv not found")
                 gaia_df["source_id"] = parse_int64_series(gaia_df["source_id"]).astype("Int64")
                 df["source_id"] = parse_int64_series(df["source_id"]).astype("Int64")
                 gaia_cols = ["source_id", "phot_g_mean_mag"]

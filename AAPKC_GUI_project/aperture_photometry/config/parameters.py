@@ -62,6 +62,7 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("parallel", "mode"), "parallel_mode"),
     (("parallel", "max_workers"), "max_workers"),
     (("parallel", "resume_mode"), "resume_mode"),
+    (("parallel", "step9_use_cache"), "step9_use_cache"),
     (("parallel", "force_redetect"), "force_redetect"),
     (("parallel", "force_rephot"), "force_rephot"),
     (("parallel", "detect_cache_strategy"), "detect_cache_strategy"),
@@ -85,6 +86,7 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("clip", "min_adu"), "clip_min_adu"),
     (("clip", "max_adu"), "clip_max_adu"),
     (("detection", "engine"), "detect_engine"),
+    (("detection", "mode"), "detect_mode"),
     (("detection", "sigma"), "detect_sigma"),
     (("detection", "sigma_g"), "detect_sigma_g"),
     (("detection", "sigma_r"), "detect_sigma_r"),
@@ -204,9 +206,25 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("gaia", "retry"), "gaia_retry"),
     (("gaia", "backoff_s"), "gaia_backoff_s"),
     (("gaia", "allow_no_cache"), "gaia_allow_no_cache"),
+    (("gaia", "derived_enable"), "gaia_derived_enable"),
+    (("gaia", "pmem_method"), "gaia_pmem_method"),
+    (("gaia", "pmem_ruwe_max"), "gaia_pmem_ruwe_max"),
+    (("gaia", "pmem_min_visibility_periods"), "gaia_pmem_min_visibility_periods"),
+    (("gaia", "pmem_min_valid"), "gaia_pmem_min_valid"),
+    (("gaia", "pmem_min_fit"), "gaia_pmem_min_fit"),
     (("gaia", "g_limit"), "idmatch_gaia_g_limit"),
+    (("idmatch", "mode"), "idmatch_mode"),
     (("idmatch", "gaia_g_limit"), "idmatch_gaia_g_limit"),
     (("idmatch", "use_gaia_refs_only"), "idmatch_use_gaia_refs_only"),
+    (("idmatch", "match_r_fwhm"), "idmatch_match_r_fwhm"),
+    (("idmatch", "two_pass_enable"), "idmatch_two_pass_enable"),
+    (("idmatch", "tight_radius_arcsec"), "idmatch_tight_radius_arcsec"),
+    (("idmatch", "loose_radius_arcsec"), "idmatch_loose_radius_arcsec"),
+    (("idmatch", "adaptive_retry_threshold"), "idmatch_adaptive_retry_threshold"),
+    (("idmatch", "fwhm_adaptive_floor"), "idmatch_fwhm_adaptive_floor"),
+    (("idmatch", "geom_correction_enable"), "idmatch_geom_correction_enable"),
+    (("idmatch", "min_correction_pairs"), "idmatch_min_correction_pairs"),
+    (("idmatch", "min_affine_pairs"), "idmatch_min_affine_pairs"),
     (("idmatch", "tol_px"), "idmatch_tol_px"),
     (("idmatch", "tol_arcsec"), "idmatch_tol_arcsec"),
     (("idmatch", "force"), "force_idmatch"),
@@ -228,11 +246,15 @@ TOML_KEY_MAP: list[tuple[Iterable[str], str]] = [
     (("master_editor", "search_radius_px"), "search_radius_px"),
     (("master_editor", "bulk_drop_box_px"), "bulk_drop_box_px"),
     (("master_editor", "gaia_add_max_sep_arcsec"), "gaia_add_max_sep_arcsec"),
+    (("master_editor", "membership_overlay_enable"), "step8_membership_overlay_enable"),
+    (("master_editor", "membership_threshold"), "step8_membership_threshold"),
     (("match", "tol_px"), "match_tol_px"),
     (("match", "wcs_radius_arcsec"), "wcs_match_radius_arcsec"),
     (("match", "min_gaia_matches"), "min_master_gaia_matches"),
     (("cmd", "snr_calib_min"), "cmd_snr_calib_min"),
     (("cmd", "max_sources"), "cmd_max_sources"),
+    (("cmd", "membership_mode"), "cmd_membership_mode"),
+    (("cmd", "membership_compare"), "cmd_membership_compare"),
     (("cmd", "apply_extinction"), "cmd_apply_extinction"),
     (("cmd", "extinction_mode"), "cmd_extinction_mode"),
     (("cmd", "frame_zp_min_n"), "frame_zp_min_n"),
@@ -415,6 +437,7 @@ class Parameters:
             parallel_max_workers=parallel_workers,
             ui_log_tail=_geti(raw, "ui_log_tail", 300),
             resume_mode=_as_bool(raw.get("resume_mode", "true"), True),
+            step9_use_cache=_as_bool(raw.get("step9_use_cache", "false"), False),
             force_redetect=_as_bool(raw.get("force_redetect", "false"), False),
             force_rephot=_as_bool(raw.get("force_rephot", "false"), False),
             detect_cache_strategy=raw.get("detect_cache_strategy", "mtime"),
@@ -439,6 +462,7 @@ class Parameters:
 
             # Detection parameters
             detect_engine=raw.get("detect_engine", "segm"),
+            detect_mode=str(raw.get("detect_mode", "normal")).strip().lower() or "normal",
             detect_sigma=_getf(raw, "detect_sigma", 3.2),
             detect_sigma_g=_as_float_or_none(raw.get("detect_sigma_g", "")),
             detect_sigma_r=_as_float_or_none(raw.get("detect_sigma_r", "")),
@@ -522,8 +546,18 @@ class Parameters:
             sky_sigma_min_n_sky=_geti(raw, "sky_sigma_min_n_sky", 50),
 
             # ID matching
+            idmatch_mode=str(raw.get("idmatch_mode", "normal")).strip().lower() or "normal",
             idmatch_gaia_g_limit=_getf(raw, "idmatch_gaia_g_limit", 18.0),
             idmatch_use_gaia_refs_only=_as_bool(raw.get("idmatch_use_gaia_refs_only", "false"), False),
+            idmatch_match_r_fwhm=_getf(raw, "idmatch_match_r_fwhm", 0.8),
+            idmatch_two_pass_enable=_as_bool(raw.get("idmatch_two_pass_enable", "true"), True),
+            idmatch_tight_radius_arcsec=_getf(raw, "idmatch_tight_radius_arcsec", 1.0),
+            idmatch_loose_radius_arcsec=_getf(raw, "idmatch_loose_radius_arcsec", 3.0),
+            idmatch_adaptive_retry_threshold=_getf(raw, "idmatch_adaptive_retry_threshold", 0.5),
+            idmatch_fwhm_adaptive_floor=_as_bool(raw.get("idmatch_fwhm_adaptive_floor", "true"), True),
+            idmatch_geom_correction_enable=_as_bool(raw.get("idmatch_geom_correction_enable", "true"), True),
+            idmatch_min_correction_pairs=_geti(raw, "idmatch_min_correction_pairs", 3),
+            idmatch_min_affine_pairs=_geti(raw, "idmatch_min_affine_pairs", 6),
             idmatch_tol_arcsec=_as_float_or_none(raw.get("idmatch_tol_arcsec", "")),
             idmatch_tol_px=_getf(raw, "idmatch_tol_px", 2.0),
             force_idmatch=_as_bool(raw.get("force_idmatch", "false"), False),
@@ -550,6 +584,8 @@ class Parameters:
             search_radius_px=_getf(raw, "search_radius_px", 7.0),
             bulk_drop_box_px=_geti(raw, "bulk_drop_box_px", 200),
             gaia_add_max_sep_arcsec=_getf(raw, "gaia_add_max_sep_arcsec", 2.0),
+            step8_membership_overlay_enable=_as_bool(raw.get("step8_membership_overlay_enable", "false"), False),
+            step8_membership_threshold=_getf(raw, "step8_membership_threshold", 0.5),
 
             # REF build
             force_master_build=_as_bool(raw.get("force_master_build", "false"), False),
@@ -616,6 +652,12 @@ class Parameters:
             gaia_retry=_geti(raw, "gaia_retry", 2),
             gaia_backoff_s=_getf(raw, "gaia_backoff_s", 6.0),
             gaia_allow_no_cache=_as_bool(raw.get("gaia_allow_no_cache", "true"), True),
+            gaia_derived_enable=_as_bool(raw.get("gaia_derived_enable", "true"), True),
+            gaia_pmem_method=str(raw.get("gaia_pmem_method", "gmm3d")).strip().lower() or "gmm3d",
+            gaia_pmem_ruwe_max=_getf(raw, "gaia_pmem_ruwe_max", 2.0),
+            gaia_pmem_min_visibility_periods=_getf(raw, "gaia_pmem_min_visibility_periods", 8.0),
+            gaia_pmem_min_valid=_geti(raw, "gaia_pmem_min_valid", 30),
+            gaia_pmem_min_fit=_geti(raw, "gaia_pmem_min_fit", 25),
             idmatch_use_qc_pass_only=_as_bool(raw.get("idmatch_use_qc_pass_only", "true"), True),
             idmatch_use_wcs_qc_gate=_as_bool(raw.get("idmatch_use_wcs_qc_gate", "true"), True),
             idmatch_wcs_qc_min_match_rate=_getf(raw, "idmatch_wcs_qc_min_match_rate", 0.20),
@@ -641,6 +683,8 @@ class Parameters:
             match_tol_px=_getf(raw, "match_tol_px", 1.0),
             min_master_gaia_matches=_geti(raw, "min_master_gaia_matches", 10),
             cmd_snr_calib_min=_getf(raw, "cmd_snr_calib_min", 20.0),
+            cmd_membership_mode=raw.get("cmd_membership_mode", "off"),
+            cmd_membership_compare=_as_bool(raw.get("cmd_membership_compare", "true"), True),
             zp_clip_sigma=_getf(raw, "zp_clip_sigma", 3.0),
             zp_fit_iters=_geti(raw, "zp_fit_iters", 5),
             zp_slope_absmax=_getf(raw, "zp_slope_absmax", 1.0),
@@ -797,11 +841,19 @@ class Parameters:
         print(f"DATA_DIR      : {P.data_dir}")
         print(f"RESULT_DIR    : {P.result_dir}")
         print(f"CACHE_DIR     : {P.cache_dir}")
-        print(f"resume_mode   : {P.resume_mode} | force_redetect={P.force_redetect} | force_rephot={P.force_rephot}")
+        print(
+            f"resume_mode   : {P.resume_mode} | step9_use_cache={getattr(P, 'step9_use_cache', False)} | "
+            f"force_redetect={P.force_redetect} | force_rephot={P.force_rephot}"
+        )
+        print(
+            f"idmatch_mode  : {getattr(P, 'idmatch_mode', 'normal')} | "
+            f"gaia_only={getattr(P, 'idmatch_use_gaia_refs_only', False)}"
+        )
         print(f"parallel_mode : {P.parallel_mode} | max_workers={P.max_workers}")
         print(f"FWHM seed     : {P.fwhm_seed_px:.2f} px (from={getattr(P, '_fwhm_seed_from', '?')})")
         print(f"FWHM range    : {P.fwhm_px_min:.2f} ~ {P.fwhm_px_max:.2f} px | elong_max={P.fwhm_elong_max} | iso_min_sep={P.iso_min_sep_pix}px")
         print(f"bkg2d detect  : {P.bkg2d_in_detect} | box={P.bkg2d_box}")
+        print(f"detect_mode   : {getattr(P, 'detect_mode', 'normal')}")
         print(f"detect_sigma  : base={P.detect_sigma} | g={P.detect_sigma_g} r={P.detect_sigma_r} i={P.detect_sigma_i}")
         print(f"deblend       : enable={P.deblend_enable} nthresh={P.deblend_nthresh} cont={P.deblend_cont} dilate={P.segm_dilate_radius_px}")
         print(f"clip          : sat_adu={P.saturation_adu}")

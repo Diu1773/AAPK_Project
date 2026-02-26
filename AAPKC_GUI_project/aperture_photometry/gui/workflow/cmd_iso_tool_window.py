@@ -1,6 +1,6 @@
 """
 CMD + Isochrone Tool
-Open CMD viewer and Isochrone Model (Step 13) from a selected result folder.
+Open CMD viewer and Isochrone Model (Step 12) from a selected result folder.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel, QMessageBox, QFileDialog
 )
 
-from .step11_zeropoint_calibration import CmdViewerWindow
-from .step13_isochrone_model import IsochroneModelWindow
+from .step10_zeropoint_calibration import CmdViewerWindow
+from .step12_isochrone_model import IsochroneModelWindow
 
 
 class _ParamsNamespaceProxy:
@@ -122,7 +122,7 @@ class CmdIsoToolWindow(QMainWindow):
         self.iso_placeholder.setAlignment(Qt.AlignCenter)
         self.iso_placeholder.setStyleSheet("QLabel { color: #666666; padding: 12px; }")
         self.iso_layout.addWidget(self.iso_placeholder)
-        self.tabs.addTab(self.iso_tab, "Isochrone (Step 13)")
+        self.tabs.addTab(self.iso_tab, "Isochrone (Step 12)")
 
     def browse_result_dir(self):
         start_dir = str(getattr(self.base_params.P, "result_dir", Path.cwd()))
@@ -164,19 +164,21 @@ class CmdIsoToolWindow(QMainWindow):
             return
 
         self.info_label.setText(f"Loaded: {wide_path}")
+        self.params_proxy = ParamsProxy(self.base_params, result_dir)
         self._load_cmd_viewer(df, result_dir)
         self._load_iso_window(result_dir)
 
     def _load_cmd_viewer(self, df: pd.DataFrame, result_dir: Path):
         self._reset_cmd_viewer()
-        viewer = CmdViewerWindow(df, result_dir, parent=self.cmd_tab, embedded=True)
+        viewer = CmdViewerWindow(df, result_dir, parent=self.cmd_tab, embedded=True, params=self.params_proxy)
         self.cmd_layout.addWidget(viewer)
         self.cmd_viewer = viewer
         self.cmd_placeholder.setVisible(False)
 
     def _load_iso_window(self, result_dir: Path):
         self._reset_iso_tab()
-        self.params_proxy = ParamsProxy(self.base_params, result_dir)
+        if self.params_proxy is None:
+            self.params_proxy = ParamsProxy(self.base_params, result_dir)
         iso_window = IsochroneModelWindow(
             self.params_proxy,
             self.file_manager,

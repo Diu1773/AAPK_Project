@@ -891,7 +891,7 @@ class IsochroneModelWindow(StepWindowBase):
         df, iso_raw, iso_file = self._load_cmd_and_iso_data(show_error=show_error)
         if df is None or iso_raw is None:
             self._show_viewer_placeholder(
-                "CMD viewer not ready.\nSelect an isochrone file and ensure Step 12 output exists."
+                "CMD viewer not ready.\nSelect an isochrone file and ensure Step 11 output exists."
             )
             return False
 

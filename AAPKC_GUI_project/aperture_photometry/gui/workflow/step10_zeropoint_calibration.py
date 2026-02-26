@@ -29,7 +29,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox,
-    QSpinBox, QCheckBox, QComboBox, QWidget
+    QSpinBox, QCheckBox, QComboBox, QWidget, QTabWidget, QFileDialog
 )
 
 from .step_window_base import StepWindowBase
@@ -359,11 +359,14 @@ class ZeropointCalibrationWorker(QThread):
             if (result_dir / "phot").exists():
                 idx_candidates += sorted((result_dir / "phot").glob("*phot*index*.csv"))
 
-            idx_path = next((p for p in idx_candidates if p.exists()), None)
+            idx_path = next((p for p in idx_candidates if p.exists() and p.stat().st_size > 0), None)
             if idx_path is None:
-                raise FileNotFoundError("photometry index csv not found")
+                raise FileNotFoundError("photometry index csv not found (or all candidates are empty)")
 
-            idx = pd.read_csv(idx_path)
+            try:
+                idx = pd.read_csv(idx_path)
+            except pd.errors.EmptyDataError:
+                raise FileNotFoundError(f"photometry index csv is empty: {idx_path.name}")
             self._log(f"Index = {idx_path.name} | rows={len(idx)}")
 
             if "path" not in idx.columns:
@@ -561,16 +564,38 @@ class ZeropointCalibrationWorker(QThread):
             rp_col = self._pick_col(df.columns, ["gaia_RP", "rpmag", "phot_rp_mean_mag"])
 
             gaia_from_master = True
+            gaia_join_name = ""
             if g_col is None or bp_col is None or rp_col is None:
                 gaia_from_master = False
                 if "source_id" not in df.columns:
                     raise RuntimeError("master_catalog missing Gaia mags and source_id for Gaia join")
-                gaia_path = step5_dir(result_dir) / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    gaia_path = result_dir / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    raise RuntimeError("master_catalog missing Gaia mags and gaia_fov.ecsv not found")
-                gaia_df = read_ecsv_int64_source_id(gaia_path)
+                gaia_candidates = [
+                    step5_dir(result_dir) / "gaia_derived.csv",
+                    result_dir / "gaia_derived.csv",
+                    step5_dir(result_dir) / "gaia_fov.ecsv",
+                    result_dir / "gaia_fov.ecsv",
+                ]
+                gaia_df = None
+                gaia_path = None
+                for cand in gaia_candidates:
+                    if not cand.exists():
+                        continue
+                    try:
+                        if cand.suffix.lower() == ".ecsv":
+                            gaia_df = read_ecsv_int64_source_id(cand)
+                        else:
+                            gaia_df = pd.read_csv(cand)
+                    except Exception:
+                        gaia_df = None
+                        continue
+                    if gaia_df is None or gaia_df.empty:
+                        gaia_df = None
+                        continue
+                    gaia_path = cand
+                    break
+                if gaia_df is None or gaia_path is None:
+                    raise RuntimeError("master_catalog missing Gaia mags and step5_wcs/gaia_derived.csv not found")
+                gaia_join_name = gaia_path.name
                 if "source_id" in gaia_df.columns:
                     gaia_df["source_id"] = parse_int64_series(gaia_df["source_id"]).astype("Int64")
                     df["source_id"] = parse_int64_series(df["source_id"]).astype("Int64")
@@ -593,7 +618,7 @@ class ZeropointCalibrationWorker(QThread):
 
             dfm = df[np.isfinite(df["gaia_G"]) & np.isfinite(df["gaia_BP"]) & np.isfinite(df["gaia_RP"])].copy()
             dfm["gaia_BP_RP"] = dfm["gaia_BP"] - dfm["gaia_RP"]
-            src_note = "master_catalog" if gaia_from_master else "gaia_fov.ecsv"
+            src_note = "master_catalog" if gaia_from_master else gaia_join_name
             self._log(f"Gaia mags from {src_note}: {len(dfm)} / {len(df)}")
 
             min_match = int(getattr(P, "min_master_gaia_matches", 10))
@@ -667,9 +692,13 @@ class ZeropointCalibrationWorker(QThread):
             self._log(f"r_std = r_inst + {zp_r:+.4f} + {ct_r:+.4f}*(g-r)_inst (N={Nr})")
             self._log(f"i_std = i_inst + {zp_i:+.4f} + {ct_i:+.4f}*(r-i)_inst (N={Ni})")
 
-            out_cal_path = output_dir / "gaia_sdss_calibrator_by_ID.csv"
-            out_cal.to_csv(out_cal_path, index=False)
-            self._log(f"Saved {out_cal_path.name} | rows={len(out_cal)}")
+            coeff_df = pd.DataFrame([
+                {"filter": "g", "zp": zp_g, "ct": ct_g, "N": Ng, "color_col": "color_gr"},
+                {"filter": "r", "zp": zp_r, "ct": ct_r, "N": Nr, "color_col": "color_gr"},
+                {"filter": "i", "zp": zp_i, "ct": ct_i, "N": Ni, "color_col": "color_ri"},
+            ])
+            coeff_df.to_csv(output_dir / "zp_fit_coefficients.csv", index=False)
+            self._log("Saved zp_fit_coefficients.csv")
             apply_ext = bool(getattr(P, "cmd_apply_extinction", False))
             ext_mode = str(getattr(P, "cmd_extinction_mode", "absorb")).strip().lower()
             if ext_mode not in ("absorb", "two_step"):
@@ -695,6 +724,12 @@ class ZeropointCalibrationWorker(QThread):
 
             out_cal["color_gr"] = color_gr
             out_cal["color_ri"] = color_ri
+            out_cal["delta_g"] = out_cal["sdss_g_ref"].to_numpy(float) - g_inst
+            out_cal["delta_r"] = out_cal["sdss_r_ref"].to_numpy(float) - r_inst
+            out_cal["delta_i"] = out_cal["sdss_i_ref"].to_numpy(float) - i_inst
+            out_cal_path = output_dir / "gaia_sdss_calibrator_by_ID.csv"
+            out_cal.to_csv(out_cal_path, index=False)
+            self._log(f"Saved {out_cal_path.name} | rows={len(out_cal)}")
 
             color_df = wide_raw[["ID"]].copy()
             if "mag_inst_g" in wide_raw.columns and "mag_inst_r" in wide_raw.columns:
@@ -929,10 +964,11 @@ class ZeropointCalibrationWorker(QThread):
 class CmdViewerWindow(QWidget):
     """Interactive CMD viewer (Qt)."""
 
-    def __init__(self, df: pd.DataFrame, result_dir: Path, parent=None, embedded: bool = False):
+    def __init__(self, df: pd.DataFrame, result_dir: Path, parent=None, embedded: bool = False, params=None):
         super().__init__(parent)
         self.df = df
         self.result_dir = Path(result_dir)
+        self.params = params
 
         self.setWindowTitle("CMD Viewer")
         if embedded:
@@ -1037,6 +1073,10 @@ class CmdViewerWindow(QWidget):
         self._plot_cache = {}
         self.last_pick_info = None
         self.pick_log = []
+        self._membership_prob = None
+        self._membership_source = "none"
+        self._membership_note = ""
+        self._membership_ready = False
         self._build_ui()
         self._build_figure()
         self._redraw()
@@ -1066,6 +1106,32 @@ class CmdViewerWindow(QWidget):
         self.invert_y = QCheckBox("Invert Y")
         self.invert_y.setChecked(True)
         controls.addWidget(self.invert_y)
+
+        controls.addSpacing(8)
+        controls.addWidget(QLabel("Membership:"))
+        self.member_mode_combo = QComboBox()
+        self.member_mode_combo.addItems([
+            "Off",
+            "Loose (P>=0.30)",
+            "Normal (P>=0.50)",
+            "Strict (P>=0.80)",
+        ])
+        mode_raw = "off"
+        if self.params is not None and hasattr(self.params, "P"):
+            mode_raw = str(getattr(self.params.P, "cmd_membership_mode", "off")).strip().lower()
+        mode_to_idx = {"off": 0, "loose": 1, "normal": 2, "strict": 3}
+        self.member_mode_combo.setCurrentIndex(mode_to_idx.get(mode_raw, 0))
+        controls.addWidget(self.member_mode_combo)
+
+        self.member_compare = QCheckBox("Compare")
+        cmp_default = True
+        if self.params is not None and hasattr(self.params, "P"):
+            cmp_default = bool(getattr(self.params.P, "cmd_membership_compare", True))
+        self.member_compare.setChecked(cmp_default)
+        controls.addWidget(self.member_compare)
+
+        self.btn_save_membership = QPushButton("Save Pmem CSV")
+        controls.addWidget(self.btn_save_membership)
 
         self.save_btn = QPushButton("Save PNG")
         controls.addWidget(self.save_btn)
@@ -1102,10 +1168,358 @@ class CmdViewerWindow(QWidget):
         self.y_combo.currentTextChanged.connect(self._redraw)
         self.snr_spin.valueChanged.connect(self._redraw)
         self.invert_y.stateChanged.connect(self._redraw)
+        self.member_mode_combo.currentIndexChanged.connect(self._on_membership_ui_changed)
+        self.member_compare.stateChanged.connect(self._on_membership_ui_changed)
+        self.btn_save_membership.clicked.connect(self._save_membership_csv)
         self.save_btn.clicked.connect(self._save_png)
         self.btn_prev_view.clicked.connect(lambda: self._switch_view(-1))
         self.btn_next_view.clicked.connect(lambda: self._switch_view(1))
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+
+    def _membership_mode_key(self) -> str:
+        idx = int(self.member_mode_combo.currentIndex())
+        if idx == 1:
+            return "loose"
+        if idx == 2:
+            return "normal"
+        if idx == 3:
+            return "strict"
+        return "off"
+
+    def _membership_threshold(self, mode_key: str) -> float:
+        if mode_key == "loose":
+            return 0.30
+        if mode_key == "strict":
+            return 0.80
+        return 0.50
+
+    def _on_membership_ui_changed(self):
+        if self.params is not None and hasattr(self.params, "P"):
+            self.params.P.cmd_membership_mode = self._membership_mode_key()
+            self.params.P.cmd_membership_compare = bool(self.member_compare.isChecked())
+            if hasattr(self.params, "save_toml"):
+                try:
+                    self.params.save_toml()
+                except Exception:
+                    pass
+        self._redraw()
+
+    def _pick_existing_membership_col(self):
+        cands = [
+            "gaia_pmem",
+            "pmem_gaia",
+            "membership_prob_gaia",
+            "membership_prob",
+            "pmem",
+        ]
+        for c in cands:
+            if c not in self.df.columns:
+                continue
+            v = pd.to_numeric(self.df[c], errors="coerce").to_numpy(float)
+            if np.isfinite(v).sum() >= 10:
+                return c, v
+        return None, None
+
+    def _merge_columns_from_gaia_derived(self, needed_cols):
+        candidates = [
+            step5_dir(self.result_dir) / "gaia_derived.csv",
+            self.result_dir / "gaia_derived.csv",
+        ]
+        gdf = None
+        for p in candidates:
+            if not p.exists():
+                continue
+            try:
+                d = pd.read_csv(p)
+            except Exception:
+                continue
+            if d.empty or ("source_id" not in d.columns):
+                continue
+            d["source_id"] = parse_int64_series(d["source_id"]).astype("Int64")
+            d = d[d["source_id"].notna()].copy()
+            if d.empty:
+                continue
+            gdf = d
+            break
+        if gdf is None:
+            return
+
+        left_key = None
+        if "source_id" in self.df.columns:
+            self.df["source_id"] = parse_int64_series(self.df["source_id"]).astype("Int64")
+            left_key = "source_id"
+        elif "gaia_source_id" in self.df.columns:
+            self.df["gaia_source_id"] = parse_int64_series(self.df["gaia_source_id"]).astype("Int64")
+            left_key = "gaia_source_id"
+        if left_key is None:
+            return
+
+        add_cols = [c for c in needed_cols if c in gdf.columns and c != "source_id"]
+        if not add_cols:
+            return
+
+        use = gdf[["source_id"] + add_cols].drop_duplicates(subset=["source_id"], keep="first")
+        if left_key != "source_id":
+            use = use.rename(columns={"source_id": left_key})
+        try:
+            merged = self.df.merge(use, on=left_key, how="left", suffixes=("", "__gaia"))
+        except Exception:
+            return
+
+        for c in add_cols:
+            c_aux = f"{c}__gaia"
+            if c_aux not in merged.columns:
+                continue
+            if c in merged.columns:
+                m = merged[c].isna()
+                merged.loc[m, c] = merged.loc[m, c_aux]
+            else:
+                merged[c] = merged[c_aux]
+            merged = merged.drop(columns=[c_aux])
+        self.df = merged
+
+    def _ensure_membership_columns_from_master(self):
+        needed = [
+            "source_id", "gaia_source_id",
+            "pmra", "pmdec", "parallax",
+            "pmra_error", "pmdec_error", "parallax_error",
+            "ruwe", "visibility_periods_used",
+            "gaia_pmem", "pmem_gaia", "membership_prob_gaia",
+        ]
+        missing = [c for c in needed if c not in self.df.columns]
+        if not missing:
+            return self._merge_columns_from_gaia_derived(needed)
+
+        master_path = step6_dir(self.result_dir) / "master_catalog.tsv"
+        if not master_path.exists():
+            master_path = self.result_dir / "master_catalog.tsv"
+        if not master_path.exists():
+            return
+
+        try:
+            master = pd.read_csv(master_path, sep="\t")
+        except Exception:
+            return
+        if master.empty:
+            return
+
+        key = None
+        if "ID" in self.df.columns and "ID" in master.columns:
+            key = "ID"
+        elif "source_id" in self.df.columns and "source_id" in master.columns:
+            key = "source_id"
+            self.df["source_id"] = parse_int64_series(self.df["source_id"]).astype("Int64")
+            master["source_id"] = parse_int64_series(master["source_id"]).astype("Int64")
+        elif "gaia_source_id" in self.df.columns and "gaia_source_id" in master.columns:
+            key = "gaia_source_id"
+            self.df["gaia_source_id"] = parse_int64_series(self.df["gaia_source_id"]).astype("Int64")
+            master["gaia_source_id"] = parse_int64_series(master["gaia_source_id"]).astype("Int64")
+        if key is None:
+            return
+
+        add_cols = [c for c in missing if c in master.columns and c != key]
+        if add_cols:
+            use = master[[key] + add_cols].copy()
+            use = use.drop_duplicates(subset=[key], keep="first")
+            try:
+                self.df = self.df.merge(use, on=key, how="left")
+            except Exception:
+                return
+
+        self._merge_columns_from_gaia_derived(needed)
+
+    @staticmethod
+    def _logpdf_gauss(x: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
+        d = x.shape[1]
+        cov_r = np.asarray(cov, float) + np.eye(d) * 1e-6
+        sign, logdet = np.linalg.slogdet(cov_r)
+        if sign <= 0:
+            return np.full(x.shape[0], -np.inf, dtype=float)
+        try:
+            inv = np.linalg.inv(cov_r)
+        except Exception:
+            return np.full(x.shape[0], -np.inf, dtype=float)
+        diff = x - mu[None, :]
+        q = np.einsum("ni,ij,nj->n", diff, inv, diff)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + q)
+
+    def _fit_two_component_gmm(self, x_fit: np.ndarray):
+        n, d = x_fit.shape
+        if n < max(30, d * 8):
+            return None
+
+        center = np.nanmedian(x_fit, axis=0)
+        mad = np.nanmedian(np.abs(x_fit - center), axis=0)
+        mad = np.where(np.isfinite(mad) & (mad > 1e-6), mad, 1.0)
+        z = (x_fit - center[None, :]) / mad[None, :]
+        d2 = np.sum(z * z, axis=1)
+        q40 = float(np.nanquantile(d2, 0.40))
+        m0 = d2 <= q40
+        if m0.sum() < max(12, d * 3) or m0.sum() > (n - max(12, d * 3)):
+            order = np.argsort(d2)
+            m0 = np.zeros(n, dtype=bool)
+            m0[order[: max(n // 2, 1)]] = True
+        m1 = ~m0
+
+        def _cov(arr: np.ndarray) -> np.ndarray:
+            if arr.shape[0] < (d + 1):
+                return np.eye(d, dtype=float)
+            c = np.cov(arr, rowvar=False)
+            if np.ndim(c) == 0:
+                c = np.eye(d, dtype=float) * float(c)
+            return np.asarray(c, float) + np.eye(d, dtype=float) * 1e-4
+
+        pi = np.array([max(m0.mean(), 1e-3), max(m1.mean(), 1e-3)], dtype=float)
+        pi /= pi.sum()
+        mu = np.vstack([
+            np.nanmean(x_fit[m0], axis=0),
+            np.nanmean(x_fit[m1], axis=0),
+        ])
+        cov = np.stack([_cov(x_fit[m0]), _cov(x_fit[m1])], axis=0)
+        last_ll = -np.inf
+
+        for _ in range(80):
+            lp0 = np.log(max(pi[0], 1e-9)) + self._logpdf_gauss(x_fit, mu[0], cov[0])
+            lp1 = np.log(max(pi[1], 1e-9)) + self._logpdf_gauss(x_fit, mu[1], cov[1])
+            m = np.maximum(lp0, lp1)
+            e0 = np.exp(lp0 - m)
+            e1 = np.exp(lp1 - m)
+            den = e0 + e1 + 1e-12
+            r0 = e0 / den
+            r1 = e1 / den
+            nk = np.array([r0.sum(), r1.sum()], dtype=float)
+            if np.any(nk < (d + 2)):
+                break
+            pi = nk / float(n)
+            mu[0] = (r0[:, None] * x_fit).sum(axis=0) / nk[0]
+            mu[1] = (r1[:, None] * x_fit).sum(axis=0) / nk[1]
+            for k, rk in enumerate((r0, r1)):
+                diff = x_fit - mu[k][None, :]
+                cov[k] = (diff.T * rk).dot(diff) / max(nk[k], 1.0)
+                cov[k] += np.eye(d, dtype=float) * 1e-4
+            ll = float(np.sum(m + np.log(den)))
+            if np.isfinite(last_ll):
+                if abs(ll - last_ll) < 1e-4 * max(1.0, abs(last_ll)):
+                    break
+            last_ll = ll
+
+        det0 = abs(float(np.linalg.det(cov[0])))
+        det1 = abs(float(np.linalg.det(cov[1])))
+        cluster_idx = 0 if det0 <= det1 else 1
+        return {
+            "pi": pi,
+            "mu": mu,
+            "cov": cov,
+            "cluster_idx": int(cluster_idx),
+        }
+
+    def _compute_gaia_membership_prob(self):
+        req = ("pmra", "pmdec", "parallax")
+        if not all(c in self.df.columns for c in req):
+            return None, "pm/parallax columns missing"
+
+        pmra = pd.to_numeric(self.df["pmra"], errors="coerce").to_numpy(float)
+        pmdec = pd.to_numeric(self.df["pmdec"], errors="coerce").to_numpy(float)
+        plx = pd.to_numeric(self.df["parallax"], errors="coerce").to_numpy(float)
+        finite = np.isfinite(pmra) & np.isfinite(pmdec) & np.isfinite(plx)
+        if int(finite.sum()) < 30:
+            return None, "too few stars with finite pm/parallax"
+
+        fit_mask = finite.copy()
+        if "ruwe" in self.df.columns:
+            ruwe = pd.to_numeric(self.df["ruwe"], errors="coerce").to_numpy(float)
+            fit_mask &= (~np.isfinite(ruwe)) | (ruwe <= 2.0)
+        if "visibility_periods_used" in self.df.columns:
+            vpu = pd.to_numeric(self.df["visibility_periods_used"], errors="coerce").to_numpy(float)
+            fit_mask &= (~np.isfinite(vpu)) | (vpu >= 8.0)
+        if int(fit_mask.sum()) < 25:
+            fit_mask = finite.copy()
+
+        x_fit = np.column_stack([pmra[fit_mask], pmdec[fit_mask], plx[fit_mask]])
+        model = self._fit_two_component_gmm(x_fit)
+        if model is None:
+            return None, "GMM fit failed"
+
+        x_all = np.column_stack([pmra[finite], pmdec[finite], plx[finite]])
+        pi = np.asarray(model["pi"], float)
+        mu = np.asarray(model["mu"], float)
+        cov = np.asarray(model["cov"], float)
+        k_cluster = int(model["cluster_idx"])
+
+        lp0 = np.log(max(pi[0], 1e-9)) + self._logpdf_gauss(x_all, mu[0], cov[0])
+        lp1 = np.log(max(pi[1], 1e-9)) + self._logpdf_gauss(x_all, mu[1], cov[1])
+        m = np.maximum(lp0, lp1)
+        e0 = np.exp(lp0 - m)
+        e1 = np.exp(lp1 - m)
+        den = e0 + e1 + 1e-12
+        r0 = e0 / den
+        r1 = e1 / den
+        p_cluster = r0 if k_cluster == 0 else r1
+
+        pmem = np.full(len(self.df), np.nan, dtype=float)
+        pmem[finite] = p_cluster
+        note = f"gaia_gmm_3d(valid={int(finite.sum())}, fit={int(fit_mask.sum())})"
+        return pmem, note
+
+    def _ensure_membership_prob(self):
+        if self._membership_ready:
+            return self._membership_prob
+        self._membership_ready = True
+
+        c_exist, v_exist = self._pick_existing_membership_col()
+        if c_exist is not None:
+            self._membership_prob = np.clip(np.asarray(v_exist, float), 0.0, 1.0)
+            self._membership_source = c_exist
+            self._membership_note = f"existing:{c_exist}"
+            return self._membership_prob
+
+        self._ensure_membership_columns_from_master()
+        c_exist, v_exist = self._pick_existing_membership_col()
+        if c_exist is not None:
+            self._membership_prob = np.clip(np.asarray(v_exist, float), 0.0, 1.0)
+            self._membership_source = c_exist
+            self._membership_note = f"existing:{c_exist}"
+            return self._membership_prob
+
+        p_auto, note = self._compute_gaia_membership_prob()
+        if p_auto is not None:
+            self._membership_prob = np.clip(np.asarray(p_auto, float), 0.0, 1.0)
+            self.df["gaia_pmem"] = self._membership_prob
+            self._membership_source = "gaia_gmm_3d"
+            self._membership_note = note
+            return self._membership_prob
+
+        self._membership_prob = None
+        self._membership_source = "none"
+        self._membership_note = note
+        return None
+
+    def _current_membership_mask(self):
+        mode = self._membership_mode_key()
+        if mode == "off":
+            return None, mode, np.nan
+        prob = self._ensure_membership_prob()
+        if prob is None:
+            return None, mode, self._membership_threshold(mode)
+        thr = self._membership_threshold(mode)
+        mask = np.isfinite(prob) & (prob >= thr)
+        return mask, mode, thr
+
+    def _save_membership_csv(self):
+        prob = self._ensure_membership_prob()
+        if prob is None:
+            self.info_text.setPlainText(
+                "Membership not available.\n"
+                f"Reason: {self._membership_note}"
+            )
+            return
+        out = self.result_dir / "cmd_with_gaia_membership.csv"
+        save_cols = ["ID", "source_id", "gaia_source_id", "pmra", "pmdec", "parallax"]
+        keep = [c for c in save_cols if c in self.df.columns]
+        df_out = self.df[keep].copy() if keep else pd.DataFrame(index=self.df.index)
+        df_out["gaia_pmem"] = prob
+        df_out.to_csv(out, index=False, na_rep="NaN")
+        self.info_text.setPlainText(f"Saved: {out}")
 
     def _build_figure(self):
         self.figure.clear()
@@ -1208,7 +1622,7 @@ class CmdViewerWindow(QWidget):
                 return ("color", (a, b))
         return (None, None)
 
-    def _compute_arrays_and_mask(self, system: str, x_pair, y_choice, snr_cut: float):
+    def _compute_arrays_and_mask(self, system: str, x_pair, y_choice, snr_cut: float, membership_mask=None):
         a, b = x_pair
         col_ax = f"mag_{system}_{a}"
         col_bx = f"mag_{system}_{b}"
@@ -1252,9 +1666,12 @@ class CmdViewerWindow(QWidget):
                     sv = self._safe_float(self.df[sc])
                     mask &= np.isfinite(sv) & (sv >= snr_cut)
 
+        if membership_mask is not None and len(membership_mask) == len(mask):
+            mask &= np.asarray(membership_mask, bool)
+
         return x[mask], y[mask], mask, xcolor[mask]
 
-    def _compute_gaia_arrays_and_mask(self, snr_cut: float):
+    def _compute_gaia_arrays_and_mask(self, snr_cut: float, membership_mask=None):
         if self.gaia_mode is None:
             return np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
@@ -1273,6 +1690,9 @@ class CmdViewerWindow(QWidget):
                 if sc in self.df.columns:
                     sv = self._safe_float(self.df[sc])
                     mask &= np.isfinite(sv) & (sv >= snr_cut)
+
+        if membership_mask is not None and len(membership_mask) == len(mask):
+            mask &= np.asarray(membership_mask, bool)
 
         return C[mask], G[mask], mask, C[mask]
 
@@ -1317,6 +1737,9 @@ class CmdViewerWindow(QWidget):
 
         yval = self.y_combo.currentText()
         snr_cut = float(self.snr_spin.value())
+        member_mask, member_mode, member_thr = self._current_membership_mask()
+        member_active = (member_mode != "off") and (member_mask is not None)
+        member_compare = bool(self.member_compare.isChecked()) and member_active
 
         if self.ax_inst is not None:
             self.ax_inst.clear()
@@ -1326,28 +1749,48 @@ class CmdViewerWindow(QWidget):
             self.ax_gaia.clear()
 
         if self.ax_inst is not None:
-            x_i, y_i, mask_i, xcol_i = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut)
+            x_i_all, y_i_all, mask_i_all, xcol_i_all = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, None)
+            if member_active:
+                x_i, y_i, mask_i, xcol_i = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, member_mask)
+            else:
+                x_i, y_i, mask_i, xcol_i = x_i_all, y_i_all, mask_i_all, xcol_i_all
             teff_i = self._teff_from_color_index(xcol_i, f"{a}-{b}")
         else:
+            x_i_all, y_i_all = np.array([]), np.array([])
             x_i, y_i, mask_i, teff_i = np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
         if self.has_std and self.ax_std is not None:
-            x_s, y_s, mask_s, xcol_s = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut)
+            x_s_all, y_s_all, mask_s_all, xcol_s_all = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, None)
+            if member_active:
+                x_s, y_s, mask_s, xcol_s = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, member_mask)
+            else:
+                x_s, y_s, mask_s, xcol_s = x_s_all, y_s_all, mask_s_all, xcol_s_all
             teff_s = self._teff_from_color_index(xcol_s, f"{a}-{b}")
         else:
+            x_s_all, y_s_all = np.array([]), np.array([])
             x_s, y_s, mask_s, teff_s = np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
         if self.gaia_mode is not None and self.ax_gaia is not None:
-            x_g, y_g, mask_g, xcol_g = self._compute_gaia_arrays_and_mask(snr_cut)
+            x_g_all, y_g_all, mask_g_all, xcol_g_all = self._compute_gaia_arrays_and_mask(snr_cut, None)
+            if member_active:
+                x_g, y_g, mask_g, xcol_g = self._compute_gaia_arrays_and_mask(snr_cut, member_mask)
+            else:
+                x_g, y_g, mask_g, xcol_g = x_g_all, y_g_all, mask_g_all, xcol_g_all
             teff_g = self._teff_from_color_index(xcol_g, "BP-RP")
         else:
+            x_g_all, y_g_all = np.array([]), np.array([])
             x_g, y_g, mask_g, teff_g = np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
         if self.ax_inst is not None:
             self._style_axis(self.ax_inst)
+            if member_compare and len(x_i_all) > 0:
+                self.ax_inst.scatter(x_i_all, y_i_all, s=10, alpha=0.22, linewidths=0, rasterized=True, c="#9E9E9E")
             if len(x_i) > 0:
                 self.ax_inst.scatter(x_i, y_i, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_i, cmap=self.ob_cmap, norm=self.ob_norm)
-                self.ax_inst.set_title(f"Instrumental CMD (N={len(x_i)})", fontsize=11, color="white")
+                if member_active:
+                    self.ax_inst.set_title(f"Instrumental CMD (N={len(x_i)}/{len(x_i_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_inst.set_title(f"Instrumental CMD (N={len(x_i)})", fontsize=11, color="white")
                 self._plot_cache[self.ax_inst] = {
                     "system": "inst",
                     "x": x_i,
@@ -1355,13 +1798,21 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_i)[0],
                 }
             else:
-                self.ax_inst.set_title("Instrumental CMD (N=0)", fontsize=11, color="white")
+                if member_active:
+                    self.ax_inst.set_title(f"Instrumental CMD (N=0/{len(x_i_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_inst.set_title("Instrumental CMD (N=0)", fontsize=11, color="white")
 
         if self.ax_std is not None:
             self._style_axis(self.ax_std)
+            if member_compare and len(x_s_all) > 0:
+                self.ax_std.scatter(x_s_all, y_s_all, s=10, alpha=0.22, linewidths=0, rasterized=True, c="#9E9E9E")
             if len(x_s) > 0:
                 self.ax_std.scatter(x_s, y_s, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_s, cmap=self.ob_cmap, norm=self.ob_norm)
-                self.ax_std.set_title(f"SDSS CMD (N={len(x_s)})", fontsize=11, color="white")
+                if member_active:
+                    self.ax_std.set_title(f"SDSS CMD (N={len(x_s)}/{len(x_s_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_std.set_title(f"SDSS CMD (N={len(x_s)})", fontsize=11, color="white")
                 self._plot_cache[self.ax_std] = {
                     "system": "std",
                     "x": x_s,
@@ -1369,14 +1820,22 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_s)[0],
                 }
             else:
-                self.ax_std.set_title("SDSS CMD (N=0)", fontsize=11, color="white")
+                if member_active:
+                    self.ax_std.set_title(f"SDSS CMD (N=0/{len(x_s_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_std.set_title("SDSS CMD (N=0)", fontsize=11, color="white")
 
         if self.ax_gaia is not None:
             self._style_axis(self.ax_gaia)
+            if member_compare and len(x_g_all) > 0:
+                self.ax_gaia.scatter(x_g_all, y_g_all, s=10, alpha=0.22, linewidths=0, rasterized=True, c="#9E9E9E")
             if len(x_g) > 0:
                 self.ax_gaia.scatter(x_g, y_g, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_g, cmap=self.ob_cmap, norm=self.ob_norm)
                 title = "Gaia CMD (inst)" if self.gaia_mode == "inst" else "Gaia CMD (syn)"
-                self.ax_gaia.set_title(f"{title} (N={len(x_g)})", fontsize=11, color="white")
+                if member_active:
+                    self.ax_gaia.set_title(f"{title} (N={len(x_g)}/{len(x_g_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_gaia.set_title(f"{title} (N={len(x_g)})", fontsize=11, color="white")
                 self._plot_cache[self.ax_gaia] = {
                     "system": "gaia",
                     "x": x_g,
@@ -1384,7 +1843,10 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_g)[0],
                 }
             else:
-                self.ax_gaia.set_title("Gaia CMD (N=0)", fontsize=11, color="white")
+                if member_active:
+                    self.ax_gaia.set_title(f"Gaia CMD (N=0/{len(x_g_all)})", fontsize=11, color="white")
+                else:
+                    self.ax_gaia.set_title("Gaia CMD (N=0)", fontsize=11, color="white")
 
         x_label = f"{a}-{b} (mag)"
         y_label = f"{yval} (mag)" if yval else ""
@@ -1409,12 +1871,23 @@ class CmdViewerWindow(QWidget):
 
         lines = [
             f"X={a}-{b}, Y={yval}, SNR>={snr_cut:.0f}",
-            f"[Inst] N={len(x_i)} | Teff range: {_rng(teff_i)}",
         ]
+        if member_mode == "off":
+            lines.append("Membership: Off")
+        elif member_mask is None:
+            lines.append(f"Membership: {member_mode} (P>={member_thr:.2f}) unavailable | {self._membership_note}")
+        else:
+            n_valid = int(np.isfinite(self._membership_prob).sum()) if self._membership_prob is not None else 0
+            n_mem = int(np.asarray(member_mask, bool).sum())
+            lines.append(
+                f"Membership: {member_mode} (P>={member_thr:.2f}) | source={self._membership_source} | "
+                f"selected={n_mem}/{n_valid} | compare={member_compare}"
+            )
+        lines.append(f"[Inst] N={len(x_i)}{'/' + str(len(x_i_all)) if member_active else ''} | Teff range: {_rng(teff_i)}")
         if self.has_std:
-            lines.append(f"[Std]  N={len(x_s)} | Teff range: {_rng(teff_s)}")
+            lines.append(f"[Std]  N={len(x_s)}{'/' + str(len(x_s_all)) if member_active else ''} | Teff range: {_rng(teff_s)}")
         if self.gaia_mode is not None:
-            lines.append(f"[Gaia:{self.gaia_mode}] N={len(x_g)} | Teff range: {_rng(teff_g)}")
+            lines.append(f"[Gaia:{self.gaia_mode}] N={len(x_g)}{'/' + str(len(x_g_all)) if member_active else ''} | Teff range: {_rng(teff_g)}")
         if not self.has_snr:
             lines.append("(snr_* columns missing: SNR cut disabled)")
         if self.last_pick_info:
@@ -1470,6 +1943,13 @@ class CmdViewerWindow(QWidget):
             parts.append(f"gaia_BP={self._fmt_val(row.get('gaia_BP'))}")
         if "gaia_RP" in row:
             parts.append(f"gaia_RP={self._fmt_val(row.get('gaia_RP'))}")
+        for c in ("pmra", "pmdec", "parallax"):
+            if c in row:
+                parts.append(f"{c}={self._fmt_val(row.get(c))}")
+        if self._membership_prob is not None and 0 <= df_idx < len(self._membership_prob):
+            pm = self._membership_prob[df_idx]
+            if np.isfinite(pm):
+                parts.append(f"Pmem={float(pm):.3f}")
         msg = " | ".join(parts)
         self.last_pick_info = msg
         self.pick_log.append(msg)
@@ -1491,7 +1971,14 @@ class CmdViewerWindow(QWidget):
         else:
             mode = "inst_only"
 
-        out = self.result_dir / f"cmd_{mode}_{a}-{b}_vs_{yv}_snr{int(self.snr_spin.value())}_OBcolor_dark.png"
+        mem_tag = ""
+        mkey = self._membership_mode_key()
+        if mkey != "off":
+            mem_tag = f"_mem{mkey}"
+            if self.member_compare.isChecked():
+                mem_tag += "_cmp"
+
+        out = self.result_dir / f"cmd_{mode}_{a}-{b}_vs_{yv}_snr{int(self.snr_spin.value())}{mem_tag}_OBcolor_dark.png"
         self.figure.savefig(out, dpi=170, bbox_inches="tight", facecolor=self.figure.get_facecolor(), edgecolor="none")
         self.info_text.setPlainText(f"Saved: {out}")
 
@@ -1508,8 +1995,292 @@ class CmdViewerWindow(QWidget):
         self._redraw()
 
 
+class ZPFitPlotWidget(QWidget):
+    """ZP linear fit (delta vs color) + per-frame ZP timeline plots."""
+
+    FILT_COLORS = {"g": "#1976D2", "r": "#D32F2F", "i": "#388E3C"}
+
+    def __init__(self, result_dir: Path, parent=None):
+        super().__init__(parent)
+        self.result_dir = Path(result_dir)
+        self._cal_df = None
+        self._frame_df = None
+        self._coeff_df = None
+        self._artist_map = {}   # id(artist) -> list of row dicts
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Filter:"))
+        self._filt_combo = QComboBox()
+        self._filt_combo.addItems(["All", "g", "r", "i"])
+        self._filt_combo.currentTextChanged.connect(self._redraw)
+        ctrl.addWidget(self._filt_combo)
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QLabel("Date:"))
+        self._date_combo = QComboBox()
+        self._date_combo.addItem("All")
+        self._date_combo.currentTextChanged.connect(self._redraw)
+        ctrl.addWidget(self._date_combo)
+        ctrl.addSpacing(12)
+        btn_reload = QPushButton("Reload")
+        btn_reload.clicked.connect(lambda: self.reload())
+        ctrl.addWidget(btn_reload)
+        btn_save = QPushButton("Save PNG")
+        btn_save.clicked.connect(self._save_png)
+        ctrl.addWidget(btn_save)
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self._fig = Figure(figsize=(10, 8))
+        self._ax_fit = self._fig.add_subplot(2, 1, 1)
+        self._ax_frame = self._fig.add_subplot(2, 1, 2)
+        self._fig.tight_layout(pad=2.0)
+        self._canvas = FigureCanvas(self._fig)
+        self._canvas.mpl_connect("pick_event", self._on_pick)
+        self._toolbar = NavigationToolbar(self._canvas, self)
+        layout.addWidget(self._toolbar)
+        layout.addWidget(self._canvas, 1)
+
+        self._info_label = QLabel("Click a data point to see star info.")
+        self._info_label.setStyleSheet(
+            "QLabel { font-family: monospace; font-size: 9pt; "
+            "background: #F5F5F5; padding: 4px; border: 1px solid #CCC; }"
+        )
+        layout.addWidget(self._info_label)
+
+    def reload(self, result_dir: Path = None):
+        if result_dir is not None:
+            self.result_dir = Path(result_dir)
+        out_dir = step11_dir(self.result_dir)
+        self._cal_df = None
+        self._frame_df = None
+        self._coeff_df = None
+
+        cal_path = out_dir / "gaia_sdss_calibrator_by_ID.csv"
+        if cal_path.exists() and cal_path.stat().st_size > 0:
+            try:
+                self._cal_df = pd.read_csv(cal_path)
+            except Exception:
+                self._cal_df = None
+
+        frame_path = out_dir / "frame_zeropoint.csv"
+        if frame_path.exists() and frame_path.stat().st_size > 0:
+            try:
+                self._frame_df = pd.read_csv(frame_path)
+            except Exception:
+                self._frame_df = None
+
+        coeff_path = out_dir / "zp_fit_coefficients.csv"
+        if coeff_path.exists() and coeff_path.stat().st_size > 0:
+            try:
+                self._coeff_df = pd.read_csv(coeff_path)
+            except Exception:
+                self._coeff_df = None
+
+        self._update_date_combo()
+        self._redraw()
+
+    def _update_date_combo(self):
+        import re
+        prev = self._date_combo.currentText()
+        self._date_combo.blockSignals(True)
+        self._date_combo.clear()
+        self._date_combo.addItem("All")
+        if self._frame_df is not None and "file" in self._frame_df.columns:
+            def _extract_date(fname):
+                m = re.search(r"\d{4}-\d{2}-\d{2}", str(fname))
+                return m.group(0) if m else None
+            dates = sorted(set(d for d in self._frame_df["file"].apply(_extract_date) if d))
+            for d in dates:
+                self._date_combo.addItem(d)
+        idx = self._date_combo.findText(prev)
+        self._date_combo.setCurrentIndex(max(idx, 0))
+        self._date_combo.blockSignals(False)
+
+    def _redraw(self):
+        self._ax_fit.cla()
+        self._ax_frame.cla()
+        self._artist_map.clear()
+        self._draw_fit_plot()
+        self._draw_frame_zp()
+        self._fig.tight_layout(pad=2.0)
+        self._canvas.draw_idle()
+
+    def _draw_fit_plot(self):
+        ax = self._ax_fit
+        filt_sel = self._filt_combo.currentText()
+
+        if self._cal_df is None:
+            ax.set_title("ZP Linear Fit — run ZP calibration first")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes,
+                    fontsize=14, color="gray")
+            return
+
+        cal = self._cal_df
+        filts = ["g", "r", "i"] if filt_sel == "All" else [filt_sel]
+
+        for filt in filts:
+            fc = self.FILT_COLORS.get(filt, "gray")
+            color_col = "color_gr" if filt in ("g", "r") else "color_ri"
+            ref_col = f"sdss_{filt}_ref"
+            inst_col = f"mag_inst_{filt}"
+            err_col = f"mag_inst_err_{filt}"
+            delta_col = f"delta_{filt}"
+
+            if color_col not in cal.columns:
+                continue
+
+            if delta_col in cal.columns:
+                delta = cal[delta_col].to_numpy(float)
+            elif ref_col in cal.columns and inst_col in cal.columns:
+                delta = cal[ref_col].to_numpy(float) - cal[inst_col].to_numpy(float)
+            else:
+                continue
+
+            color_x = cal[color_col].to_numpy(float)
+            mask = np.isfinite(delta) & np.isfinite(color_x)
+            if mask.sum() == 0:
+                continue
+
+            x_plot = color_x[mask]
+            y_plot = delta[mask]
+            stars_idx = np.where(mask)[0]
+
+            err_arr = None
+            if err_col in cal.columns:
+                err_raw = cal[err_col].to_numpy(float)[mask]
+                err_arr = np.where(np.isfinite(err_raw), err_raw, np.nan)
+
+            sc = ax.scatter(
+                x_plot, y_plot,
+                c=fc, s=10, alpha=0.55,
+                label=f"{filt} (N={mask.sum()})",
+                picker=True, pickradius=6, zorder=3,
+            )
+            if err_arr is not None and np.isfinite(err_arr).any():
+                ax.errorbar(
+                    x_plot, y_plot, yerr=err_arr,
+                    fmt="none", ecolor=fc, elinewidth=0.7, capsize=2,
+                    alpha=0.4, zorder=2,
+                )
+
+            row_list = []
+            for i, si in enumerate(stars_idx):
+                row_list.append({
+                    "filt": filt,
+                    "ID": cal["ID"].iloc[si] if "ID" in cal.columns else "?",
+                    "color": float(color_x[si]),
+                    "delta": float(delta[si]),
+                    "ref_mag": float(cal[ref_col].iloc[si]) if ref_col in cal.columns else np.nan,
+                    "inst_mag": float(cal[inst_col].iloc[si]) if inst_col in cal.columns else np.nan,
+                    "err": float(err_arr[i]) if err_arr is not None and np.isfinite(err_arr[i]) else np.nan,
+                })
+            self._artist_map[id(sc)] = row_list
+
+            if self._coeff_df is not None:
+                row = self._coeff_df[self._coeff_df["filter"] == filt]
+                if len(row) > 0:
+                    zp_val = float(row["zp"].iloc[0])
+                    ct_val = float(row["ct"].iloc[0])
+                    x_fit = np.linspace(np.nanmin(x_plot) - 0.05, np.nanmax(x_plot) + 0.05, 200)
+                    y_fit = zp_val + ct_val * x_fit
+                    ax.plot(x_fit, y_fit, "-", color=fc, linewidth=2.0,
+                            label=f"{filt}: ZP={zp_val:.3f}, CT={ct_val:+.3f}", zorder=4)
+
+        if filt_sel == "g":
+            color_label = "g - r (inst)"
+        elif filt_sel == "r":
+            color_label = "g - r (inst)"
+        elif filt_sel == "i":
+            color_label = "r - i (inst)"
+        else:
+            color_label = "color index"
+        ax.set_xlabel(color_label)
+        ax.set_ylabel("gaia_ref - raw_inst (mag)")
+        ax.set_title("ZP Linear Fit: gaia_ref - raw_inst vs color")
+        if ax.collections or ax.get_lines():
+            ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    def _draw_frame_zp(self):
+        import re
+        ax = self._ax_frame
+        filt_sel = self._filt_combo.currentText()
+        date_sel = self._date_combo.currentText()
+
+        if self._frame_df is None:
+            ax.set_title("Per-Frame ZP — run ZP calibration first")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes,
+                    fontsize=14, color="gray")
+            return
+
+        df = self._frame_df.copy()
+        if date_sel != "All" and "file" in df.columns:
+            df = df[df["file"].apply(lambda f: bool(re.search(re.escape(date_sel), str(f))))].copy()
+
+        filts = ["g", "r", "i"] if filt_sel == "All" else [filt_sel]
+        if "filter" not in df.columns:
+            ax.set_title("Per-Frame ZP — no filter column")
+            return
+
+        for filt in filts:
+            sub = df[df["filter"] == filt].reset_index(drop=True)
+            if sub.empty:
+                continue
+            fc = self.FILT_COLORS.get(filt, "gray")
+            x = np.arange(len(sub))
+            y = sub["zp_frame"].to_numpy(float)
+            yerr = sub["zp_scatter"].to_numpy(float) if "zp_scatter" in sub.columns else None
+            ax.errorbar(
+                x, y, yerr=yerr,
+                fmt="o-", color=fc, alpha=0.8,
+                markersize=4, elinewidth=0.8, capsize=3,
+                label=f"{filt} (N={len(sub)})",
+            )
+
+        ax.set_xlabel("Frame index")
+        ax.set_ylabel("ZP (mag)")
+        ax.set_title("Per-Frame Zeropoint")
+        if ax.get_lines():
+            ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    def _on_pick(self, event):
+        artist = event.artist
+        aid = id(artist)
+        if aid not in self._artist_map:
+            return
+        rows = self._artist_map[aid]
+        ind = event.ind
+        if len(ind) == 0:
+            return
+        info = rows[ind[0]]
+        parts = [
+            f"Filter={info['filt']}",
+            f"ID={info['ID']}",
+            f"color={info['color']:.3f}",
+            f"delta={info['delta']:.3f}",
+            f"ref_mag={info['ref_mag']:.3f}",
+            f"inst_mag={info['inst_mag']:.3f}",
+        ]
+        if np.isfinite(info["err"]):
+            parts.append(f"err={info['err']:.4f}")
+        self._info_label.setText(" | ".join(parts))
+
+    def _save_png(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", str(self.result_dir), "PNG Images (*.png)"
+        )
+        if path:
+            self._fig.savefig(path, dpi=150, bbox_inches="tight")
+
+
 class ZeropointCalibrationWindow(StepWindowBase):
-    """Step 11: Zeropoint & Standardization"""
+    """Step 10: Zeropoint & Standardization"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -1528,11 +2299,18 @@ class ZeropointCalibrationWindow(StepWindowBase):
         self.restore_state()
 
     def setup_step_ui(self):
+        tab_widget = QTabWidget()
+        self.content_layout.addWidget(tab_widget)
+
+        # --- Tab 1: Calibration ---
+        calib_widget = QWidget()
+        calib_layout = QVBoxLayout(calib_widget)
+
         info = QLabel(
             "Build per-frame ZP calibration and standardized catalogs."
         )
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
-        self.content_layout.addWidget(info)
+        calib_layout.addWidget(info)
 
         control_layout = QHBoxLayout()
         btn_params = QPushButton("Calibration Parameters")
@@ -1557,14 +2335,22 @@ class ZeropointCalibrationWindow(StepWindowBase):
         control_layout.addWidget(btn_log)
 
         control_layout.addStretch()
-        self.content_layout.addLayout(control_layout)
+        calib_layout.addLayout(control_layout)
 
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
         self.progress_label = QLabel("Idle")
         progress_layout.addWidget(self.progress_label)
-        self.content_layout.addWidget(progress_group)
+        calib_layout.addWidget(progress_group)
+        calib_layout.addStretch()
 
+        tab_widget.addTab(calib_widget, "Calibration")
+
+        # --- Tab 2: ZP Fit Plot ---
+        self.fit_tab = ZPFitPlotWidget(self.params.P.result_dir)
+        tab_widget.addTab(self.fit_tab, "ZP Fit Plot")
+
+        # Log window (floating, not in tab)
         self.log_window = QWidget(self, Qt.Window)
         self.log_window.setWindowTitle("Calibration Log")
         self.log_window.resize(800, 400)
@@ -1734,6 +2520,7 @@ class ZeropointCalibrationWindow(StepWindowBase):
             self.log("ZP calibration complete")
             self.save_state()
             self.update_navigation_buttons()
+            self.fit_tab.reload()
         self._cleanup_worker()
 
     def on_error(self, message):

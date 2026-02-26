@@ -219,11 +219,11 @@ class MainWindowWorkflow(QMainWindow):
             "Reference Build",
             "Star ID Matching",
             "Master ID Editor",
-            "Forced Photometry",
-            "Aperture Overlay",
+            "Aperture Photometry",
+            "PSF Photometry",
             "Zeropoint Calibration",
             "CMD Plot",
-            "Isochrone Model"
+            "Isochrone Model",
         ]
 
         # Step buttons
@@ -390,6 +390,14 @@ class MainWindowWorkflow(QMainWindow):
         action_cmd_prev.triggered.connect(self.open_cmd_iso_tool)
         tools_menu.addAction(action_cmd_prev)
 
+        action_gaia_3d = QAction("Gaia 3D Cluster Viewer", self)
+        action_gaia_3d.triggered.connect(self.open_gaia_3d_viewer)
+        tools_menu.addAction(action_gaia_3d)
+
+        action_cluster_structure = QAction("Analyze Cluster Structure", self)
+        action_cluster_structure.triggered.connect(self.open_cluster_structure_tool)
+        tools_menu.addAction(action_cluster_structure)
+
         tools_menu.addSeparator()
 
         # IRAF tool (integrated photometry + comparison)
@@ -486,22 +494,22 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 9:
-            from .workflow.step10_aperture_overlay import ApertureOverlayWindow
-            self.current_step_window = ApertureOverlayWindow(
+            from .workflow.step10_psf_photometry import PsfPhotometryWindow
+            self.current_step_window = PsfPhotometryWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 10:
-            from .workflow.step11_zeropoint_calibration import ZeropointCalibrationWindow
+            from .workflow.step10_zeropoint_calibration import ZeropointCalibrationWindow
             self.current_step_window = ZeropointCalibrationWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 11:
-            from .workflow.step12_cmd_plot import CmdPlotWindow
+            from .workflow.step11_cmd_plot import CmdPlotWindow
             self.current_step_window = CmdPlotWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 12:
-            from .workflow.step13_isochrone_model import IsochroneModelWindow
+            from .workflow.step12_isochrone_model import IsochroneModelWindow
             self.current_step_window = IsochroneModelWindow(
                 self.params, self.file_manager, self.project_state, self
             )
@@ -938,6 +946,36 @@ class MainWindowWorkflow(QMainWindow):
         self.iraf_window.raise_()
         self.iraf_window.activateWindow()
         self.append_log("Opened IRAF/DAOPHOT Tool")
+
+    def open_gaia_3d_viewer(self):
+        """Open Gaia 3D cluster viewer tool window."""
+        from .workflow.gaia_3d_viewer_window import Gaia3DViewerWindow
+
+        self.gaia_3d_window = Gaia3DViewerWindow(
+            self.params,
+            self.params.P.result_dir,
+            parent=None
+        )
+        self.gaia_3d_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.gaia_3d_window.show()
+        self.gaia_3d_window.raise_()
+        self.gaia_3d_window.activateWindow()
+        self.append_log(f"Opened Gaia 3D Viewer: {self.params.P.result_dir}")
+
+    def open_cluster_structure_tool(self):
+        """Open cluster structure analysis tool window."""
+        from .tools.cluster_structure import ClusterStructureWindow
+
+        self.cluster_structure_window = ClusterStructureWindow(
+            self.params,
+            self.params.P.result_dir,
+            parent=None,
+        )
+        self.cluster_structure_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.cluster_structure_window.show()
+        self.cluster_structure_window.raise_()
+        self.cluster_structure_window.activateWindow()
+        self.append_log(f"Opened Cluster Structure Tool: {self.params.P.result_dir}")
 
     def _update_parameter_file(self, updates: dict):
         """

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import time
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +32,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, crop_is_active
+from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, step9_dir, crop_is_active
 from ...utils.io_utils import (
     parse_int64_scalar,
     parse_int64_series,
@@ -49,11 +51,18 @@ class MasterIdEditorWindow(StepWindowBase):
         self.current_filename = None
         self.image_data = None
         self.header = None
+        self._file_filter_map = {}
         self.idmatch_df = None
         self.master_ids = set()
         self.selected_source_id = None
         self.last_click_xy = None
         self.gaia_df = None  # Gaia catalog cache
+        self._gaia_gmag_map = {}
+        self.membership_by_source = {}
+        self.membership_by_gaia = {}
+        self.membership_by_id = {}
+        self._membership_loaded = False
+        self._membership_log_once = False
         self.master_gmag_map = {}
         # Fixed ID map (source_id -> display ID); IDs must stay stable across sessions.
         self.internal_id_map = {}
@@ -79,13 +88,21 @@ class MasterIdEditorWindow(StepWindowBase):
         self._scat_removed = None
         self._scat_local = None
         self._scat_gaia = None
+        self._scat_member = None
         self._scat_selected = None
 
         # Frame data caches: filename -> data  (LRU, max _FITS_CACHE_SIZE entries)
         self._fits_cache: dict = {}        # filename -> (image_data, header)
         self._fits_cache_order: list = []  # LRU order
-        self._FITS_CACHE_SIZE = 5
+        self._FITS_CACHE_SIZE = max(3, int(getattr(params.P, "step8_fits_cache_size", 8)))
         self._idmatch_cache: dict = {}     # filename -> idmatch_df (all frames, small)
+        self._idmatch_arr_cache: dict = {} # filename -> (x, y, sids) numpy arrays
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending: set[str] = set()
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        # Display cache: (filename, stretch_idx, intensity, black_point) -> stretched image (LRU)
+        self._display_cache: dict = {}
+        self._display_cache_order: list = []
 
         super().__init__(
             step_index=7,
@@ -102,7 +119,8 @@ class MasterIdEditorWindow(StepWindowBase):
     def setup_step_ui(self):
         info = QLabel(
             "Edit master_star_ids.csv using idmatch overlays.\n"
-            "Shortcuts: A=Add (detected or undetected star), D=Remove, Shift+D=Remove Box, G=Radial Profile (at cursor), [ / ] = Prev/Next frame"
+            "Shortcuts: A=Add (detected or undetected star), D=Remove, Shift+D=Remove Box, G=Radial Profile (at cursor), [ / ] = Prev/Next frame\n"
+            "Overlay: Gaia(master)=green, Membership(member)=pink (when enabled)"
         )
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         self.content_layout.addWidget(info)
@@ -210,11 +228,12 @@ class MasterIdEditorWindow(StepWindowBase):
         table_layout = QVBoxLayout(table_group)
 
         self.master_table = QTableWidget()
-        self.master_table.setColumnCount(3)
-        self.master_table.setHorizontalHeaderLabels(["ID", "source_id", "G mag"])
+        self.master_table.setColumnCount(4)
+        self.master_table.setHorizontalHeaderLabels(["ID", "source_id", "G mag", "Pmem"])
         self.master_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.master_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.master_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.master_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.master_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         table_layout.addWidget(self.master_table)
@@ -241,6 +260,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self.log_text.append(f"[{timestamp}] {message}")
 
     def populate_file_list(self):
+        self._file_filter_map = {}
         cropped_dir = step2_cropped_dir(self.params.P.result_dir)
         legacy_cropped = self.params.P.result_dir / "cropped"
         crop_active = crop_is_active(self.params.P.result_dir)
@@ -269,6 +289,9 @@ class MasterIdEditorWindow(StepWindowBase):
             except Exception:
                 s7 = pd.DataFrame()
             if (not s7.empty) and ("file" in s7.columns):
+                if "filter" in s7.columns:
+                    for fname, filt in zip(s7["file"].astype(str), s7["filter"].astype(str)):
+                        self._file_filter_map[fname] = self._normalize_filter_key(filt)
                 if "wcs_ok" in s7.columns:
                     wcs_ok = s7["wcs_ok"].astype(str).str.strip().str.lower().isin({"true", "1", "yes", "y", "on"})
                 else:
@@ -287,6 +310,76 @@ class MasterIdEditorWindow(StepWindowBase):
         self.file_list = list(files)
         self.file_combo.clear()
         self.file_combo.addItems(self.file_list)
+        self._load_filter_map_from_index()
+        with self._prefetch_lock:
+            self._fits_cache.clear()
+            self._fits_cache_order.clear()
+            self._idmatch_arr_cache.clear()
+            self._display_cache.clear()
+            self._display_cache_order.clear()
+            self._norm_cache.clear()
+            self._prefetch_pending.clear()
+
+    @staticmethod
+    def _normalize_filter_key(value: str | None) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().upper()
+
+    def _extract_filter_from_header(self, header) -> str:
+        if header is None:
+            return ""
+        for key in ("FILTER", "FILTER1", "FILTER2", "FILTNAM"):
+            val = header.get(key)
+            if val:
+                return self._normalize_filter_key(val)
+        return ""
+
+    @staticmethod
+    def _infer_filter_from_filename(fname: str) -> str:
+        base = Path(fname).name
+        for ext in (".fits", ".fit", ".fts", ".fz", ".gz"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+        parts = [p for p in base.replace(".", "_").replace("-", "_").split("_") if p]
+        for token in reversed(parts):
+            cand = token.lower()
+            if 1 <= len(cand) <= 3 and cand.isalpha():
+                return cand.upper()
+        return ""
+
+    def _load_filter_map_from_index(self):
+        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
+        if not idx_path.exists():
+            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        if not idx_path.exists():
+            return
+        try:
+            df = pd.read_csv(idx_path)
+        except Exception:
+            return
+        if "file" not in df.columns or "filter" not in df.columns:
+            return
+        for fname, filt in zip(df["file"].astype(str), df["filter"].astype(str)):
+            fkey = self._normalize_filter_key(filt)
+            if not fkey:
+                fkey = self._infer_filter_from_filename(fname)
+            self._file_filter_map[fname] = fkey
+            if fname.lower().startswith("crop_"):
+                self._file_filter_map[fname[5:]] = fkey
+            if fname.lower().startswith("cropped_"):
+                self._file_filter_map[fname[8:]] = fkey
+
+    def _get_filter_for_file(self, fname: str) -> str:
+        fkey = self._file_filter_map.get(fname, "")
+        if fkey:
+            return fkey
+        if fname == self.current_filename and self.header is not None:
+            fkey = self._extract_filter_from_header(self.header)
+        if not fkey:
+            fkey = self._infer_filter_from_filename(fname)
+        self._file_filter_map[fname] = fkey
+        return fkey
 
     def load_master_ids(self):
         master_path = step8_dir(self.params.P.result_dir) / "master_star_ids.csv"
@@ -501,12 +594,20 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def load_gaia_catalog(self):
         """Load Gaia catalog for source info lookup"""
-        gaia_path = step5_dir(self.params.P.result_dir) / "gaia_fov.ecsv"
-        if not gaia_path.exists():
-            gaia_path = self.params.P.result_dir / "gaia_fov.ecsv"
-        if gaia_path.exists():
+        candidates = [
+            step5_dir(self.params.P.result_dir) / "gaia_derived.csv",
+            self.params.P.result_dir / "gaia_derived.csv",
+            step5_dir(self.params.P.result_dir) / "gaia_fov.ecsv",
+            self.params.P.result_dir / "gaia_fov.ecsv",
+        ]
+        for gaia_path in candidates:
+            if not gaia_path.exists():
+                continue
             try:
-                self.gaia_df = read_ecsv_int64_source_id(gaia_path)
+                if gaia_path.suffix.lower() == ".ecsv":
+                    self.gaia_df = read_ecsv_int64_source_id(gaia_path)
+                else:
+                    self.gaia_df = pd.read_csv(gaia_path)
                 if "source_id" in self.gaia_df.columns:
                     sid_series = parse_int64_series(self.gaia_df["source_id"])
                     valid = sid_series.notna()
@@ -516,13 +617,321 @@ class MasterIdEditorWindow(StepWindowBase):
                         sid_series = sid_series.loc[valid]
                         self.log(f"Gaia catalog: dropped {dropped} rows with invalid source_id")
                     self.gaia_df["source_id"] = sid_series.astype("int64")
-                self.log(f"Gaia catalog loaded: {len(self.gaia_df)} sources")
+                self._rebuild_gaia_gmag_map()
+                self.log(f"Gaia catalog loaded: {len(self.gaia_df)} sources ({gaia_path.name})")
                 if self.master_ids:
                     self.update_master_table()
                     self.update_overlay()
+                return
             except Exception as e:
-                self.log(f"Failed to load Gaia catalog: {e}")
+                self.log(f"Failed to load Gaia catalog ({gaia_path.name}): {e}")
                 self.gaia_df = None
+                self._gaia_gmag_map = {}
+
+    def _rebuild_gaia_gmag_map(self):
+        self._gaia_gmag_map = {}
+        if self.gaia_df is None or len(self.gaia_df) == 0:
+            return
+        if "source_id" not in self.gaia_df.columns:
+            return
+        g_col = None
+        for cand in ("phot_g_mean_mag", "gaia_G", "g_mag"):
+            if cand in self.gaia_df.columns:
+                g_col = cand
+                break
+        if g_col is None:
+            return
+        sid = parse_int64_series(self.gaia_df["source_id"])
+        g = pd.to_numeric(self.gaia_df[g_col], errors="coerce")
+        valid = sid.notna() & g.notna()
+        if not valid.any():
+            return
+        sid_i = sid.loc[valid].astype("int64").to_numpy(np.int64, copy=False)
+        g_v = g.loc[valid].astype(float).to_numpy(float, copy=False)
+        for s, gv in zip(sid_i.tolist(), g_v.tolist()):
+            if np.isfinite(gv):
+                self._gaia_gmag_map[int(s)] = float(gv)
+
+    @staticmethod
+    def _pick_membership_col(cols) -> str | None:
+        for c in ("gaia_pmem", "pmem_gaia", "membership_prob_gaia", "membership_prob", "pmem"):
+            if c in cols:
+                return c
+        return None
+
+    @staticmethod
+    def _logpdf_gauss(x: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
+        d = x.shape[1]
+        cov_r = np.asarray(cov, float) + np.eye(d) * 1e-6
+        sign, logdet = np.linalg.slogdet(cov_r)
+        if sign <= 0:
+            return np.full(x.shape[0], -np.inf, dtype=float)
+        try:
+            inv = np.linalg.inv(cov_r)
+        except Exception:
+            return np.full(x.shape[0], -np.inf, dtype=float)
+        diff = x - mu[None, :]
+        q = np.einsum("ni,ij,nj->n", diff, inv, diff)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + q)
+
+    def _fit_two_component_gmm(self, x_fit: np.ndarray):
+        n, d = x_fit.shape
+        if n < max(30, d * 8):
+            return None
+
+        center = np.nanmedian(x_fit, axis=0)
+        mad = np.nanmedian(np.abs(x_fit - center), axis=0)
+        mad = np.where(np.isfinite(mad) & (mad > 1e-6), mad, 1.0)
+        z = (x_fit - center[None, :]) / mad[None, :]
+        d2 = np.sum(z * z, axis=1)
+        q40 = float(np.nanquantile(d2, 0.40))
+        m0 = d2 <= q40
+        if m0.sum() < max(12, d * 3) or m0.sum() > (n - max(12, d * 3)):
+            order = np.argsort(d2)
+            m0 = np.zeros(n, dtype=bool)
+            m0[order[: max(n // 2, 1)]] = True
+        m1 = ~m0
+
+        def _cov(arr: np.ndarray) -> np.ndarray:
+            if arr.shape[0] < (d + 1):
+                return np.eye(d, dtype=float)
+            c = np.cov(arr, rowvar=False)
+            if np.ndim(c) == 0:
+                c = np.eye(d, dtype=float) * float(c)
+            return np.asarray(c, float) + np.eye(d, dtype=float) * 1e-4
+
+        pi = np.array([max(m0.mean(), 1e-3), max(m1.mean(), 1e-3)], dtype=float)
+        pi /= pi.sum()
+        mu = np.vstack([
+            np.nanmean(x_fit[m0], axis=0),
+            np.nanmean(x_fit[m1], axis=0),
+        ])
+        cov = np.stack([_cov(x_fit[m0]), _cov(x_fit[m1])], axis=0)
+        last_ll = -np.inf
+
+        for _ in range(80):
+            lp0 = np.log(max(pi[0], 1e-9)) + self._logpdf_gauss(x_fit, mu[0], cov[0])
+            lp1 = np.log(max(pi[1], 1e-9)) + self._logpdf_gauss(x_fit, mu[1], cov[1])
+            m = np.maximum(lp0, lp1)
+            e0 = np.exp(lp0 - m)
+            e1 = np.exp(lp1 - m)
+            den = e0 + e1 + 1e-12
+            r0 = e0 / den
+            r1 = e1 / den
+            nk = np.array([r0.sum(), r1.sum()], dtype=float)
+            if np.any(nk < (d + 2)):
+                break
+            pi = nk / float(n)
+            mu[0] = (r0[:, None] * x_fit).sum(axis=0) / nk[0]
+            mu[1] = (r1[:, None] * x_fit).sum(axis=0) / nk[1]
+            for k, rk in enumerate((r0, r1)):
+                diff = x_fit - mu[k][None, :]
+                cov[k] = (diff.T * rk).dot(diff) / max(nk[k], 1.0)
+                cov[k] += np.eye(d, dtype=float) * 1e-4
+            ll = float(np.sum(m + np.log(den)))
+            if np.isfinite(last_ll):
+                if abs(ll - last_ll) < 1e-4 * max(1.0, abs(last_ll)):
+                    break
+            last_ll = ll
+
+        det0 = abs(float(np.linalg.det(cov[0])))
+        det1 = abs(float(np.linalg.det(cov[1])))
+        cluster_idx = 0 if det0 <= det1 else 1
+        return {
+            "pi": pi,
+            "mu": mu,
+            "cov": cov,
+            "cluster_idx": int(cluster_idx),
+        }
+
+    def _compute_membership_from_master(self) -> bool:
+        master_candidates = [
+            step6_dir(self.params.P.result_dir) / "master_catalog.tsv",
+            self.params.P.result_dir / "master_catalog.tsv",
+        ]
+        master_path = next((p for p in master_candidates if p.exists()), None)
+        if master_path is None:
+            return False
+
+        try:
+            df = pd.read_csv(master_path, sep="\t")
+        except Exception:
+            return False
+        if df.empty:
+            return False
+        req = ("pmra", "pmdec", "parallax")
+        if not all(c in df.columns for c in req):
+            return False
+
+        pmra = pd.to_numeric(df["pmra"], errors="coerce").to_numpy(float)
+        pmdec = pd.to_numeric(df["pmdec"], errors="coerce").to_numpy(float)
+        plx = pd.to_numeric(df["parallax"], errors="coerce").to_numpy(float)
+        finite = np.isfinite(pmra) & np.isfinite(pmdec) & np.isfinite(plx)
+        if int(finite.sum()) < 30:
+            return False
+
+        fit_mask = finite.copy()
+        if "ruwe" in df.columns:
+            ruwe = pd.to_numeric(df["ruwe"], errors="coerce").to_numpy(float)
+            fit_mask &= (~np.isfinite(ruwe)) | (ruwe <= 2.0)
+        if "visibility_periods_used" in df.columns:
+            vpu = pd.to_numeric(df["visibility_periods_used"], errors="coerce").to_numpy(float)
+            fit_mask &= (~np.isfinite(vpu)) | (vpu >= 8.0)
+        if int(fit_mask.sum()) < 25:
+            fit_mask = finite.copy()
+
+        x_fit = np.column_stack([pmra[fit_mask], pmdec[fit_mask], plx[fit_mask]])
+        model = self._fit_two_component_gmm(x_fit)
+        if model is None:
+            return False
+
+        x_all = np.column_stack([pmra[finite], pmdec[finite], plx[finite]])
+        pi = np.asarray(model["pi"], float)
+        mu = np.asarray(model["mu"], float)
+        cov = np.asarray(model["cov"], float)
+        k_cluster = int(model["cluster_idx"])
+
+        lp0 = np.log(max(pi[0], 1e-9)) + self._logpdf_gauss(x_all, mu[0], cov[0])
+        lp1 = np.log(max(pi[1], 1e-9)) + self._logpdf_gauss(x_all, mu[1], cov[1])
+        m = np.maximum(lp0, lp1)
+        e0 = np.exp(lp0 - m)
+        e1 = np.exp(lp1 - m)
+        den = e0 + e1 + 1e-12
+        r0 = e0 / den
+        r1 = e1 / den
+        p_cluster = r0 if k_cluster == 0 else r1
+
+        pmem = np.full(len(df), np.nan, dtype=float)
+        pmem[finite] = np.clip(p_cluster, 0.0, 1.0)
+
+        src = parse_int64_series(df["source_id"]).tolist() if "source_id" in df.columns else [pd.NA] * len(df)
+        gaia = parse_int64_series(df["gaia_source_id"]).tolist() if "gaia_source_id" in df.columns else [pd.NA] * len(df)
+        ids = pd.to_numeric(df["ID"], errors="coerce").tolist() if "ID" in df.columns else [np.nan] * len(df)
+
+        n_src = 0
+        n_gaia = 0
+        n_id = 0
+        for s, g, i, p in zip(src, gaia, ids, pmem.tolist()):
+            if not np.isfinite(p):
+                continue
+            pp = float(np.clip(p, 0.0, 1.0))
+            if pd.notna(s):
+                self.membership_by_source[int(s)] = pp
+                n_src += 1
+            if pd.notna(g):
+                self.membership_by_gaia[int(g)] = pp
+                n_gaia += 1
+            if np.isfinite(i):
+                self.membership_by_id[int(i)] = pp
+                n_id += 1
+
+        self.log(
+            "Membership map computed from master astrometry "
+            f"(source={n_src}, gaia={n_gaia}, id={n_id}, fit={int(fit_mask.sum())})"
+        )
+        return (n_src + n_gaia + n_id) > 0
+
+    def _load_membership_map(self):
+        self.membership_by_source = {}
+        self.membership_by_gaia = {}
+        self.membership_by_id = {}
+        self._membership_loaded = True
+
+        result_dir = self.params.P.result_dir
+        candidates = [
+            step5_dir(result_dir) / "gaia_derived.csv",
+            result_dir / "gaia_derived.csv",
+            result_dir / "cmd_with_gaia_membership.csv",
+            result_dir / "step11" / "cmd_with_gaia_membership.csv",
+            result_dir / "cmd_with_membership.csv",
+            result_dir / "step12" / "cmd_with_membership.csv",
+            result_dir / "median_by_ID_filter_wide_cmd.csv",
+            result_dir / "step11" / "median_by_ID_filter_wide_cmd.csv",
+            step6_dir(result_dir) / "master_catalog.tsv",
+            result_dir / "master_catalog.tsv",
+        ]
+
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                if path.suffix.lower() == ".tsv":
+                    df = pd.read_csv(path, sep="\t")
+                else:
+                    df = pd.read_csv(path)
+            except Exception:
+                continue
+            if df.empty:
+                continue
+
+            p_col = self._pick_membership_col(df.columns)
+            if p_col is None:
+                continue
+            prob = pd.to_numeric(df[p_col], errors="coerce").to_numpy(float)
+
+            n_src = 0
+            n_gaia = 0
+            n_id = 0
+            if "source_id" in df.columns:
+                src = parse_int64_series(df["source_id"])
+                for sid, p in zip(src.tolist(), prob.tolist()):
+                    if pd.isna(sid) or (not np.isfinite(p)):
+                        continue
+                    self.membership_by_source[int(sid)] = float(np.clip(p, 0.0, 1.0))
+                    n_src += 1
+
+            if "gaia_source_id" in df.columns:
+                gs = parse_int64_series(df["gaia_source_id"])
+                for sid, p in zip(gs.tolist(), prob.tolist()):
+                    if pd.isna(sid) or (not np.isfinite(p)):
+                        continue
+                    self.membership_by_gaia[int(sid)] = float(np.clip(p, 0.0, 1.0))
+                    n_gaia += 1
+
+            if "ID" in df.columns:
+                ids = pd.to_numeric(df["ID"], errors="coerce")
+                for id_v, p in zip(ids.tolist(), prob.tolist()):
+                    if (not np.isfinite(id_v)) or (not np.isfinite(p)):
+                        continue
+                    self.membership_by_id[int(id_v)] = float(np.clip(p, 0.0, 1.0))
+                    n_id += 1
+
+            if (n_src + n_gaia + n_id) > 0:
+                self.log(
+                    f"Membership map loaded: source={n_src}, gaia={n_gaia}, id={n_id} "
+                    f"from {path.name} ({p_col})"
+                )
+                return
+
+        # Fallback: compute membership from Step6 astrometric columns.
+        if self._compute_membership_from_master():
+            return
+
+        if not self._membership_log_once:
+            self.log("Membership map not found (gaia_pmem column/file missing).")
+            self._membership_log_once = True
+
+    def _ensure_membership_map(self, force: bool = False):
+        if (not force) and (not bool(getattr(self.params.P, "step8_membership_overlay_enable", False))):
+            return
+        if not self._membership_loaded:
+            self._load_membership_map()
+
+    def _membership_prob_for_sid(self, sid: int) -> float:
+        s = int(sid)
+        p = self.membership_by_source.get(s, None)
+        if p is not None:
+            return float(p)
+        if s > 0:
+            p = self.membership_by_gaia.get(s, None)
+            if p is not None:
+                return float(p)
+        id_v = self.internal_id_map.get(s, self._global_id_map.get(s, None))
+        if id_v is not None:
+            p = self.membership_by_id.get(int(id_v), None)
+            if p is not None:
+                return float(p)
+        return np.nan
 
     def get_gaia_info(self, source_id: int) -> str:
         """Get Gaia info string for a source_id"""
@@ -564,31 +973,42 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def update_master_table(self):
         """Update master table using stable ID (not frame-dependent numbering)."""
+        self._ensure_membership_map(force=True)
         rows = []
         for sid in sorted(self.master_ids):
             sid_i = int(sid)
             fixed_id = self._ensure_stable_id(sid_i)
             g_mag = self._get_gmag_for_source(sid_i)
-            rows.append((int(fixed_id), sid_i, g_mag))
+            pmem = self._membership_prob_for_sid(sid_i)
+            rows.append((int(fixed_id), sid_i, g_mag, pmem))
 
         rows.sort(key=lambda x: int(x[0]))
 
-        self.master_table.setRowCount(len(rows))
-        for i, (fixed_id, sid, g_mag) in enumerate(rows):
-            self.master_table.setItem(i, 0, QTableWidgetItem(str(fixed_id)))
-            self.master_table.setItem(i, 1, QTableWidgetItem(str(sid)))
-            if np.isfinite(g_mag):
-                g_str = f"{g_mag:.3f}"
-            elif int(sid) < 0:
-                g_str = "local"
-            else:
-                g_str = "-"
-            self.master_table.setItem(i, 2, QTableWidgetItem(g_str))
+        self.master_table.blockSignals(True)
+        self.master_table.setUpdatesEnabled(False)
+        try:
+            self.master_table.setRowCount(len(rows))
+            for i, (fixed_id, sid, g_mag, pmem) in enumerate(rows):
+                self.master_table.setItem(i, 0, QTableWidgetItem(str(fixed_id)))
+                self.master_table.setItem(i, 1, QTableWidgetItem(str(sid)))
+                if np.isfinite(g_mag):
+                    g_str = f"{g_mag:.3f}"
+                elif int(sid) < 0:
+                    g_str = "local"
+                else:
+                    g_str = "-"
+                self.master_table.setItem(i, 2, QTableWidgetItem(g_str))
+                p_str = f"{pmem:.3f}" if np.isfinite(pmem) else "-"
+                self.master_table.setItem(i, 3, QTableWidgetItem(p_str))
+        finally:
+            self.master_table.setUpdatesEnabled(True)
+            self.master_table.blockSignals(False)
 
         n_total = len(rows)
-        n_gmag = sum(1 for _, _, g in rows if np.isfinite(g))
+        n_gmag = sum(1 for _, _, g, _ in rows if np.isfinite(g))
+        n_pmem = sum(1 for _, _, _, p in rows if np.isfinite(p))
         if hasattr(self, "log_text"):
-            self.log(f"Master IDs: {n_total} | Gmag available: {n_gmag} | Stable IDs")
+            self.log(f"Master IDs: {n_total} | Gmag: {n_gmag} | Pmem: {n_pmem} | Stable IDs")
 
         self.update_navigation_buttons()
 
@@ -624,7 +1044,8 @@ class MasterIdEditorWindow(StepWindowBase):
     def on_file_changed(self, index):
         if index < 0 or index >= len(self.file_list):
             return
-        self.load_and_display()
+        # Fast switch: avoid full redraw if shape is unchanged.
+        self.load_and_display(quick_switch=True)
 
     def _get_fits_path(self, filename):
         if self.use_cropped:
@@ -636,22 +1057,85 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def _load_fits_cached(self, filename):
         """Return (image_data, header) from cache or disk. LRU eviction."""
-        if filename in self._fits_cache:
-            # Move to end (most recently used)
-            self._fits_cache_order.remove(filename)
-            self._fits_cache_order.append(filename)
-            return self._fits_cache[filename]
+        with self._prefetch_lock:
+            if filename in self._fits_cache:
+                # Move to end (most recently used)
+                try:
+                    self._fits_cache_order.remove(filename)
+                except ValueError:
+                    pass
+                self._fits_cache_order.append(filename)
+                return self._fits_cache[filename]
         file_path = self._get_fits_path(filename)
-        with fits.open(file_path) as hdul:
-            data = hdul[0].data.astype(float)
+        with fits.open(file_path, memmap=False) as hdul:
+            # Use float32 to reduce memory bandwidth on frame switching.
+            data_raw = hdul[0].data
+            if data_raw is None:
+                raise ValueError(f"FITS image data is empty: {file_path.name}")
+            data = np.asarray(data_raw, dtype=np.float32)
             header = hdul[0].header.copy()
-        # Evict oldest if over limit
-        while len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
-            oldest = self._fits_cache_order.pop(0)
-            self._fits_cache.pop(oldest, None)
-        self._fits_cache[filename] = (data, header)
-        self._fits_cache_order.append(filename)
-        return data, header
+        with self._prefetch_lock:
+            # In case prefetch completed first, return existing cache entry.
+            if filename in self._fits_cache:
+                try:
+                    self._fits_cache_order.remove(filename)
+                except ValueError:
+                    pass
+                self._fits_cache_order.append(filename)
+                return self._fits_cache[filename]
+            # Evict oldest if over limit
+            while len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+                oldest = self._fits_cache_order.pop(0)
+                self._fits_cache.pop(oldest, None)
+            self._fits_cache[filename] = (data, header)
+            self._fits_cache_order.append(filename)
+            return data, header
+
+    def _prefetch_fits_worker(self, filename: str):
+        try:
+            file_path = self._get_fits_path(filename)
+            if not file_path.exists():
+                return
+            with fits.open(file_path, memmap=False) as hdul:
+                data_raw = hdul[0].data
+                if data_raw is None:
+                    return
+                data = np.asarray(data_raw, dtype=np.float32)
+                header = hdul[0].header.copy()
+            with self._prefetch_lock:
+                if filename not in self._fits_cache:
+                    while len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+                        oldest = self._fits_cache_order.pop(0)
+                        self._fits_cache.pop(oldest, None)
+                    self._fits_cache[filename] = (data, header)
+                    self._fits_cache_order.append(filename)
+        except Exception:
+            pass
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_pending.discard(filename)
+
+    def _schedule_prefetch_neighbors(self):
+        if not self.file_list:
+            return
+        idx = self.file_combo.currentIndex()
+        if idx < 0:
+            return
+        candidates = []
+        if idx + 1 < len(self.file_list):
+            candidates.append(self.file_list[idx + 1])
+        if idx - 1 >= 0:
+            candidates.append(self.file_list[idx - 1])
+        for fname in candidates:
+            with self._prefetch_lock:
+                if fname in self._fits_cache or fname in self._prefetch_pending:
+                    continue
+                self._prefetch_pending.add(fname)
+            try:
+                self._prefetch_executor.submit(self._prefetch_fits_worker, fname)
+            except Exception:
+                with self._prefetch_lock:
+                    self._prefetch_pending.discard(fname)
 
     def load_and_display(self, quick_switch=False):
         filename = self.file_combo.currentText()
@@ -675,16 +1159,26 @@ class MasterIdEditorWindow(StepWindowBase):
             if self._auto_master_dirty:
                 self.save_master_ids(log_action="auto_add")
                 self._auto_master_dirty = False
-            else:
-                self.update_master_table()
+            self._schedule_prefetch_neighbors()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load: {str(e)}")
+
+    def closeEvent(self, event):
+        try:
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def load_idmatch_for_file(self, filename):
         # Check cache first
         if filename in self._idmatch_cache:
             self.idmatch_df = self._idmatch_cache[filename]
-            self._auto_add_detections_to_master(self.idmatch_df)
+            arr = self._idmatch_arr_cache.get(filename, None)
+            if arr is not None:
+                self._auto_add_detections_to_master(self.idmatch_df, arr[2])
+            else:
+                self._auto_add_detections_to_master(self.idmatch_df)
             return
         idmatch_path = self.params.P.cache_dir / "idmatch" / f"idmatch_{filename}.csv"
         if idmatch_path.exists():
@@ -709,23 +1203,34 @@ class MasterIdEditorWindow(StepWindowBase):
                         self.log(f"[{filename}] idmatch: unmatched detections kept={unmatched}")
                     clean["source_id"] = parse_int64_series(clean["source_id"]).fillna(0).astype("int64")
                     result = clean.reset_index(drop=True)
+                    x_arr = result["x"].to_numpy(float, copy=False)
+                    y_arr = result["y"].to_numpy(float, copy=False)
+                    sid_arr = result["source_id"].to_numpy(np.int64, copy=False)
                     self._idmatch_cache[filename] = result
+                    self._idmatch_arr_cache[filename] = (x_arr, y_arr, sid_arr)
                     self.idmatch_df = result
-                    self._auto_add_detections_to_master(self.idmatch_df)
+                    self._auto_add_detections_to_master(self.idmatch_df, sid_arr)
                     return
             except Exception:
                 pass
         empty = pd.DataFrame(columns=["x", "y", "source_id"])
         self._idmatch_cache[filename] = empty
+        self._idmatch_arr_cache[filename] = (
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype=np.int64),
+        )
         self.idmatch_df = empty
 
-    def _auto_add_detections_to_master(self, df: pd.DataFrame):
-        try:
-            sids = set(parse_int64_series(df["source_id"]).dropna().astype("int64").tolist())
-        except Exception:
+    def _auto_add_detections_to_master(self, df: pd.DataFrame, sid_arr: np.ndarray | None = None):
+        if sid_arr is None:
+            try:
+                sid_arr = parse_int64_series(df["source_id"]).dropna().astype("int64").to_numpy(np.int64, copy=False)
+            except Exception:
+                return
+        if sid_arr.size == 0:
             return
-        if 0 in sids:
-            sids.remove(0)
+        sids = set(np.unique(sid_arr[sid_arr != 0]).tolist())
         new_ids = sids - self.master_ids
         if not new_ids:
             return
@@ -736,11 +1241,9 @@ class MasterIdEditorWindow(StepWindowBase):
         if self.image_data is None:
             return
 
-        normalized = self.normalize_image()
-        if normalized is None:
+        stretched = self._get_stretched_display_cached()
+        if stretched is None:
             return
-
-        stretched = self.apply_stretch(normalized)
 
         filt = ""
         if self.header is not None:
@@ -766,6 +1269,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._scat_removed = None
         self._scat_local = None
         self._scat_gaia = None
+        self._scat_member = None
         self._scat_selected = None
 
         self._imshow_obj = self.ax.imshow(
@@ -781,6 +1285,8 @@ class MasterIdEditorWindow(StepWindowBase):
                                                edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
         self._scat_gaia      = self.ax.scatter([], [], s=28, facecolors='none',
                                                edgecolors='lime', linewidths=1.1, alpha=0.85)
+        self._scat_member    = self.ax.scatter([], [], s=30, facecolors='none',
+                                               edgecolors='#FF4DA6', linewidths=1.2, alpha=0.9)
         self._scat_selected  = self.ax.scatter([], [], s=60, facecolors='none',
                                                edgecolors='red', linewidths=1.5, alpha=0.9)
 
@@ -814,40 +1320,70 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if self.idmatch_df is None or self.idmatch_df.empty:
             for s in (self._scat_unmatched, self._scat_removed,
-                      self._scat_local, self._scat_gaia, self._scat_selected):
+                      self._scat_local, self._scat_gaia, self._scat_member, self._scat_selected):
                 s.set_offsets(empty)
             self.canvas.draw_idle()
             return
 
-        x = pd.to_numeric(self.idmatch_df["x"], errors="coerce").to_numpy(float)
-        y = pd.to_numeric(self.idmatch_df["y"], errors="coerce").to_numpy(float)
-        sid_series = parse_int64_series(self.idmatch_df["source_id"])
-        sid_valid = sid_series.notna().to_numpy(bool)
-        valid = np.isfinite(x) & np.isfinite(y) & sid_valid
+        arr = self._idmatch_arr_cache.get(self.current_filename or "", None)
+        if arr is None:
+            x = pd.to_numeric(self.idmatch_df["x"], errors="coerce").to_numpy(float)
+            y = pd.to_numeric(self.idmatch_df["y"], errors="coerce").to_numpy(float)
+            sid = np.asarray(pd.to_numeric(self.idmatch_df["source_id"], errors="coerce"), dtype=float)
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(sid)
+            if not np.any(valid):
+                for s in (self._scat_unmatched, self._scat_removed,
+                          self._scat_local, self._scat_gaia, self._scat_member, self._scat_selected):
+                    s.set_offsets(empty)
+                self.canvas.draw_idle()
+                return
+            x = x[valid]
+            y = y[valid]
+            sids = sid[valid].astype(np.int64, copy=False)
+            self._idmatch_arr_cache[self.current_filename or ""] = (x, y, sids)
+        else:
+            x, y, sids = arr
 
-        if not np.any(valid):
+        if sids.size == 0:
             for s in (self._scat_unmatched, self._scat_removed,
-                      self._scat_local, self._scat_gaia, self._scat_selected):
+                      self._scat_local, self._scat_gaia, self._scat_member, self._scat_selected):
                 s.set_offsets(empty)
             self.canvas.draw_idle()
             return
 
-        x = x[valid]
-        y = y[valid]
-        sids = sid_series.loc[valid].astype("int64").to_numpy(dtype=np.int64)
-        in_master = np.array([sid in self.master_ids for sid in sids])
+        if self.master_ids:
+            master_vals = np.fromiter((int(v) for v in self.master_ids), dtype=np.int64, count=len(self.master_ids))
+            in_master = np.isin(sids, master_vals)
+        else:
+            in_master = np.zeros_like(sids, dtype=bool)
         is_unmatched  = sids == 0
         is_matched    = ~is_unmatched
         is_gaia       = sids > 0
         is_local      = sids < 0
         is_removed    = is_matched & ~in_master
-        is_gaia_master  = is_matched & in_master & is_gaia
+        is_gaia_master = is_matched & in_master & is_gaia
         is_local_master = is_matched & in_master & is_local
+
+        is_member = np.zeros_like(is_gaia_master, dtype=bool)
+        if bool(getattr(self.params.P, "step8_membership_overlay_enable", False)):
+            self._ensure_membership_map()
+            thr = float(getattr(self.params.P, "step8_membership_threshold", 0.5))
+            idx_gaia = np.where(is_gaia_master)[0]
+            if idx_gaia.size > 0:
+                sid_gaia = sids[idx_gaia]
+                pmem = np.fromiter(
+                    (self._membership_prob_for_sid(int(s)) for s in sid_gaia),
+                    dtype=float,
+                    count=sid_gaia.size,
+                )
+                is_member[idx_gaia] = np.isfinite(pmem) & (pmem >= thr)
+        is_gaia_nonmember = is_gaia_master & (~is_member)
 
         self._scat_unmatched.set_offsets(self._safe_offsets(x[is_unmatched], y[is_unmatched]))
         self._scat_removed.set_offsets(self._safe_offsets(x[is_removed], y[is_removed]))
         self._scat_local.set_offsets(self._safe_offsets(x[is_local_master], y[is_local_master]))
-        self._scat_gaia.set_offsets(self._safe_offsets(x[is_gaia_master], y[is_gaia_master]))
+        self._scat_gaia.set_offsets(self._safe_offsets(x[is_gaia_nonmember], y[is_gaia_nonmember]))
+        self._scat_member.set_offsets(self._safe_offsets(x[is_member], y[is_member]))
 
         if self.selected_source_id is not None:
             sel_mask = sids == self.selected_source_id
@@ -1023,21 +1559,10 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def _get_gmag_for_source(self, source_id: int) -> float:
         """Get G magnitude for a source_id from Gaia catalog"""
-        if self.gaia_df is None or len(self.gaia_df) == 0:
-            return float(self.master_gmag_map.get(int(source_id), np.nan))
-        try:
-            sid_col = parse_int64_series(self.gaia_df["source_id"])
-            valid = sid_col.notna().to_numpy(bool)
-            if not np.any(valid):
-                return float(self.master_gmag_map.get(int(source_id), np.nan))
-            sid_valid = sid_col.loc[valid].astype("int64")
-            row = self.gaia_df.loc[valid].loc[sid_valid == int(source_id)]
-            if len(row) > 0:
-                val = float(row.iloc[0].get("phot_g_mean_mag", np.nan))
-                if np.isfinite(val):
-                    return val
-        except Exception:
-            pass
+        sid = int(source_id)
+        val = self._gaia_gmag_map.get(sid, np.nan)
+        if np.isfinite(val):
+            return float(val)
         return float(self.master_gmag_map.get(int(source_id), np.nan))
 
     def _refine_centroid(self, x: float, y: float) -> tuple | None:
@@ -1237,6 +1762,17 @@ class MasterIdEditorWindow(StepWindowBase):
         self.param_gaia_sep.setValue(float(getattr(self.params.P, "gaia_add_max_sep_arcsec", 2.0)))
         form.addRow("Gaia Add Max Sep (\"):", self.param_gaia_sep)
 
+        self.param_mem_overlay = QCheckBox("Enable membership color overlay")
+        self.param_mem_overlay.setChecked(bool(getattr(self.params.P, "step8_membership_overlay_enable", False)))
+        form.addRow("Membership Overlay:", self.param_mem_overlay)
+
+        self.param_mem_thr = QDoubleSpinBox()
+        self.param_mem_thr.setRange(0.0, 1.0)
+        self.param_mem_thr.setDecimals(2)
+        self.param_mem_thr.setSingleStep(0.05)
+        self.param_mem_thr.setValue(float(getattr(self.params.P, "step8_membership_threshold", 0.5)))
+        form.addRow("Membership P threshold:", self.param_mem_thr)
+
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: self.save_parameters(dialog))
@@ -1248,6 +1784,11 @@ class MasterIdEditorWindow(StepWindowBase):
         self.params.P.search_radius_px = self.param_search.value()
         self.params.P.bulk_drop_box_px = self.param_box.value()
         self.params.P.gaia_add_max_sep_arcsec = self.param_gaia_sep.value()
+        self.params.P.step8_membership_overlay_enable = self.param_mem_overlay.isChecked()
+        self.params.P.step8_membership_threshold = self.param_mem_thr.value()
+        self._membership_loaded = False
+        self._ensure_membership_map(force=True)
+        self.update_overlay()
         self.save_state()
         QMessageBox.information(dialog, "Success", "Parameters saved!")
         dialog.accept()
@@ -1265,6 +1806,8 @@ class MasterIdEditorWindow(StepWindowBase):
             "search_radius_px": getattr(self.params.P, "search_radius_px", 7.0),
             "bulk_drop_box_px": getattr(self.params.P, "bulk_drop_box_px", 200),
             "gaia_add_max_sep_arcsec": getattr(self.params.P, "gaia_add_max_sep_arcsec", 2.0),
+            "step8_membership_overlay_enable": getattr(self.params.P, "step8_membership_overlay_enable", False),
+            "step8_membership_threshold": getattr(self.params.P, "step8_membership_threshold", 0.5),
         }
         self.project_state.store_step_data("master_id_editor", state_data)
 
@@ -1284,7 +1827,27 @@ class MasterIdEditorWindow(StepWindowBase):
         if not self.file_list:
             return
         idx = self.file_combo.currentIndex()
-        new_idx = max(0, min(len(self.file_list) - 1, idx + delta))
+        if idx < 0:
+            return
+        current_fname = self.file_combo.itemText(idx)
+        current_filter = self._get_filter_for_file(current_fname)
+        if not current_filter:
+            current_filter = ""
+
+        filter_indices = []
+        for i, fname in enumerate(self.file_list):
+            if self._get_filter_for_file(fname) == current_filter:
+                filter_indices.append(i)
+
+        if len(filter_indices) <= 1:
+            new_idx = (idx + delta) % len(self.file_list)
+        else:
+            try:
+                pos = filter_indices.index(idx)
+            except ValueError:
+                pos = 0
+            new_idx = filter_indices[(pos + delta) % len(filter_indices)]
+
         if new_idx != idx:
             # Disconnect signal temporarily to call load_and_display with quick_switch flag
             self.file_combo.blockSignals(True)
@@ -1431,6 +1994,8 @@ class MasterIdEditorWindow(StepWindowBase):
     # Stretch functions (from Step4)
     def on_stretch_changed(self, index):
         self._norm_cache.clear()  # Stretch changed — invalidate all normalized caches
+        self._display_cache.clear()
+        self._display_cache_order.clear()
         self.display_image()
 
     def update_stretch_label(self, value):
@@ -1442,6 +2007,33 @@ class MasterIdEditorWindow(StepWindowBase):
     def redisplay_image(self):
         self.display_image()
 
+    def _get_stretched_display_cached(self):
+        if self.image_data is None:
+            return None
+        stretch_idx = int(self.scale_combo.currentIndex())
+        intensity = int(self.stretch_slider.value())
+        black_point = int(self.black_slider.value())
+        cache_key = (self.current_filename, stretch_idx, intensity, black_point)
+        if cache_key in self._display_cache:
+            try:
+                self._display_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            self._display_cache_order.append(cache_key)
+            return self._display_cache[cache_key]
+
+        normalized = self.normalize_image()
+        if normalized is None:
+            return None
+        stretched = self.apply_stretch(normalized).astype(np.float32, copy=False)
+
+        while len(self._display_cache_order) >= self._FITS_CACHE_SIZE:
+            oldest = self._display_cache_order.pop(0)
+            self._display_cache.pop(oldest, None)
+        self._display_cache[cache_key] = stretched
+        self._display_cache_order.append(cache_key)
+        return stretched
+
     def normalize_image(self):
         if self.image_data is None:
             return None
@@ -1449,7 +2041,7 @@ class MasterIdEditorWindow(StepWindowBase):
         stretch_idx = self.scale_combo.currentIndex()
         cache_key = (self.current_filename, stretch_idx)
         if cache_key in self._norm_cache:
-            return self._norm_cache[cache_key].copy()
+            return self._norm_cache[cache_key]
 
         finite = np.isfinite(self.image_data)
         if not finite.any():
@@ -1477,9 +2069,9 @@ class MasterIdEditorWindow(StepWindowBase):
         if len(self._norm_cache) >= self._FITS_CACHE_SIZE:
             oldest = next(iter(self._norm_cache))
             del self._norm_cache[oldest]
-        self._norm_cache[cache_key] = normalized
+        self._norm_cache[cache_key] = normalized.astype(np.float32, copy=False)
 
-        return normalized.copy()
+        return self._norm_cache[cache_key]
 
     def calculate_zscale(self):
         finite = np.isfinite(self.image_data)

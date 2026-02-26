@@ -387,16 +387,29 @@ class CropSelectorWindow(StepWindowBase):
             cropped_dir = step2_cropped_dir(self.params.P.result_dir)
             cropped_dir.mkdir(parents=True, exist_ok=True)
 
+            total = len(self.file_manager.filenames)
+            n_written = 0
+            n_cached = 0
+            cancelled = False
+
             # Crop all files
             for i, filename in enumerate(self.file_manager.filenames):
                 if progress.wasCanceled():
+                    cancelled = True
                     break
 
                 progress.setValue(i)
-                progress.setLabelText(f"Cropping {filename}...")
+                progress.setLabelText(f"Checking cache: {filename}...")
 
                 original_path = self.params.P.data_dir / filename
                 cropped_path = cropped_dir / filename
+
+                # Cache hit: existing cropped file matches current crop rect and is newer than source.
+                if self._is_crop_cache_valid(original_path, cropped_path):
+                    n_cached += 1
+                    continue
+
+                progress.setLabelText(f"Cropping {filename}...")
 
                 # Read FITS data and header from original
                 hdul = fits.open(original_path)
@@ -417,8 +430,19 @@ class CropSelectorWindow(StepWindowBase):
                 # Save cropped file
                 hdu = fits.PrimaryHDU(data=cropped_data, header=header)
                 hdu.writeto(cropped_path, overwrite=True)
+                n_written += 1
 
-            progress.setValue(len(self.file_manager.filenames))
+            progress.setValue(total)
+
+            if cancelled:
+                QMessageBox.warning(
+                    self, "Crop Cancelled",
+                    f"Cropping was cancelled.\n\n"
+                    f"Newly written: {n_written}\n"
+                    f"Reused from cache: {n_cached}\n"
+                    f"Total target files: {total}"
+                )
+                return
 
             # Update displayed image to show cropped result
             self.displayed_image_data = self.original_image_data[self.crop_y0:self.crop_y1, self.crop_x0:self.crop_x1]
@@ -436,7 +460,8 @@ class CropSelectorWindow(StepWindowBase):
             self.crop_info_label.setText(
                 f"Crop Applied!\n"
                 f"Cropped files saved to: result/step2_crop/cropped/\n"
-                f"Size: {width} × {height} pixels"
+                f"Size: {width} × {height} pixels\n"
+                f"Newly cropped: {n_written}, cache reused: {n_cached}"
             )
 
             # Disable crop button
@@ -447,7 +472,9 @@ class CropSelectorWindow(StepWindowBase):
 
             QMessageBox.information(
                 self, "Crop Complete",
-                f"Successfully cropped {len(self.file_manager.filenames)} images!\n\n"
+                f"Crop complete for {total} images.\n\n"
+                f"Newly cropped: {n_written}\n"
+                f"Reused from cache: {n_cached}\n\n"
                 f"Cropped files: result/step2_crop/cropped/\n"
                 f"Original files: unchanged"
             )
@@ -457,6 +484,36 @@ class CropSelectorWindow(StepWindowBase):
                 self, "Crop Error",
                 f"Failed to crop images:\n{str(e)}"
             )
+
+    def _is_crop_cache_valid(self, original_path: Path, cropped_path: Path) -> bool:
+        """Return True if existing cropped file can be reused for current crop rectangle."""
+        if not cropped_path.exists():
+            return False
+        try:
+            src_stat = original_path.stat()
+            dst_stat = cropped_path.stat()
+            if int(dst_stat.st_mtime_ns) < int(src_stat.st_mtime_ns):
+                return False
+
+            header = fits.getheader(cropped_path, ext=0)
+            if int(header.get("CROP_X0", -1)) != int(self.crop_x0):
+                return False
+            if int(header.get("CROP_Y0", -1)) != int(self.crop_y0):
+                return False
+            if int(header.get("CROP_X1", -1)) != int(self.crop_x1):
+                return False
+            if int(header.get("CROP_Y1", -1)) != int(self.crop_y1):
+                return False
+
+            expected_w = int(self.crop_x1 - self.crop_x0)
+            expected_h = int(self.crop_y1 - self.crop_y0)
+            if int(header.get("NAXIS1", -1)) != expected_w:
+                return False
+            if int(header.get("NAXIS2", -1)) != expected_h:
+                return False
+            return True
+        except Exception:
+            return False
 
     def has_completed_step4_or_later(self) -> bool:
         """Return True if Step 4+ has already been completed."""

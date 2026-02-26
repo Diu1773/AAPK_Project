@@ -14,7 +14,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QGroupBox, QTextEdit, QMessageBox
 
 from .step_window_base import StepWindowBase
-from .step11_zeropoint_calibration import CmdViewerWindow
+from .step10_zeropoint_calibration import CmdViewerWindow
 from ...utils.step_paths import step9_dir, step11_dir, step12_dir
 
 
@@ -87,7 +87,7 @@ class CmdPlotWindow(StepWindowBase):
 
         df = pd.read_csv(wide_path)
         self._reset_viewer()
-        viewer = CmdViewerWindow(df, output_dir, self, embedded=True)
+        viewer = CmdViewerWindow(df, output_dir, self, embedded=True, params=self.params)
         self.viewer_layout.addWidget(viewer)
         self.viewer = viewer
         self.viewer_placeholder.setVisible(False)
