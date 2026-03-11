@@ -33,17 +33,81 @@ from PyQt5.QtWidgets import (
 )
 
 from .step_window_base import StepWindowBase
-from ...utils.astro_utils import compute_airmass_from_header, normalize_filter_name
+from ...utils.astro_utils import normalize_filter_name
 from ...utils.step_paths import (
     step2_cropped_dir,
     crop_is_active,
-    step5_dir,
-    step6_dir,
-    step9_dir,
     step11_dir,
     step11_extinction_dir,
+    # New pipeline paths
+    step5_aperture_dir, step6_psf_dir, step7_dir, step7_wcs_dir,
+    # Legacy paths (old pipeline)
+    step5_dir, step6_dir, step8_dir, step9_dir,
 )
 from ...utils.io_utils import parse_int64_series, read_ecsv_int64_source_id
+
+
+def _first_existing_col(cols, candidates):
+    colset = set(cols)
+    for c in candidates:
+        if c in colset:
+            return c
+    return None
+
+
+def _normalize_master_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    ren = {}
+    id_col = _first_existing_col(out.columns, ["ID", "id", "Id", "star_id", "master_id"])
+    if id_col and id_col != "ID":
+        ren[id_col] = "ID"
+    sid_col = _first_existing_col(
+        out.columns, ["source_id", "gaia_source_id", "SOURCE_ID", "Source_ID"]
+    )
+    if sid_col and sid_col != "source_id":
+        ren[sid_col] = "source_id"
+    g_col = _first_existing_col(
+        out.columns, ["gaia_G", "gmag", "phot_g_mean_mag", "Gmag", "G_MAG"]
+    )
+    if g_col and g_col != "gaia_G":
+        ren[g_col] = "gaia_G"
+    bp_col = _first_existing_col(
+        out.columns, ["gaia_BP", "bpmag", "phot_bp_mean_mag", "BPmag", "BP_MAG"]
+    )
+    if bp_col and bp_col != "gaia_BP":
+        ren[bp_col] = "gaia_BP"
+    rp_col = _first_existing_col(
+        out.columns, ["gaia_RP", "rpmag", "phot_rp_mean_mag", "RPmag", "RP_MAG"]
+    )
+    if rp_col and rp_col != "gaia_RP":
+        ren[rp_col] = "gaia_RP"
+    if ren:
+        out = out.rename(columns=ren)
+    return out
+
+
+def _load_master_table(result_dir: Path) -> tuple[pd.DataFrame, str, Path]:
+    candidates = [
+        ("master_catalog", step6_dir(result_dir) / "master_catalog.tsv", "\t"),
+        ("master_catalog", result_dir / "master_catalog.tsv", "\t"),
+        ("master_gaia_map", result_dir / "master_gaia_map.csv", ","),
+    ]
+    tried = []
+    for source_name, p, sep in candidates:
+        if not p.exists():
+            continue
+        tried.append(str(p))
+        try:
+            df = pd.read_csv(p, sep=sep)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        return _normalize_master_columns(df), source_name, p
+    msg = "master_catalog.tsv or master_gaia_map.csv missing/invalid"
+    if tried:
+        msg += f" (tried: {', '.join(tried)})"
+    raise FileNotFoundError(msg)
 
 
 class ZeropointCalibrationWorker(QThread):
@@ -79,7 +143,17 @@ class ZeropointCalibrationWorker(QThread):
         p0 = Path(p)
         if p0.is_absolute() and p0.exists():
             return p0
+        # Support Windows absolute paths when running under POSIX-like envs.
+        if len(p) >= 3 and p[1] == ":" and (p[2] == "\\" or p[2] == "/"):
+            drv = p[0].lower()
+            rest = p[2:].replace("\\", "/").lstrip("/")
+            p_win = Path(f"/mnt/{drv}/{rest}")
+            if p_win.exists():
+                return p_win
         for base in (
+            step6_psf_dir(self.result_dir),
+            step5_aperture_dir(self.result_dir),
+            step8_dir(self.result_dir),
             step9_dir(self.result_dir),
             self.result_dir,
             self.result_dir / "phot",
@@ -200,6 +274,20 @@ class ZeropointCalibrationWorker(QThread):
                 return sorted(legacy.glob("*.fit*"))
         return sorted(self.data_dir.glob("*.fit*"))
 
+    def _find_idmatch_csv(self, fname: str, result_dir: Path):
+        """Find idmatch_{fname}.csv in step7_idmatch/ or its date-keyed subdirs."""
+        idm_dir = step7_dir(result_dir)
+        direct = idm_dir / f"idmatch_{fname}.csv"
+        if direct.exists():
+            return direct
+        if idm_dir.exists():
+            for sub in sorted(idm_dir.iterdir()):
+                if sub.is_dir():
+                    cand = sub / f"idmatch_{fname}.csv"
+                    if cand.exists():
+                        return cand
+        return None
+
     def _load_ref_wcs(self):
         P = self.params.P
         files = self._list_frames()
@@ -258,6 +346,7 @@ class ZeropointCalibrationWorker(QThread):
         return None, None
 
     def _build_frame_airmass(self, idx: pd.DataFrame) -> pd.DataFrame:
+        from ...utils.astro_utils import compute_airmass_from_header
         P = self.params.P
         lat = float(getattr(P, "site_lat_deg", 0.0))
         lon = float(getattr(P, "site_lon_deg", 0.0))
@@ -310,16 +399,31 @@ class ZeropointCalibrationWorker(QThread):
             p *= x
         return y
 
-    def _robust_linfit(self, x, y, clip_sigma=3.0, iters=5, slope_absmax=1.0, min_n=10):
+    def _robust_linfit(self, x, y, w=None, clip_sigma=3.0, iters=5, slope_absmax=1.0, min_n=10):
+        """Robust sigma-clipping linear fit.  w = weights (e.g. 1/err²); if None, OLS."""
         x = np.asarray(x, float)
         y = np.asarray(y, float)
         m0 = np.isfinite(x) & np.isfinite(y)
-        x = x[m0]
-        y = y[m0]
+        if w is not None:
+            w = np.asarray(w, float)
+            m0 &= np.isfinite(w) & (w > 0)
+        x, y = x[m0], y[m0]
+        if w is not None:
+            w = w[m0]
         if len(x) < min_n:
             return (float(np.nanmedian(y)) if len(y) else np.nan, 0.0, int(len(x)))
 
-        ct, zp = np.polyfit(x, y, 1)
+        def _fit(xf, yf, wf):
+            if wf is not None:
+                sw = np.sqrt(wf)
+                A = np.column_stack([xf * sw, sw])
+                result, _, _, _ = np.linalg.lstsq(A, yf * sw, rcond=None)
+                return result[1], result[0]   # zp, ct
+            else:
+                ct_, zp_ = np.polyfit(xf, yf, 1)
+                return zp_, ct_
+
+        zp, ct = _fit(x, y, w)
 
         for _ in range(int(iters)):
             yhat = zp + ct * x
@@ -330,8 +434,10 @@ class ZeropointCalibrationWorker(QThread):
             keep = np.abs(r - med) <= float(clip_sigma) * sig
             if keep.sum() < min_n:
                 break
-            ct, zp = np.polyfit(x[keep], y[keep], 1)
+            zp, ct = _fit(x[keep], y[keep], w[keep] if w is not None else None)
             x, y = x[keep], y[keep]
+            if w is not None:
+                w = w[keep]
 
         if abs(ct) > float(slope_absmax):
             return (float(np.nanmedian(y)), 0.0, int(len(x)))
@@ -344,17 +450,24 @@ class ZeropointCalibrationWorker(QThread):
             result_dir = self.result_dir
             output_dir = step11_dir(result_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
-            phot_dir = step9_dir(result_dir)
+            # PSF photometry (step6_psf/) preferred; fallback to aperture, legacy
+            phot_dir_psf = step6_psf_dir(result_dir)
+            phot_dir_ap  = step5_aperture_dir(result_dir)
+            phot_dir     = step9_dir(result_dir)  # legacy fallback
 
             idx_candidates = [
-                phot_dir / "photometry_index.csv",
-                phot_dir / "phot_index.csv",
-                result_dir / "photometry_index.csv",
-                result_dir / "phot_index.csv",
-                result_dir / "phot" / "phot_index.csv",
-                result_dir / "phot" / "photometry_index.csv",
+                phot_dir_psf / "photometry_index.csv",
+                phot_dir_ap  / "photometry_index.csv",
+                phot_dir     / "photometry_index.csv",
+                phot_dir     / "phot_index.csv",
+                result_dir   / "photometry_index.csv",
+                result_dir   / "phot_index.csv",
+                result_dir   / "phot" / "phot_index.csv",
+                result_dir   / "phot" / "photometry_index.csv",
             ]
-            idx_candidates += sorted(phot_dir.glob("*phot*index*.csv"))
+            for _pd in (phot_dir_psf, phot_dir_ap, phot_dir):
+                if _pd.exists():
+                    idx_candidates += sorted(_pd.glob("*phot*index*.csv"))
             idx_candidates += sorted(result_dir.glob("*phot*index*.csv"))
             if (result_dir / "phot").exists():
                 idx_candidates += sorted((result_dir / "phot").glob("*phot*index*.csv"))
@@ -375,6 +488,14 @@ class ZeropointCalibrationWorker(QThread):
                         idx = idx.rename(columns={cand: "path"})
                         break
 
+            # Fallback: construct path from file column (photometry_{fname}.tsv in same dir)
+            if "path" not in idx.columns and "file" in idx.columns:
+                phot_dir = idx_path.parent
+                idx["path"] = idx["file"].apply(
+                    lambda f: str(phot_dir / f"photometry_{f}.tsv")
+                )
+                self._log(f"[ZP] path column missing — constructed from file column ({phot_dir.name}/)")
+
             if "file" not in idx.columns:
                 c_file = self._pick_col(idx.columns, ["fname", "frame", "image", "fits", "name"])
                 if c_file:
@@ -387,7 +508,9 @@ class ZeropointCalibrationWorker(QThread):
             else:
                 idx["filter"] = "unknown"
 
-            fq_path = step5_dir(result_dir) / "frame_quality.csv"
+            fq_path = step7_wcs_dir(result_dir) / "frame_quality.csv"
+            if not fq_path.exists():
+                fq_path = step5_dir(result_dir) / "frame_quality.csv"  # legacy fallback
             if not fq_path.exists():
                 fq_path = result_dir / "frame_quality.csv"
             if fq_path.exists() and ("file" in idx.columns):
@@ -400,8 +523,23 @@ class ZeropointCalibrationWorker(QThread):
 
             min_snr_for_mag = float(getattr(P, "min_snr_for_mag", 0.0))
 
+            # Pre-load sourceid_to_ID for fallback ID injection (det_uid → source_id → ID)
+            _sid_map = None
+            for _cand_dir in (step8_dir(result_dir),):
+                _sid_csv = _cand_dir / "sourceid_to_ID.csv"
+                if _sid_csv.exists():
+                    try:
+                        _sid_df = pd.read_csv(_sid_csv)
+                        if "source_id" in _sid_df.columns and "ID" in _sid_df.columns:
+                            _sid_map = _sid_df.set_index("source_id")["ID"].to_dict()
+                            self._log(f"[ZP] sourceid_to_ID: {len(_sid_map)} entries ({_sid_csv.parent.name}/)")
+                    except Exception:
+                        pass
+                    break
+
             rows = []
             n_missing = 0
+            missing_examples = []
             total = len(idx)
             for i, (_, r) in enumerate(idx.iterrows(), start=1):
                 if self._stop_requested:
@@ -410,6 +548,8 @@ class ZeropointCalibrationWorker(QThread):
                 p = self._resolve_path(r.get("path", ""))
                 if p is None or (not p.exists()):
                     n_missing += 1
+                    if len(missing_examples) < 5:
+                        missing_examples.append(str(r.get("path", "")))
                     continue
 
                 try:
@@ -427,7 +567,29 @@ class ZeropointCalibrationWorker(QThread):
                     dfp = dfp[~dfp["recenter_capped"].fillna(False).astype(bool)]
 
                 if "ID" not in dfp.columns:
-                    raise RuntimeError(f"{p.name}: ID column missing")
+                    # Fallback: inject ID via idmatch join (det_uid → source_id → ID)
+                    if "det_uid" in dfp.columns and _sid_map is not None:
+                        _fname = str(r.get("file", "")) if "file" in idx.columns else ""
+                        if not _fname:
+                            _stem = p.stem
+                            _fname = _stem[len("photometry_"):] if _stem.startswith("photometry_") else _stem
+                        _idmatch_csv = self._find_idmatch_csv(_fname, result_dir)
+                        if _idmatch_csv is not None:
+                            try:
+                                _im = pd.read_csv(_idmatch_csv)
+                                if "det_idx" in _im.columns:
+                                    _im = _im.rename(columns={"det_idx": "det_uid"})
+                                if "det_uid" in _im.columns and "source_id" in _im.columns:
+                                    _had_sid = "source_id" in dfp.columns
+                                    _im_sub = _im[["det_uid", "source_id"]].drop_duplicates("det_uid")
+                                    dfp = dfp.merge(_im_sub, on="det_uid", how="left")
+                                    dfp["ID"] = dfp["source_id"].map(_sid_map)
+                                    if not _had_sid:
+                                        dfp = dfp.drop(columns=["source_id"], errors="ignore")
+                            except Exception as _inj_e:
+                                self._log(f"[ZP] ID injection failed for {p.name}: {_inj_e}")
+                    if "ID" not in dfp.columns:
+                        raise RuntimeError(f"{p.name}: ID column missing")
 
                 if "FILTER" in dfp.columns:
                     dfp["FILTER"] = dfp["FILTER"].map(normalize_filter_name)
@@ -435,7 +597,7 @@ class ZeropointCalibrationWorker(QThread):
                     dfp["FILTER"] = normalize_filter_name(r.get("filter", "unknown"))
 
                 mag_col = None
-                for cand in ("mag_inst", "mag", "mag_ap", "mag_apcorr"):
+                for cand in ("mag_psf", "mag_inst", "mag", "mag_ap", "mag_apcorr"):
                     if cand in dfp.columns:
                         mag_col = cand
                         break
@@ -443,7 +605,7 @@ class ZeropointCalibrationWorker(QThread):
                     raise RuntimeError(f"{p.name}: mag column missing")
 
                 err_col = None
-                for cand in ("mag_err", "emag", "emag_inst", "magerr"):
+                for cand in ("mag_psf_err", "mag_err", "emag", "emag_inst", "magerr"):
                     if cand in dfp.columns:
                         err_col = cand
                         break
@@ -451,7 +613,7 @@ class ZeropointCalibrationWorker(QThread):
                     dfp["mag_err"] = np.nan
                     err_col = "mag_err"
 
-                snr_col = "snr" if "snr" in dfp.columns else None
+                snr_col = "snr" if "snr" in dfp.columns else ("snr_psf" if "snr_psf" in dfp.columns else None)
 
                 tmp = dfp[["ID", "FILTER", mag_col, err_col] + ([snr_col] if snr_col else [])].copy()
                 tmp = tmp.rename(columns={mag_col: "mag_inst", err_col: "mag_err"})
@@ -462,7 +624,8 @@ class ZeropointCalibrationWorker(QThread):
                 if np.isnan(tmp["mag_err"].to_numpy(float)).all():
                     snr_vals = tmp["snr"].to_numpy(float)
                     if np.isfinite(snr_vals).any():
-                        tmp.loc[np.isfinite(snr_vals) & (snr_vals > 0), "mag_err"] = 1.0857 / snr_vals
+                        _snr_mask = np.isfinite(snr_vals) & (snr_vals > 0)
+                        tmp.loc[_snr_mask, "mag_err"] = 1.0857 / snr_vals[_snr_mask]
 
                 tmp["file"] = str(r.get("file", "")) if ("file" in idx.columns) else ""
 
@@ -474,14 +637,24 @@ class ZeropointCalibrationWorker(QThread):
                 self.progress.emit(i, total, str(r.get("file", "")))
 
             self._log(f"Read frames: {len(rows)} | missing paths: {n_missing}")
+            if missing_examples:
+                self._log(f"Missing path samples: {missing_examples}")
 
             all_df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["ID", "FILTER", "mag_inst", "mag_err", "snr", "file"])
             all_df["FILTER"] = all_df["FILTER"].map(normalize_filter_name)
+            if all_df.empty:
+                raise RuntimeError(
+                    "No readable photometry rows. "
+                    f"missing_paths={n_missing}/{total}. "
+                    "Check photometry_index.csv path column and Step5/Step6 photometry outputs."
+                )
 
             def _combine_group_raw(g):
                 med, med_err, n_med = self._robust_median_and_err(g["mag_inst"])
                 wmean, werr, _ = self._weighted_mean_mag(g["mag_inst"], g["mag_err"])
-                snr_vals = np.asarray(g.get("snr", np.nan), float)
+                # snr_psf (PSF photometry) or snr (aperture photometry)
+                _snr_col = "snr" if "snr" in g.columns else ("snr_psf" if "snr_psf" in g.columns else None)
+                snr_vals = np.asarray(g[_snr_col], float) if _snr_col else np.array([np.nan])
                 snr_med = float(np.nanmedian(snr_vals)) if np.isfinite(snr_vals).any() else np.nan
                 return pd.Series({
                     "mag_inst_med": med,
@@ -492,7 +665,7 @@ class ZeropointCalibrationWorker(QThread):
                     "snr_med": snr_med,
                 })
 
-            grp_raw = all_df.groupby(["ID", "FILTER"]).apply(_combine_group_raw).reset_index()
+            grp_raw = all_df.groupby(["ID", "FILTER"], as_index=False).apply(_combine_group_raw)
 
             grp_raw_path = output_dir / "median_by_ID_filter_raw.csv"
             grp_raw.to_csv(grp_raw_path, index=False, na_rep="NaN")
@@ -531,14 +704,15 @@ class ZeropointCalibrationWorker(QThread):
             wide_raw.to_csv(wide_raw_path, index=False, na_rep="NaN")
             self._log(f"Saved {wide_raw_path.name} | rows={len(wide_raw)}")
 
-            master_path = step6_dir(result_dir) / "master_catalog.tsv"
-            if not master_path.exists():
-                master_path = result_dir / "master_catalog.tsv"
-            if not master_path.exists():
-                raise FileNotFoundError("master_catalog.tsv missing")
-            master = pd.read_csv(master_path, sep="\t")
+            master, master_source, master_path = _load_master_table(result_dir)
+            self._log(f"Master table: {master_path.name} ({master_source})")
+            if "ID" not in master.columns and "source_id" in master.columns and _sid_map:
+                sid_s = parse_int64_series(master["source_id"]).astype("Int64")
+                id_vals = sid_s.map(_sid_map)
+                master["ID"] = pd.to_numeric(id_vals, errors="coerce").astype("Int64")
+                master = master[master["ID"].notna()].copy()
             if "ID" not in master.columns:
-                raise RuntimeError("master_catalog.tsv missing ID column")
+                raise RuntimeError(f"{master_path.name} missing ID column")
 
             # Merge wide with master to get Gaia mags from master_catalog
             merge_cols = ["ID"]
@@ -550,7 +724,9 @@ class ZeropointCalibrationWorker(QThread):
                 merge_cols.append(col_xm)
             if col_ym:
                 merge_cols.append(col_ym)
-            for col in ("gaia_G", "gaia_BP", "gaia_RP", "gmag", "bpmag", "rpmag", "phot_g_mean_mag", "phot_bp_mean_mag", "phot_rp_mean_mag"):
+            for col in ("ra_deg", "dec_deg",
+                        "gaia_G", "gaia_BP", "gaia_RP", "gmag", "bpmag", "rpmag", "phot_g_mean_mag", "phot_bp_mean_mag", "phot_rp_mean_mag",
+                        "parallax", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error"):
                 if col in master.columns and col not in merge_cols:
                     merge_cols.append(col)
 
@@ -570,9 +746,13 @@ class ZeropointCalibrationWorker(QThread):
                 if "source_id" not in df.columns:
                     raise RuntimeError("master_catalog missing Gaia mags and source_id for Gaia join")
                 gaia_candidates = [
-                    step5_dir(result_dir) / "gaia_derived.csv",
+                    step7_wcs_dir(result_dir) / "gaia_fov.ecsv",
+                    step7_wcs_dir(result_dir) / "gaia_derived.csv",
+                    step7_wcs_dir(result_dir) / "gaia_fov.ecsv",
+                    step7_wcs_dir(result_dir) / "gaia_derived.csv",
+                    step5_dir(result_dir) / "gaia_derived.csv",          # legacy step5_wcs
+                    step5_dir(result_dir) / "gaia_fov.ecsv",             # legacy step5_wcs
                     result_dir / "gaia_derived.csv",
-                    step5_dir(result_dir) / "gaia_fov.ecsv",
                     result_dir / "gaia_fov.ecsv",
                 ]
                 gaia_df = None
@@ -594,7 +774,7 @@ class ZeropointCalibrationWorker(QThread):
                     gaia_path = cand
                     break
                 if gaia_df is None or gaia_path is None:
-                    raise RuntimeError("master_catalog missing Gaia mags and step5_wcs/gaia_derived.csv not found")
+                    raise RuntimeError("master_catalog missing Gaia mags and step7_wcs/gaia_derived.csv not found")
                 gaia_join_name = gaia_path.name
                 if "source_id" in gaia_df.columns:
                     gaia_df["source_id"] = parse_int64_series(gaia_df["source_id"]).astype("Int64")
@@ -618,7 +798,7 @@ class ZeropointCalibrationWorker(QThread):
 
             dfm = df[np.isfinite(df["gaia_G"]) & np.isfinite(df["gaia_BP"]) & np.isfinite(df["gaia_RP"])].copy()
             dfm["gaia_BP_RP"] = dfm["gaia_BP"] - dfm["gaia_RP"]
-            src_note = "master_catalog" if gaia_from_master else gaia_join_name
+            src_note = str(master_source) if gaia_from_master else gaia_join_name
             self._log(f"Gaia mags from {src_note}: {len(dfm)} / {len(df)}")
 
             min_match = int(getattr(P, "min_master_gaia_matches", 10))
@@ -676,17 +856,27 @@ class ZeropointCalibrationWorker(QThread):
             fit_iters = int(getattr(P, "zp_fit_iters", 5))
             slope_absmax = float(getattr(P, "zp_slope_absmax", 1.0))
 
+            # WLS weights: 1/err² from median mag error per ID/band
+            def _wls_weights(err_col):
+                e = _arr(err_col)
+                w = np.where(np.isfinite(e) & (e > 0), 1.0 / e**2, np.nan)
+                return w
+
+            w_g = _wls_weights("mag_inst_err_g")
+            w_r = _wls_weights("mag_inst_err_r")
+            w_i = _wls_weights("mag_inst_err_i")
+
             delta_g = out_cal["sdss_g_ref"].to_numpy(float) - g_inst
             mg = np.isfinite(delta_g) & np.isfinite(color_gr) & np.isfinite(g_inst) & m_snr_sdss
-            zp_g, ct_g, Ng = self._robust_linfit(color_gr[mg], delta_g[mg], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
+            zp_g, ct_g, Ng = self._robust_linfit(color_gr[mg], delta_g[mg], w=w_g[mg], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
 
             delta_r = out_cal["sdss_r_ref"].to_numpy(float) - r_inst
             mr = np.isfinite(delta_r) & np.isfinite(color_gr) & np.isfinite(r_inst) & m_snr_sdss
-            zp_r, ct_r, Nr = self._robust_linfit(color_gr[mr], delta_r[mr], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
+            zp_r, ct_r, Nr = self._robust_linfit(color_gr[mr], delta_r[mr], w=w_r[mr], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
 
             delta_i = out_cal["sdss_i_ref"].to_numpy(float) - i_inst
             mi = np.isfinite(delta_i) & np.isfinite(color_ri) & np.isfinite(i_inst) & m_snr_sdss
-            zp_i, ct_i, Ni = self._robust_linfit(color_ri[mi], delta_i[mi], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
+            zp_i, ct_i, Ni = self._robust_linfit(color_ri[mi], delta_i[mi], w=w_i[mi], clip_sigma=clip_sigma, iters=fit_iters, slope_absmax=slope_absmax, min_n=min_match)
 
             self._log(f"g_std = g_inst + {zp_g:+.4f} + {ct_g:+.4f}*(g-r)_inst (N={Ng})")
             self._log(f"r_std = r_inst + {zp_r:+.4f} + {ct_r:+.4f}*(g-r)_inst (N={Nr})")
@@ -705,9 +895,13 @@ class ZeropointCalibrationWorker(QThread):
                 ext_mode = "absorb"
             min_frame_refs = int(getattr(P, "frame_zp_min_n", 5))
 
-            frame_airmass = self._build_frame_airmass(idx)
-            if frame_airmass is None or frame_airmass.empty:
-                frame_airmass = pd.DataFrame(columns=["file", "filter", "airmass"])
+            _am_empty = pd.DataFrame(columns=["file", "filter", "airmass"])
+            if apply_ext:
+                frame_airmass = self._build_frame_airmass(idx)
+                if frame_airmass is None or frame_airmass.empty:
+                    frame_airmass = _am_empty
+            else:
+                frame_airmass = _am_empty
 
             ext_df = None
             ext_map = {}
@@ -864,7 +1058,8 @@ class ZeropointCalibrationWorker(QThread):
             def _combine_group_cal(g):
                 med, med_err, n_med = self._robust_median_and_err(g["mag_cal"])
                 wmean, werr, _ = self._weighted_mean_mag(g["mag_cal"], g["mag_err"])
-                snr_vals = np.asarray(g.get("snr", np.nan), float)
+                _snr_col = "snr" if "snr" in g.columns else ("snr_psf" if "snr_psf" in g.columns else None)
+                snr_vals = np.asarray(g[_snr_col], float) if _snr_col else np.array([np.nan])
                 snr_med = float(np.nanmedian(snr_vals)) if np.isfinite(snr_vals).any() else np.nan
                 return pd.Series({
                     "mag_inst_med": med,
@@ -875,7 +1070,7 @@ class ZeropointCalibrationWorker(QThread):
                     "snr_med": snr_med,
                 })
 
-            grp_cal = obs.groupby(["ID", "FILTER"]).apply(_combine_group_cal).reset_index()
+            grp_cal = obs.groupby(["ID", "FILTER"], as_index=False).apply(_combine_group_cal)
 
             grp_path = output_dir / "median_by_ID_filter.csv"
             grp_cal.to_csv(grp_path, index=False, na_rep="NaN")
@@ -924,13 +1119,23 @@ class ZeropointCalibrationWorker(QThread):
                 if col not in df_out.columns and col in df.columns:
                     df_out[col] = df[col]
 
+            wide_by_id = wide.drop_duplicates(subset=["ID"], keep="first").set_index("ID", drop=False)
             for band in ("g", "r", "i"):
                 c_inst = f"mag_inst_{band}"
                 c_std = f"mag_std_{band}"
                 if c_inst in wide.columns:
-                    df_out[c_std] = wide[c_inst].to_numpy(float)
+                    df_out[c_std] = pd.to_numeric(
+                        wide_by_id.reindex(df_out["ID"])[c_inst],
+                        errors="coerce",
+                    ).to_numpy(float)
                 else:
                     df_out[c_std] = np.nan
+
+            missing_cal_ids = int(df_out[["mag_std_g", "mag_std_r", "mag_std_i"]].isna().all(axis=1).sum())
+            if missing_cal_ids:
+                self._log(
+                    f"CMD export: {missing_cal_ids} IDs missing calibrated wide magnitudes; keeping mag_std_* as NaN."
+                )
 
             gi_std = df_out["mag_std_g"].to_numpy(float) - df_out["mag_std_i"].to_numpy(float)
             m_gi_std = np.isfinite(gi_std) & (gi_std >= 1.0) & (gi_std <= 9.0)
@@ -1077,7 +1282,9 @@ class CmdViewerWindow(QWidget):
         self._membership_source = "none"
         self._membership_note = ""
         self._membership_ready = False
+        self._roi_data: dict | None = None
         self._build_ui()
+        self._load_roi()
         self._build_figure()
         self._redraw()
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1176,6 +1383,134 @@ class CmdViewerWindow(QWidget):
         self.btn_next_view.clicked.connect(lambda: self._switch_view(1))
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
 
+        controls2 = QHBoxLayout()
+        self.plx_check = QCheckBox("Parallax filter")
+        self.plx_check.setChecked(False)
+        controls2.addWidget(self.plx_check)
+        controls2.addWidget(QLabel("min:"))
+        self.plx_min_spin = QDoubleSpinBox()
+        self.plx_min_spin.setRange(-5.0, 20.0)
+        self.plx_min_spin.setDecimals(3)
+        self.plx_min_spin.setSingleStep(0.05)
+        self.plx_min_spin.setValue(-0.5)
+        self.plx_min_spin.setSuffix(" mas")
+        controls2.addWidget(self.plx_min_spin)
+        controls2.addWidget(QLabel("max:"))
+        self.plx_max_spin = QDoubleSpinBox()
+        self.plx_max_spin.setRange(-5.0, 20.0)
+        self.plx_max_spin.setDecimals(3)
+        self.plx_max_spin.setSingleStep(0.05)
+        self.plx_max_spin.setValue(0.5)
+        self.plx_max_spin.setSuffix(" mas")
+        controls2.addWidget(self.plx_max_spin)
+        controls2.addSpacing(16)
+        self.roi_check = QCheckBox("ROI filter")
+        self.roi_check.setChecked(False)
+        self.roi_check.setToolTip("Filter CMD sources by the spatial ROI circle set in Step 10.\nDoes not affect ZP calibration.")
+        controls2.addWidget(self.roi_check)
+        self.roi_info_label = QLabel("(no ROI)")
+        self.roi_info_label.setStyleSheet("QLabel { color: #90A4AE; font-size: 9pt; }")
+        controls2.addWidget(self.roi_info_label)
+        self.btn_reload_roi = QPushButton("Reload")
+        self.btn_reload_roi.setFixedWidth(56)
+        self.btn_reload_roi.setToolTip("Re-read cmd_roi.json from Step 10 output directory")
+        controls2.addWidget(self.btn_reload_roi)
+        controls2.addStretch()
+        layout.addLayout(controls2)
+
+        self.plx_check.stateChanged.connect(self._on_plx_filter_changed)
+        self.plx_min_spin.valueChanged.connect(self._redraw)
+        self.plx_max_spin.valueChanged.connect(self._redraw)
+        self.roi_check.stateChanged.connect(self._redraw)
+        self.btn_reload_roi.clicked.connect(self._on_reload_roi)
+
+    def _load_roi(self):
+        """Load cmd_roi.json from step8 output directory and update UI."""
+        roi_path = step8_dir(self.result_dir) / "cmd_roi.json"
+        try:
+            if roi_path.exists():
+                self._roi_data = json.loads(roi_path.read_text())
+            else:
+                self._roi_data = None
+        except Exception:
+            self._roi_data = None
+        if hasattr(self, "roi_check"):
+            self.roi_check.setEnabled(self._roi_data is not None)
+        if hasattr(self, "roi_info_label"):
+            if self._roi_data:
+                ra = self._roi_data.get("ra_deg", 0.0)
+                dec = self._roi_data.get("dec_deg", 0.0)
+                r = self._roi_data.get("radius_arcsec", 0.0)
+                self.roi_info_label.setText(f"RA={ra:.4f} Dec={dec:.4f}  r={r:.0f}\"")
+                self.roi_info_label.setStyleSheet("QLabel { color: #00E5FF; font-size: 9pt; }")
+            else:
+                self.roi_info_label.setText("(no ROI)")
+                self.roi_info_label.setStyleSheet("QLabel { color: #90A4AE; font-size: 9pt; }")
+
+    def _on_reload_roi(self):
+        self._load_roi()
+        self._redraw()
+
+    def _roi_mask(self):
+        """Returns boolean mask selecting sources inside the CMD ROI circle (sky coords), or None if disabled."""
+        if not self.roi_check.isChecked() or self._roi_data is None:
+            return None
+        roi_ra = float(self._roi_data["ra_deg"])
+        roi_dec = float(self._roi_data["dec_deg"])
+        roi_r_arcsec = float(self._roi_data["radius_arcsec"])
+        # Prefer RA/Dec angular distance (correct across frames)
+        if "ra_deg" in self.df.columns and "dec_deg" in self.df.columns:
+            ra = pd.to_numeric(self.df["ra_deg"], errors="coerce").to_numpy(float)
+            dec = pd.to_numeric(self.df["dec_deg"], errors="coerce").to_numpy(float)
+            valid = np.isfinite(ra) & np.isfinite(dec)
+            # Small-field approximation (accurate to ~0.01% within 1 deg)
+            cos_dec = np.cos(np.radians(roi_dec))
+            d_ra = (ra - roi_ra) * cos_dec * 3600.0   # arcsec
+            d_dec = (dec - roi_dec) * 3600.0           # arcsec
+            return valid & (d_ra ** 2 + d_dec ** 2 <= roi_r_arcsec ** 2)
+        # Fallback: pixel distance if RA/Dec unavailable (reference frame only)
+        if "x_pix" in self.df.columns and "y_pix" in self.df.columns:
+            ps = float(getattr(self.params.P, "pixel_scale_arcsec", 1.0)) if self.params else 1.0
+            x = pd.to_numeric(self.df["x_pix"], errors="coerce").to_numpy(float)
+            y = pd.to_numeric(self.df["y_pix"], errors="coerce").to_numpy(float)
+            valid = np.isfinite(x) & np.isfinite(y)
+            r_px = roi_r_arcsec / max(ps, 0.01)
+            # We don't have center in pixels without WCS — skip gracefully
+            _ = r_px  # suppress lint
+        return None
+
+    def _on_plx_filter_changed(self):
+        if self.plx_check.isChecked():
+            if "parallax" not in self.df.columns:
+                self._ensure_membership_columns_from_master()
+            if "parallax" not in self.df.columns:
+                self.plx_check.blockSignals(True)
+                self.plx_check.setChecked(False)
+                self.plx_check.blockSignals(False)
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Parallax Unavailable",
+                    "parallax column not found in CMD data or master_catalog.\n"
+                    "Rerun Step 8 (Ref Build) and Step 11 (ZP Calibration).")
+                return
+        self._redraw()
+
+    def _parallax_mask(self):
+        """Returns boolean mask for parallax range filter, or None if disabled/unavailable."""
+        if not self.plx_check.isChecked():
+            return None
+        if "parallax" not in self.df.columns:
+            self._ensure_membership_columns_from_master()
+        if "parallax" not in self.df.columns:
+            return None
+        plx = pd.to_numeric(self.df["parallax"], errors="coerce").to_numpy(float)
+        plx_min = float(self.plx_min_spin.value())
+        plx_max = float(self.plx_max_spin.value())
+        mask = np.isfinite(plx) & (plx >= plx_min) & (plx <= plx_max)
+        n_finite = int(np.isfinite(plx).sum())
+        if n_finite == 0:
+            return None
+        return mask
+
     def _membership_mode_key(self) -> str:
         idx = int(self.member_mode_combo.currentIndex())
         if idx == 1:
@@ -1222,7 +1557,9 @@ class CmdViewerWindow(QWidget):
 
     def _merge_columns_from_gaia_derived(self, needed_cols):
         candidates = [
-            step5_dir(self.result_dir) / "gaia_derived.csv",
+            step7_wcs_dir(self.result_dir) / "gaia_derived.csv",
+            step7_wcs_dir(self.result_dir) / "gaia_fov.ecsv",
+            step5_dir(self.result_dir) / "gaia_derived.csv",  # legacy
             self.result_dir / "gaia_derived.csv",
         ]
         gdf = None
@@ -1290,14 +1627,8 @@ class CmdViewerWindow(QWidget):
         if not missing:
             return self._merge_columns_from_gaia_derived(needed)
 
-        master_path = step6_dir(self.result_dir) / "master_catalog.tsv"
-        if not master_path.exists():
-            master_path = self.result_dir / "master_catalog.tsv"
-        if not master_path.exists():
-            return
-
         try:
-            master = pd.read_csv(master_path, sep="\t")
+            master, _, _ = _load_master_table(self.result_dir)
         except Exception:
             return
         if master.empty:
@@ -1664,7 +1995,9 @@ class CmdViewerWindow(QWidget):
                 sc = f"snr_{band}"
                 if sc in self.df.columns:
                     sv = self._safe_float(self.df[sc])
-                    mask &= np.isfinite(sv) & (sv >= snr_cut)
+                    # Only exclude stars with known (finite) SNR below threshold;
+                    # NaN SNR means unmeasured → keep (do not reject unknowns)
+                    mask &= ~(np.isfinite(sv) & (sv < snr_cut))
 
         if membership_mask is not None and len(membership_mask) == len(mask):
             mask &= np.asarray(membership_mask, bool)
@@ -1689,7 +2022,7 @@ class CmdViewerWindow(QWidget):
                 sc = f"snr_{band}"
                 if sc in self.df.columns:
                     sv = self._safe_float(self.df[sc])
-                    mask &= np.isfinite(sv) & (sv >= snr_cut)
+                    mask &= ~(np.isfinite(sv) & (sv < snr_cut))
 
         if membership_mask is not None and len(membership_mask) == len(mask):
             mask &= np.asarray(membership_mask, bool)
@@ -1741,6 +2074,34 @@ class CmdViewerWindow(QWidget):
         member_active = (member_mode != "off") and (member_mask is not None)
         member_compare = bool(self.member_compare.isChecked()) and member_active
 
+        plx_mask = self._parallax_mask()
+        plx_active = plx_mask is not None
+
+        roi_mask = self._roi_mask()
+        roi_active = roi_mask is not None
+
+        # background (grey dots): spatial/parallax pre-filter (everything inside ROI or parallax range)
+        if plx_active and roi_active:
+            bg_mask = plx_mask & roi_mask
+        elif plx_active:
+            bg_mask = plx_mask
+        elif roi_active:
+            bg_mask = roi_mask
+        else:
+            bg_mask = None
+
+        # foreground mask: member & spatial filters combined
+        spatial_mask = bg_mask  # reuse combined spatial pre-filter
+        spatial_active = spatial_mask is not None
+        if member_active and spatial_active:
+            effective_mask = np.asarray(member_mask, bool) & spatial_mask
+        elif member_active:
+            effective_mask = member_mask
+        elif spatial_active:
+            effective_mask = spatial_mask
+        else:
+            effective_mask = None
+
         if self.ax_inst is not None:
             self.ax_inst.clear()
         if self.ax_std is not None:
@@ -1749,9 +2110,9 @@ class CmdViewerWindow(QWidget):
             self.ax_gaia.clear()
 
         if self.ax_inst is not None:
-            x_i_all, y_i_all, mask_i_all, xcol_i_all = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, None)
-            if member_active:
-                x_i, y_i, mask_i, xcol_i = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, member_mask)
+            x_i_all, y_i_all, mask_i_all, xcol_i_all = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, bg_mask)
+            if member_active or plx_active or roi_active:
+                x_i, y_i, mask_i, xcol_i = self._compute_arrays_and_mask("inst", x_pair, yval, snr_cut, effective_mask)
             else:
                 x_i, y_i, mask_i, xcol_i = x_i_all, y_i_all, mask_i_all, xcol_i_all
             teff_i = self._teff_from_color_index(xcol_i, f"{a}-{b}")
@@ -1760,9 +2121,9 @@ class CmdViewerWindow(QWidget):
             x_i, y_i, mask_i, teff_i = np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
         if self.has_std and self.ax_std is not None:
-            x_s_all, y_s_all, mask_s_all, xcol_s_all = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, None)
-            if member_active:
-                x_s, y_s, mask_s, xcol_s = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, member_mask)
+            x_s_all, y_s_all, mask_s_all, xcol_s_all = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, bg_mask)
+            if member_active or plx_active or roi_active:
+                x_s, y_s, mask_s, xcol_s = self._compute_arrays_and_mask("std", x_pair, yval, snr_cut, effective_mask)
             else:
                 x_s, y_s, mask_s, xcol_s = x_s_all, y_s_all, mask_s_all, xcol_s_all
             teff_s = self._teff_from_color_index(xcol_s, f"{a}-{b}")
@@ -1771,9 +2132,9 @@ class CmdViewerWindow(QWidget):
             x_s, y_s, mask_s, teff_s = np.array([]), np.array([]), np.zeros(len(self.df), bool), np.array([])
 
         if self.gaia_mode is not None and self.ax_gaia is not None:
-            x_g_all, y_g_all, mask_g_all, xcol_g_all = self._compute_gaia_arrays_and_mask(snr_cut, None)
-            if member_active:
-                x_g, y_g, mask_g, xcol_g = self._compute_gaia_arrays_and_mask(snr_cut, member_mask)
+            x_g_all, y_g_all, mask_g_all, xcol_g_all = self._compute_gaia_arrays_and_mask(snr_cut, bg_mask)
+            if member_active or plx_active or roi_active:
+                x_g, y_g, mask_g, xcol_g = self._compute_gaia_arrays_and_mask(snr_cut, effective_mask)
             else:
                 x_g, y_g, mask_g, xcol_g = x_g_all, y_g_all, mask_g_all, xcol_g_all
             teff_g = self._teff_from_color_index(xcol_g, "BP-RP")
@@ -1787,7 +2148,7 @@ class CmdViewerWindow(QWidget):
                 self.ax_inst.scatter(x_i_all, y_i_all, s=10, alpha=0.22, linewidths=0, rasterized=True, c="#9E9E9E")
             if len(x_i) > 0:
                 self.ax_inst.scatter(x_i, y_i, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_i, cmap=self.ob_cmap, norm=self.ob_norm)
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_inst.set_title(f"Instrumental CMD (N={len(x_i)}/{len(x_i_all)})", fontsize=11, color="white")
                 else:
                     self.ax_inst.set_title(f"Instrumental CMD (N={len(x_i)})", fontsize=11, color="white")
@@ -1798,7 +2159,7 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_i)[0],
                 }
             else:
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_inst.set_title(f"Instrumental CMD (N=0/{len(x_i_all)})", fontsize=11, color="white")
                 else:
                     self.ax_inst.set_title("Instrumental CMD (N=0)", fontsize=11, color="white")
@@ -1809,7 +2170,7 @@ class CmdViewerWindow(QWidget):
                 self.ax_std.scatter(x_s_all, y_s_all, s=10, alpha=0.22, linewidths=0, rasterized=True, c="#9E9E9E")
             if len(x_s) > 0:
                 self.ax_std.scatter(x_s, y_s, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_s, cmap=self.ob_cmap, norm=self.ob_norm)
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_std.set_title(f"SDSS CMD (N={len(x_s)}/{len(x_s_all)})", fontsize=11, color="white")
                 else:
                     self.ax_std.set_title(f"SDSS CMD (N={len(x_s)})", fontsize=11, color="white")
@@ -1820,7 +2181,7 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_s)[0],
                 }
             else:
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_std.set_title(f"SDSS CMD (N=0/{len(x_s_all)})", fontsize=11, color="white")
                 else:
                     self.ax_std.set_title("SDSS CMD (N=0)", fontsize=11, color="white")
@@ -1832,7 +2193,7 @@ class CmdViewerWindow(QWidget):
             if len(x_g) > 0:
                 self.ax_gaia.scatter(x_g, y_g, s=12, alpha=0.92, linewidths=0, rasterized=True, c=teff_g, cmap=self.ob_cmap, norm=self.ob_norm)
                 title = "Gaia CMD (inst)" if self.gaia_mode == "inst" else "Gaia CMD (syn)"
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_gaia.set_title(f"{title} (N={len(x_g)}/{len(x_g_all)})", fontsize=11, color="white")
                 else:
                     self.ax_gaia.set_title(f"{title} (N={len(x_g)})", fontsize=11, color="white")
@@ -1843,7 +2204,7 @@ class CmdViewerWindow(QWidget):
                     "df_index": np.where(mask_g)[0],
                 }
             else:
-                if member_active:
+                if member_active or plx_active or roi_active:
                     self.ax_gaia.set_title(f"Gaia CMD (N=0/{len(x_g_all)})", fontsize=11, color="white")
                 else:
                     self.ax_gaia.set_title("Gaia CMD (N=0)", fontsize=11, color="white")
@@ -2035,10 +2396,11 @@ class ZPFitPlotWidget(QWidget):
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
-        self._fig = Figure(figsize=(10, 8))
-        self._ax_fit = self._fig.add_subplot(2, 1, 1)
-        self._ax_frame = self._fig.add_subplot(2, 1, 2)
-        self._fig.tight_layout(pad=2.0)
+        self._fig = Figure(figsize=(12, 8))
+        gs = self._fig.add_gridspec(2, 2, hspace=0.35, wspace=0.30)
+        self._ax_fit = self._fig.add_subplot(gs[0, 0])
+        self._ax_hist = self._fig.add_subplot(gs[0, 1])
+        self._ax_frame = self._fig.add_subplot(gs[1, :])
         self._canvas = FigureCanvas(self._fig)
         self._canvas.mpl_connect("pick_event", self._on_pick)
         self._toolbar = NavigationToolbar(self._canvas, self)
@@ -2103,9 +2465,11 @@ class ZPFitPlotWidget(QWidget):
 
     def _redraw(self):
         self._ax_fit.cla()
+        self._ax_hist.cla()
         self._ax_frame.cla()
         self._artist_map.clear()
         self._draw_fit_plot()
+        self._draw_zp_hist()
         self._draw_frame_zp()
         self._fig.tight_layout(pad=2.0)
         self._canvas.draw_idle()
@@ -2206,6 +2570,60 @@ class ZPFitPlotWidget(QWidget):
             ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
+    def _draw_zp_hist(self):
+        """ZP distribution histogram per filter (논문 AutoPHOT Fig.8 방식)."""
+        from scipy.stats import gaussian_kde
+        ax = self._ax_hist
+        filt_sel = self._filt_combo.currentText()
+
+        if self._frame_df is None:
+            ax.set_title("ZP Distribution")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=12, color="gray")
+            return
+
+        df = self._frame_df.copy()
+        date_sel = self._date_combo.currentText()
+        if date_sel != "All" and "file" in df.columns:
+            import re
+            df = df[df["file"].apply(lambda f: bool(re.search(re.escape(date_sel), str(f))))].copy()
+
+        filts = ["g", "r", "i"] if filt_sel == "All" else [filt_sel]
+        has_any = False
+        for filt in filts:
+            sub = df[df["filter"] == filt] if "filter" in df.columns else pd.DataFrame()
+            if sub.empty:
+                continue
+            zp_vals = pd.to_numeric(sub["zp_frame"], errors="coerce").dropna().to_numpy(float)
+            zp_vals = zp_vals[np.isfinite(zp_vals)]
+            if len(zp_vals) < 3:
+                continue
+            has_any = True
+            fc = self.FILT_COLORS.get(filt, "gray")
+            med = float(np.median(zp_vals))
+            mad = float(np.median(np.abs(zp_vals - med)))
+            sigma = 1.4826 * mad
+            n_bins = max(8, min(30, len(zp_vals) // 2))
+            ax.hist(zp_vals, bins=n_bins, color=fc, alpha=0.5,
+                    label=f"{filt}: μ={med:.3f} σ={sigma:.3f} N={len(zp_vals)}")
+            # KDE curve
+            if len(zp_vals) >= 5:
+                try:
+                    kde = gaussian_kde(zp_vals, bw_method="scott")
+                    xg = np.linspace(zp_vals.min() - 3 * sigma, zp_vals.max() + 3 * sigma, 200)
+                    yk = kde(xg) * len(zp_vals) * (zp_vals.max() - zp_vals.min()) / n_bins
+                    ax.plot(xg, yk, color=fc, linewidth=1.5)
+                except Exception:
+                    pass
+            ax.axvline(med, color=fc, linestyle="--", linewidth=1.2, alpha=0.9)
+
+        ax.set_xlabel("ZP (mag)")
+        ax.set_ylabel("Count")
+        ax.set_title("ZP Distribution")
+        if has_any:
+            ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
     def _draw_frame_zp(self):
         import re
         ax = self._ax_frame
@@ -2280,7 +2698,7 @@ class ZPFitPlotWidget(QWidget):
 
 
 class ZeropointCalibrationWindow(StepWindowBase):
-    """Step 10: Zeropoint & Standardization"""
+    """Step 11: Zeropoint & Standardization"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager

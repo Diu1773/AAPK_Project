@@ -1,5 +1,5 @@
-"""Workflow step dialogs"""
+"""Workflow step dialogs."""
 
-from .step1_file_selection import FileSelectionDialog
+from .step1_file_selection_window import FileSelectionWindow
 
-__all__ = ['FileSelectionDialog']
+__all__ = ["FileSelectionWindow"]

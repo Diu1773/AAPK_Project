@@ -614,6 +614,17 @@ class Gaia3DViewerWindow(QWidget):
         if self.membership_col is not None:
             df[self.membership_col] = pd.to_numeric(df[self.membership_col], errors="coerce")
 
+        # Report parallax quality
+        if "parallax" in df.columns:
+            plx = pd.to_numeric(df["parallax"], errors="coerce").to_numpy(float)
+            n_total = len(plx)
+            n_neg = int(np.sum(np.isfinite(plx) & (plx <= 0)))
+            n_nan = int(np.sum(~np.isfinite(plx)))
+            if n_neg > 0:
+                self.log(f"WARNING: {n_neg}/{n_total} stars have non-positive parallax (excluded from distance)")
+            if n_nan > 0:
+                self.log(f"INFO: {n_nan}/{n_total} stars have NaN parallax")
+
         self.df = df
         self.loaded_from = base_name
         self.log(f"Loaded: {base_name} | rows={len(df)}")
@@ -816,11 +827,18 @@ class Gaia3DViewerWindow(QWidget):
         ra_dec_range = max(sx, sy)   # RA/Dec axes (degrees)
         scale = ra_dec_range * 0.12 * float(self.pm_scale_spin.value()) / pm95
 
-        # Subsample if too many arrows
+        # Subsample if too many arrows — keep all members, fill remainder with non-members
         vi = np.where(valid)[0]
         if len(vi) > _MAX_PM_ARROWS:
+            pmem_thr_sub = float(self.pm_member_thr.value())
+            is_mem_sub = np.isfinite(pmem[vi]) & (pmem[vi] >= pmem_thr_sub)
+            mem_vi  = vi[is_mem_sub]
+            nonm_vi = vi[~is_mem_sub]
             rng = np.random.default_rng(0)
-            vi = np.sort(rng.choice(vi, size=_MAX_PM_ARROWS, replace=False))
+            n_nonm = max(0, _MAX_PM_ARROWS - len(mem_vi))
+            if n_nonm < len(nonm_vi):
+                nonm_vi = np.sort(rng.choice(nonm_vi, size=n_nonm, replace=False))
+            vi = np.sort(np.concatenate([mem_vi, nonm_vi]))
 
         # Split by membership
         pmem_thr = float(self.pm_member_thr.value())

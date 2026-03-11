@@ -1,8 +1,8 @@
 """
-Step 6: Reference Build (WCS-based ref catalog)
+Step 8: Reference Build (WCS-based ref catalog)
 
 - Select reference frame using detection-based quality metrics
-- Build a fixed master star list from the reference frame detections
+- Build a fixed master star list using PSF/aperture/detection positions
 - Write master catalogs for downstream steps
 """
 
@@ -35,7 +35,9 @@ from matplotlib.figure import Figure
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step5_dir,
+    step5_aperture_dir,
     step6_dir,
+    step6_psf_dir,
     step2_cropped_dir,
     step4_dir,
     crop_rect_path,
@@ -74,6 +76,80 @@ def _norm_path_key(path_value) -> str:
     if len(s) > 1 and s.endswith("/"):
         s = s[:-1]
     return s.lower()
+
+
+def _load_frame_positions(result_dir, fname: str, log_fn=None) -> tuple[pd.DataFrame, str]:
+    """Load per-frame star positions with PSF-first fallback chain.
+
+    Priority:
+      1. step6_psf/photometry_{fname}.tsv  → x_fit, y_fit  (iter_found == 1 only)
+      2. step5_aperture/photometry_{fname}.tsv → xcenter, ycenter
+      3. step4_detection/detect_{fname}.csv    → x, y
+
+    Returns (df, source_tag) where source_tag is "psf"/"aperture"/"detection"/"empty".
+    Returned df always has at minimum columns [det_uid, x, y]; extra columns are kept.
+    """
+    # 1) PSF positions (most accurate)
+    psf_tsv = step6_psf_dir(result_dir) / f"photometry_{fname}.tsv"
+    if psf_tsv.exists():
+        try:
+            df = pd.read_csv(psf_tsv, sep="\t")
+            if {"det_uid", "x_fit", "y_fit"} <= set(df.columns):
+                if "iter_found" in df.columns:
+                    df = df[df["iter_found"] == 1]
+                df = df.copy()
+                df = df.rename(columns={"x_fit": "x", "y_fit": "y"})
+                df["x"] = pd.to_numeric(df["x"], errors="coerce")
+                df["y"] = pd.to_numeric(df["y"], errors="coerce")
+                df = df.dropna(subset=["x", "y"])
+                if not df.empty:
+                    if log_fn:
+                        log_fn(f"  [pos] PSF positions: {len(df)} sources")
+                    return df.reset_index(drop=True), "psf"
+        except Exception:
+            pass
+
+    # 2) Aperture positions
+    ap_tsv = step5_aperture_dir(result_dir) / f"photometry_{fname}.tsv"
+    if ap_tsv.exists():
+        try:
+            df = pd.read_csv(ap_tsv, sep="\t")
+            x_col = "xcenter" if "xcenter" in df.columns else "x_init"
+            y_col = "ycenter" if "ycenter" in df.columns else "y_init"
+            if {"det_uid", x_col, y_col} <= set(df.columns):
+                df = df.copy()
+                df = df.rename(columns={x_col: "x", y_col: "y"})
+                df["x"] = pd.to_numeric(df["x"], errors="coerce")
+                df["y"] = pd.to_numeric(df["y"], errors="coerce")
+                df = df.dropna(subset=["x", "y"])
+                if not df.empty:
+                    if log_fn:
+                        log_fn(f"  [pos] Aperture positions: {len(df)} sources")
+                    return df.reset_index(drop=True), "aperture"
+        except Exception:
+            pass
+
+    # 3) Detection CSV (has quality columns like elongation, roundness, etc.)
+    det_csv = step4_dir(result_dir) / f"detect_{fname}.csv"
+    if det_csv.exists():
+        try:
+            df = pd.read_csv(det_csv)
+            if {"x", "y"} <= set(df.columns):
+                if "det_uid" not in df.columns:
+                    df = df.reset_index(drop=True)
+                    df["det_uid"] = df.index
+                df = df.copy()
+                df["x"] = pd.to_numeric(df["x"], errors="coerce")
+                df["y"] = pd.to_numeric(df["y"], errors="coerce")
+                df = df.dropna(subset=["x", "y"])
+                if not df.empty:
+                    if log_fn:
+                        log_fn(f"  [pos] Detection positions: {len(df)} sources")
+                    return df.reset_index(drop=True), "detection"
+        except Exception:
+            pass
+
+    return pd.DataFrame(columns=["det_uid", "x", "y"]), "empty"
 
 
 def _build_file_signature(path: Path, *, use_cropped: bool) -> dict:
@@ -699,7 +775,7 @@ class RefBuildWorker(QThread):
                 self._log(
                     "[REF][WARN] Gaia match fraction is low "
                     f"({frac:.1%}). Consider increasing [gaia].mag_max and "
-                    "[idmatch].gaia_g_limit, then re-run Step5/Step6."
+                    "[idmatch].gaia_g_limit, then re-run Step7/Step8."
                 )
 
         return out, sid_map, id_map
@@ -1042,7 +1118,7 @@ class RefBuildWorker(QThread):
             self._log("[REF][QC] WCS thresholds removed all candidates; using wcs_ok frames.")
             cand = cand_wcs_base
         else:
-            raise RuntimeError("No WCS-valid candidate frames. Run Step5 WCS solving first.")
+            raise RuntimeError("No WCS-valid candidate frames. Run Step7 WCS solving first.")
         self._log(
             "[REF][QC] candidates: start={s} sat_drop={sat:.1f}% -> {n1} "
             "shape_drop={elong:.1f}% -> {n2} wcs_valid -> {n0} wcs_pass -> {n3}".format(
@@ -1108,17 +1184,35 @@ class RefBuildWorker(QThread):
         return str(cand.iloc[0]["file"])
 
     def _build_master_catalog(self, ref_fname: str) -> tuple[pd.DataFrame, dict]:
-        """Build master catalog from reference frame detections.
+        """Build master catalog using PSF/aperture/detection positions (PSF preferred).
 
         Returns:
             Tuple of (catalog DataFrame, stats dict with n_ref_total/after_cuts/used)
         """
-        det_path = self._resolve_detect_csv(ref_fname)
-        if det_path is None:
-            raise RuntimeError(f"Missing detection file: detect_{ref_fname}.csv")
-        df = pd.read_csv(det_path)
-        if not {"x", "y"} <= set(df.columns):
-            raise RuntimeError(f"Detection file missing x/y: {det_path}")
+        df, pos_source = _load_frame_positions(
+            self.result_dir, ref_fname, log_fn=self._log
+        )
+        if df.empty:
+            raise RuntimeError(f"No position data for ref frame: {ref_fname}")
+        self._log(f"[REF] Position source for ref frame: {pos_source}")
+
+        # When PSF positions used, merge quality columns from detection CSV (optional)
+        if pos_source in ("psf", "aperture"):
+            det_path = self._resolve_detect_csv(ref_fname)
+            if det_path is not None:
+                try:
+                    det_df = pd.read_csv(det_path)
+                    quality_cols = [
+                        c for c in ("elongation", "roundness", "sharpness",
+                                    "dao_flux", "dao_peak", "peak_adu", "fwhm_px")
+                        if c in det_df.columns and c not in df.columns
+                    ]
+                    if quality_cols and "det_uid" in det_df.columns:
+                        df = df.merge(
+                            det_df[["det_uid"] + quality_cols], on="det_uid", how="left"
+                        )
+                except Exception:
+                    pass
 
         df = df.copy()
         for col in (
@@ -1269,14 +1363,13 @@ class RefBuildWorker(QThread):
         stats_rows = []
         for row in metrics.to_dict(orient="records"):
             fname = row["file"]
-            det_path = self._resolve_detect_csv(fname)
+            # Use PSF-first positions for Gaia match stats (most accurate)
+            df_pos, _pos_src = _load_frame_positions(self.result_dir, fname)
             det_xy = np.zeros((0, 2), float)
-            if det_path is not None and det_path.exists():
+            if not df_pos.empty and {"x", "y"} <= set(df_pos.columns):
                 try:
-                    df_det = pd.read_csv(det_path)
-                    if {"x", "y"} <= set(df_det.columns):
-                        det_xy = df_det[["x", "y"]].to_numpy(float)
-                        det_xy = det_xy[np.isfinite(det_xy).all(axis=1)]
+                    det_xy = df_pos[["x", "y"]].to_numpy(float)
+                    det_xy = det_xy[np.isfinite(det_xy).all(axis=1)]
                 except Exception:
                     det_xy = np.zeros((0, 2), float)
 
@@ -1387,7 +1480,7 @@ class RefBuildWorker(QThread):
                 if legacy_hint.exists():
                     summary_hint = legacy_hint
             raise RuntimeError(
-                "No WCS-valid frames (wcs_ok=0). Run Step5 first and confirm solved frames in "
+                "No WCS-valid frames (wcs_ok=0). Run Step7 first and confirm solved frames in "
                 f"{summary_hint} (check fail_reason)."
             )
 
@@ -1576,7 +1669,7 @@ class RefBuildWorker(QThread):
 
 
 class RefBuildWindow(StepWindowBase):
-    """Step 6: Reference Build (WCS-based)"""
+    """Step 8: Reference Build (WCS-based)"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -1585,7 +1678,7 @@ class RefBuildWindow(StepWindowBase):
         self.results = {}
 
         super().__init__(
-            step_index=5,
+            step_index=7,
             step_name="Reference Build",
             params=params,
             project_state=project_state,
@@ -1821,7 +1914,7 @@ class RefBuildWindow(StepWindowBase):
                     self.stats_table.setColumnCount(0)
                     self._update_plot_tab(None)
                     self.status_label.setText(
-                        "Step6 cache is older than latest Step5 WCS summary. Re-run Reference Build."
+                        "Step8 cache is older than latest Step7 WCS summary. Re-run Reference Build."
                     )
                     self.status_label.setStyleSheet("color: #ef6c00;")
                     return
@@ -1953,12 +2046,6 @@ class RefBuildWindow(StepWindowBase):
         match_r_spin.setValue(float(getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0)))
         form.addRow("Gaia Match Tol (Ref, arcsec):", match_r_spin)
 
-        gaia_query_mag_spin = QDoubleSpinBox()
-        gaia_query_mag_spin.setRange(10.0, 25.0)
-        gaia_query_mag_spin.setDecimals(2)
-        gaia_query_mag_spin.setSingleStep(0.5)
-        gaia_query_mag_spin.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
-        form.addRow("Gaia Query Mag Max (Step5):", gaia_query_mag_spin)
 
         form.addRow(QLabel("── WCS match quality gate ──────────────"))
 
@@ -2006,7 +2093,7 @@ class RefBuildWindow(StepWindowBase):
                 )
             )
         )
-        form.addRow("Gaia G Limit (Hybrid ID, Step6/7):", gaia_mag_spin)
+        form.addRow("Gaia G Limit (Hybrid ID, Step8/9):", gaia_mag_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -2025,7 +2112,7 @@ class RefBuildWindow(StepWindowBase):
             self.params.P.ref_cat_sharp_max = sharp_max_spin.value()
             self.params.P.ref_cat_min_peak_adu = peak_spin.value()
             self.params.P.ref_wcs_match_radius_arcsec = match_r_spin.value()
-            self.params.P.gaia_mag_max = gaia_query_mag_spin.value()
+
             self.params.P.ref_wcs_min_match_rate = min_rate_spin.value()
             self.params.P.ref_wcs_min_match_n = min_match_spin.value()
             self.params.P.ref_wcs_max_sep_med_arcsec = max_sep_med_spin.value()
@@ -2243,7 +2330,7 @@ class RefBuildWindow(StepWindowBase):
             "match_rate": "match_rate_det (Gaia/det)",
             "match_rate_cat": "match_rate_cat (Gaia/cat)",
             "n_match": "n_match (Gaia)",
-            "qc_pass": "qc_pass (Step6 gate)",
+            "qc_pass": "qc_pass (Step8 gate)",
         }
         self.stats_table.setHorizontalHeaderLabels([header_map.get(c, c) for c in cols])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -2528,7 +2615,7 @@ class RefBuildWindow(StepWindowBase):
 
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Step6 QC Plot",
+            "Save Step8 QC Plot",
             str(default_name),
             "PNG Image (*.png);;PDF Document (*.pdf);;SVG Image (*.svg)"
         )
@@ -2588,14 +2675,36 @@ class RefBuildWindow(StepWindowBase):
                 except Exception:
                     n_sources = 0
 
+        P = self.params.P
         state_data = {
             "ref_frame": ref_frame,
             "ref_filter": ref_filter,
             "n_sources": n_sources,
+            # ref build params
+            "ref_select_sat_pct":          float(getattr(P, "ref_select_sat_pct",          20.0)),
+            "ref_select_elong_pct":        float(getattr(P, "ref_select_elong_pct",        20.0)),
+            "ref_per_date":                bool(getattr(P,  "ref_per_date",                True)),
+            "ref_cat_max_sources":         int(getattr(P,   "ref_cat_max_sources",         0)),
+            "ref_cat_min_sources":         int(getattr(P,   "ref_cat_min_sources",         50)),
+            "ref_cat_max_elong":           float(getattr(P, "ref_cat_max_elong",           1.5)),
+            "ref_cat_max_abs_round":       float(getattr(P, "ref_cat_max_abs_round",       0.4)),
+            "ref_cat_sharp_min":           float(getattr(P, "ref_cat_sharp_min",           0.2)),
+            "ref_cat_sharp_max":           float(getattr(P, "ref_cat_sharp_max",           1.0)),
+            "ref_cat_min_peak_adu":        float(getattr(P, "ref_cat_min_peak_adu",        0.0)),
+            "ref_wcs_match_radius_arcsec": float(getattr(P, "ref_wcs_match_radius_arcsec", 2.0)),
+            "ref_wcs_min_match_rate":      float(getattr(P, "ref_wcs_min_match_rate",      0.2)),
+            "ref_wcs_min_match_n":         int(getattr(P,   "ref_wcs_min_match_n",         50)),
+            "ref_wcs_max_sep_med_arcsec":  float(getattr(P, "ref_wcs_max_sep_med_arcsec",  1.5)),
+            "ref_wcs_max_sep_p90_arcsec":  float(getattr(P, "ref_wcs_max_sep_p90_arcsec",  2.5)),
+            "ref_wcs_max_dup_rate":        float(getattr(P, "ref_wcs_max_dup_rate",        0.1)),
+            # shared with step9
+            "idmatch_gaia_g_limit":        float(getattr(P, "idmatch_gaia_g_limit",
+                                                  getattr(P, "gaia_mag_max", 18.0))),
         }
         self.project_state.store_step_data("ref_build", state_data)
         if ref_frame:
             self.file_manager.ref_filename = ref_frame
+        self.persist_params()
 
     def restore_state(self):
         state = self.project_state.get_step_data("ref_build")
@@ -2603,6 +2712,28 @@ class RefBuildWindow(StepWindowBase):
             return
         if state.get("ref_frame"):
             self.file_manager.ref_filename = state.get("ref_frame")
+        P = self.params.P
+        _f = lambda k, d: float(state[k]) if k in state else d
+        _i = lambda k, d: int(state[k])   if k in state else d
+        _b = lambda k, d: bool(state[k])  if k in state else d
+        P.ref_select_sat_pct          = _f("ref_select_sat_pct",          20.0)
+        P.ref_select_elong_pct        = _f("ref_select_elong_pct",        20.0)
+        P.ref_per_date                = _b("ref_per_date",                True)
+        P.ref_cat_max_sources         = _i("ref_cat_max_sources",         0)
+        P.ref_cat_min_sources         = _i("ref_cat_min_sources",         50)
+        P.ref_cat_max_elong           = _f("ref_cat_max_elong",           1.5)
+        P.ref_cat_max_abs_round       = _f("ref_cat_max_abs_round",       0.4)
+        P.ref_cat_sharp_min           = _f("ref_cat_sharp_min",           0.2)
+        P.ref_cat_sharp_max           = _f("ref_cat_sharp_max",           1.0)
+        P.ref_cat_min_peak_adu        = _f("ref_cat_min_peak_adu",        0.0)
+        P.ref_wcs_match_radius_arcsec = _f("ref_wcs_match_radius_arcsec", 2.0)
+        P.ref_wcs_min_match_rate      = _f("ref_wcs_min_match_rate",      0.2)
+        P.ref_wcs_min_match_n         = _i("ref_wcs_min_match_n",         50)
+        P.ref_wcs_max_sep_med_arcsec  = _f("ref_wcs_max_sep_med_arcsec",  1.5)
+        P.ref_wcs_max_sep_p90_arcsec  = _f("ref_wcs_max_sep_p90_arcsec",  2.5)
+        P.ref_wcs_max_dup_rate        = _f("ref_wcs_max_dup_rate",        0.1)
+        if "idmatch_gaia_g_limit" in state:
+            P.idmatch_gaia_g_limit    = float(state["idmatch_gaia_g_limit"])
         self._update_stats_table()
         self._update_plot_tab(state)
 

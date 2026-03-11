@@ -1,7 +1,7 @@
 """
-Step 7: Star ID Matching (WCS-based)
+Step 9: Star ID Matching (WCS-based)
 
-- Uses a fixed ref catalog (RA/Dec) from Step 6
+- Uses a fixed ref catalog (RA/Dec) from Step 8
 - Converts detections to sky coordinates via per-frame WCS
 - Sky-matches within a configurable arcsec radius
 """
@@ -361,11 +361,29 @@ def _estimate_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return mat
 
 
-def _estimate_affine(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+def _estimate_affine(src: np.ndarray, dst: np.ndarray, clip_sigma: float = 3.0, clip_iters: int = 2) -> np.ndarray:
     if len(src) == 0:
         return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    a = np.column_stack([src, np.ones(len(src))])
-    m, _, _, _ = np.linalg.lstsq(a, dst, rcond=None)
+    keep = np.ones(len(src), dtype=bool)
+    m = None
+    for it in range(clip_iters + 1):
+        s, d = src[keep], dst[keep]
+        if len(s) < 3:
+            break
+        a = np.column_stack([s, np.ones(len(s))])
+        m, _, _, _ = np.linalg.lstsq(a, d, rcond=None)
+        if it < clip_iters:
+            a_full = np.column_stack([src, np.ones(len(src))])
+            res = np.linalg.norm(dst - a_full @ m, axis=1)
+            med = np.median(res)
+            mad = np.median(np.abs(res - med)) + 1e-12
+            new_keep = res <= med + clip_sigma * 1.4826 * mad
+            if new_keep.sum() < 3 or np.array_equal(new_keep, keep):
+                break
+            keep = new_keep
+    if m is None:
+        a = np.column_stack([src, np.ones(len(src))])
+        m, _, _, _ = np.linalg.lstsq(a, dst, rcond=None)
     return m.T
 
 
@@ -917,7 +935,7 @@ class IdMatchWorker(QThread):
             wcs = self._load_wcs_for_frame(fname)
             wcs_ok = wcs is not None
             if not wcs_ok:
-                self._log(f"[IDMATCH][SKIP] {fname}: no solved WCS (excluded from Step7/Step8)")
+                self._log(f"[IDMATCH][SKIP] {fname}: no solved WCS (excluded from Step9/Step10)")
                 # Prevent stale idmatch artifacts from showing up downstream.
                 try:
                     stale = self.cache_dir / "idmatch" / f"idmatch_{fname}.csv"
@@ -1041,6 +1059,8 @@ class IdMatchWorker(QThread):
 
                 idx, sep2d, _ = det_sky.match_to_catalog_sky(ref_sky)
                 sep_arcsec = sep2d.arcsec
+                idx_stats = idx
+                sep_arcsec_stats = sep_arcsec
 
                 # Two-pass matching if enabled
                 if self.two_pass_enable:
@@ -1127,8 +1147,10 @@ class IdMatchWorker(QThread):
                             best_det[ref_i] = det_i
                             best_confidence[ref_i] = "low"
 
+                    idx_stats = idx_p2
+                    sep_arcsec_stats = sep_arcsec_p2
                     match_r = loose_r
-                    ok = sep_arcsec <= loose_r
+                    ok = sep_arcsec_stats <= loose_r
 
                     # C: Adaptive retry — if rate is still low, try with 2× loose_r
                     if self.adaptive_retry_threshold > 0:
@@ -1151,7 +1173,7 @@ class IdMatchWorker(QThread):
                                     best_det[ref_i] = det_i
                                     best_confidence[ref_i] = "retry"
                             match_r = retry_r
-                            ok = sep_arcsec <= retry_r
+                            ok = sep_arcsec_stats <= retry_r
                             self._log(
                                 f"[IDMATCH] {fname}: adaptive retry "
                                 f"rate={rate_now:.3f} retry_r={retry_r:.2f}\" "
@@ -1255,7 +1277,7 @@ class IdMatchWorker(QThread):
             dup_count = 0
             if det_sky is not None:
                 try:
-                    counts = pd.Series(idx[ok]).value_counts()
+                    counts = pd.Series(idx_stats[ok]).value_counts()
                     dup = counts[counts > 1].sum()
                     dup_count = int(dup)
                     dup_rate = float(dup / max(n_match, 1))
@@ -1438,7 +1460,7 @@ class IdMatchWorker(QThread):
         self.finished.emit(summary)
 
 class StarIdMatchingWindow(StepWindowBase):
-    """Step 7: Star ID Matching (WCS-based)"""
+    """Step 9: Star ID Matching (WCS-based)"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -1447,7 +1469,7 @@ class StarIdMatchingWindow(StepWindowBase):
         self.log_window = None
 
         super().__init__(
-            step_index=6,
+            step_index=8,
             step_name="Star ID Matching",
             params=params,
             project_state=project_state,
@@ -1500,7 +1522,7 @@ class StarIdMatchingWindow(StepWindowBase):
         btn_help = QPushButton("?")
         btn_help.setFixedWidth(28)
         btn_help.setToolTip(
-            "Step7 지표 도움말: match_rate(ID), 매칭 기준, dx/dy 의미"
+            "Step9 지표 도움말: match_rate(ID), 매칭 기준, dx/dy 의미"
         )
         btn_help.clicked.connect(self.show_idmatch_help_dialog)
         control_layout.addWidget(btn_help)
@@ -1638,7 +1660,7 @@ class StarIdMatchingWindow(StepWindowBase):
         gaia_g_spin.setRange(10.0, 25.0)
         gaia_g_spin.setDecimals(2)
         gaia_g_spin.setSingleStep(0.5)
-        gaia_g_spin.setValue(_coalesce_float(getattr(self.params.P, "idmatch_gaia_g_limit", None), 25.0))
+        gaia_g_spin.setValue(_coalesce_float(getattr(self.params.P, "idmatch_gaia_g_limit", None), 18.0))
         form.addRow("Gaia G limit (Gaia-only mode):", gaia_g_spin)
 
         form.addRow(QLabel("── Two-pass matching ──────────────────"))
@@ -1796,7 +1818,7 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Missing Reference", "Reference info not found in ref_build_meta.json")
             return
         if bool(getattr(self.params.P, "ref_per_date", False)) and not ref_per_date:
-            self.log("[WARN] Per-date ref is ON in parameters, but ref_build_meta.json is global. Re-run Step 6.")
+            self.log("[WARN] Per-date ref is ON in parameters, but ref_build_meta.json is global. Re-run Step 8.")
 
         files = list(self.file_manager.filenames) if self.file_manager else []
         if not files and self.file_manager:
@@ -1868,7 +1890,7 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Warning", "No frames after WCS QC filter.")
             return
 
-        # Hard gate: keep only frames explicitly solved by Step5 summary.
+        # Hard gate: keep only frames explicitly solved by Step7 WCS summary.
         solved_candidates = [
             step5_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
             self.params.P.result_dir / "wcs_solve_summary.csv",
@@ -2049,7 +2071,7 @@ class StarIdMatchingWindow(StepWindowBase):
     def _qc_help_text(self) -> str:
         mode_key = _get_idmatch_mode_from_params(self.params.P)
         return (
-            "match_rate = n_match / n_det (Step7 ID rate, not Step6 Gaia rate). "
+            "match_rate = n_match / n_det (Step9 ID rate, not Step8 Gaia rate). "
             "dx_med/dy_med = median(det - ref_projected) residual in pixel."
             + (f" 현재 mode={mode_key}." if mode_key else "")
         )
@@ -2057,11 +2079,11 @@ class StarIdMatchingWindow(StepWindowBase):
     def _idmatch_help_text(self) -> str:
         mode_key = _get_idmatch_mode_from_params(self.params.P)
         return (
-            "Step7 Metrics Guide\n\n"
+            "Step9 Metrics Guide\n\n"
             "1) match_rate\n"
             "   - match_rate = n_match / n_det\n"
-            "   - Step7 ID 매칭률(검출원 대비 source_id 매칭 비율)입니다.\n"
-            "   - Step6의 Gaia match_rate 계열과 다른 지표입니다.\n\n"
+            "   - Step9 ID 매칭률(검출원 대비 source_id 매칭 비율)입니다.\n"
+            "   - Step8의 Gaia match_rate 계열과 다른 지표입니다.\n\n"
             "2) 실제 매칭 기준\n"
             "   - detection(x,y) -> frame WCS -> sky(ra,dec) 변환\n"
             "   - ref_catalog(ra,dec)와 최근접 매칭\n"
@@ -2076,7 +2098,7 @@ class StarIdMatchingWindow(StepWindowBase):
         )
 
     def show_idmatch_help_dialog(self):
-        QMessageBox.information(self, "Step7 Help", self._idmatch_help_text())
+        QMessageBox.information(self, "Step9 Help", self._idmatch_help_text())
 
     def _update_plot_tab(self) -> None:
         if not hasattr(self, "plot_canvas") or self.plot_canvas is None:
@@ -2213,7 +2235,7 @@ class StarIdMatchingWindow(StepWindowBase):
 
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Step7 QC Plot",
+            "Save Step9 QC Plot",
             str(default_name),
             "PNG Image (*.png);;PDF Document (*.pdf);;SVG Image (*.svg)"
         )
@@ -2240,17 +2262,29 @@ class StarIdMatchingWindow(StepWindowBase):
             summary = self.results if isinstance(self.results, dict) else {}
         summary = summary or {}
 
+        P = self.params.P
         state_data = {
             "idmatch_complete": bool(summary),
             "n_files": summary.get("total", 0) if summary else 0,
-            "idmatch_mode": str(getattr(self.params.P, "idmatch_mode", "normal")),
-            "match_radius_arcsec": _coalesce_float(getattr(self.params.P, "idmatch_tol_arcsec", None), 0.0),
-            "match_r_fwhm": _coalesce_float(getattr(self.params.P, "idmatch_match_r_fwhm", None), 0.8),
-            "init_r_fwhm": _coalesce_float(getattr(self.params.P, "idmatch_init_r_fwhm", None), 5.0),
-            "ratio_max": _coalesce_float(getattr(self.params.P, "idmatch_ratio_max", None), 0.7),
-            "min_pairs": _coalesce_int(getattr(self.params.P, "idmatch_min_pairs", None), 15),
-            "transform_mode": str(getattr(self.params.P, "idmatch_transform_mode", "similarity")),
-            "mutual_nearest": bool(getattr(self.params.P, "idmatch_mutual_nearest", True)),
+            "idmatch_mode":                str(getattr(P, "idmatch_mode", "normal")),
+            "match_radius_arcsec":         _coalesce_float(getattr(P, "idmatch_tol_arcsec",                None), 0.0),
+            "match_r_fwhm":                _coalesce_float(getattr(P, "idmatch_match_r_fwhm",              None), 0.8),
+            "init_r_fwhm":                 _coalesce_float(getattr(P, "idmatch_init_r_fwhm",               None), 5.0),
+            "ratio_max":                   _coalesce_float(getattr(P, "idmatch_ratio_max",                 None), 0.7),
+            "min_pairs":                   _coalesce_int(getattr(P,   "idmatch_min_pairs",                 None), 15),
+            "transform_mode":              str(getattr(P, "idmatch_transform_mode", "similarity")),
+            "mutual_nearest":              bool(getattr(P, "idmatch_mutual_nearest", True)),
+            # params missing from previous versions
+            "idmatch_gaia_g_limit":        _coalesce_float(getattr(P, "idmatch_gaia_g_limit",             None), 18.0),
+            "idmatch_use_gaia_refs_only":  bool(getattr(P, "idmatch_use_gaia_refs_only",                  False)),
+            "idmatch_two_pass_enable":     bool(getattr(P, "idmatch_two_pass_enable",                     True)),
+            "idmatch_tight_radius_arcsec": _coalesce_float(getattr(P, "idmatch_tight_radius_arcsec",      None), 1.0),
+            "idmatch_loose_radius_arcsec": _coalesce_float(getattr(P, "idmatch_loose_radius_arcsec",      None), 3.0),
+            "idmatch_adaptive_retry_threshold": _coalesce_float(getattr(P, "idmatch_adaptive_retry_threshold", None), 0.5),
+            "idmatch_fwhm_adaptive_floor": bool(getattr(P, "idmatch_fwhm_adaptive_floor",                 True)),
+            "idmatch_geom_correction_enable": bool(getattr(P, "idmatch_geom_correction_enable",           True)),
+            "idmatch_min_correction_pairs":_coalesce_int(getattr(P,   "idmatch_min_correction_pairs",     None), 3),
+            "idmatch_min_affine_pairs":    _coalesce_int(getattr(P,   "idmatch_min_affine_pairs",         None), 6),
         }
         self.project_state.store_step_data("star_id_match", state_data)
 
@@ -2260,24 +2294,46 @@ class StarIdMatchingWindow(StepWindowBase):
         state = self.project_state.get_step_data("star_id_match")
         if not state:
             return
+        P = self.params.P
         if "idmatch_mode" in state:
-            self.params.P.idmatch_mode = _normalize_idmatch_mode(state["idmatch_mode"])
+            P.idmatch_mode = _normalize_idmatch_mode(state["idmatch_mode"])
         if "match_r_fwhm" in state:
-            self.params.P.idmatch_match_r_fwhm = _coalesce_float(state["match_r_fwhm"], 0.8)
+            P.idmatch_match_r_fwhm = _coalesce_float(state["match_r_fwhm"], 0.8)
         if "match_radius_arcsec" in state:
-            self.params.P.idmatch_tol_arcsec = _coalesce_float(state["match_radius_arcsec"], 0.0)
+            P.idmatch_tol_arcsec = _coalesce_float(state["match_radius_arcsec"], 0.0)
         if "init_r_fwhm" in state:
-            self.params.P.idmatch_init_r_fwhm = _coalesce_float(state["init_r_fwhm"], 5.0)
+            P.idmatch_init_r_fwhm = _coalesce_float(state["init_r_fwhm"], 5.0)
         if "ratio_max" in state:
-            self.params.P.idmatch_ratio_max = _coalesce_float(state["ratio_max"], 0.7)
+            P.idmatch_ratio_max = _coalesce_float(state["ratio_max"], 0.7)
         if "min_pairs" in state:
-            self.params.P.idmatch_min_pairs = _coalesce_int(state["min_pairs"], 15)
+            P.idmatch_min_pairs = _coalesce_int(state["min_pairs"], 15)
         if "transform_mode" in state:
             mode = str(state["transform_mode"]).lower()
             if mode in ("shift", "affine", "similarity"):
-                self.params.P.idmatch_transform_mode = mode
+                P.idmatch_transform_mode = mode
         if "mutual_nearest" in state:
-            self.params.P.idmatch_mutual_nearest = bool(state["mutual_nearest"])
+            P.idmatch_mutual_nearest = bool(state["mutual_nearest"])
+        # params added in later versions
+        if "idmatch_gaia_g_limit" in state:
+            P.idmatch_gaia_g_limit = _coalesce_float(state["idmatch_gaia_g_limit"], 18.0)
+        if "idmatch_use_gaia_refs_only" in state:
+            P.idmatch_use_gaia_refs_only = bool(state["idmatch_use_gaia_refs_only"])
+        if "idmatch_two_pass_enable" in state:
+            P.idmatch_two_pass_enable = bool(state["idmatch_two_pass_enable"])
+        if "idmatch_tight_radius_arcsec" in state:
+            P.idmatch_tight_radius_arcsec = _coalesce_float(state["idmatch_tight_radius_arcsec"], 1.0)
+        if "idmatch_loose_radius_arcsec" in state:
+            P.idmatch_loose_radius_arcsec = _coalesce_float(state["idmatch_loose_radius_arcsec"], 3.0)
+        if "idmatch_adaptive_retry_threshold" in state:
+            P.idmatch_adaptive_retry_threshold = _coalesce_float(state["idmatch_adaptive_retry_threshold"], 0.5)
+        if "idmatch_fwhm_adaptive_floor" in state:
+            P.idmatch_fwhm_adaptive_floor = bool(state["idmatch_fwhm_adaptive_floor"])
+        if "idmatch_geom_correction_enable" in state:
+            P.idmatch_geom_correction_enable = bool(state["idmatch_geom_correction_enable"])
+        if "idmatch_min_correction_pairs" in state:
+            P.idmatch_min_correction_pairs = _coalesce_int(state["idmatch_min_correction_pairs"], 3)
+        if "idmatch_min_affine_pairs" in state:
+            P.idmatch_min_affine_pairs = _coalesce_int(state["idmatch_min_affine_pairs"], 6)
         self._update_plot_tab()
 
     def log(self, msg: str):

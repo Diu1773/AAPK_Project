@@ -16,8 +16,8 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel, QMessageBox, QFileDialog
 )
 
-from .step10_zeropoint_calibration import CmdViewerWindow
-from .step12_isochrone_model import IsochroneModelWindow
+from ..workflow.step11_zeropoint_calibration import CmdViewerWindow
+from ..workflow.step13_isochrone_model import IsochroneModelWindow
 
 
 class _ParamsNamespaceProxy:
@@ -186,9 +186,11 @@ class CmdIsoToolWindow(QMainWindow):
             self.main_window
         )
         iso_window.setWindowFlags(Qt.Widget)
-        for btn in (iso_window.btn_previous, iso_window.btn_next, iso_window.btn_complete):
-            btn.setEnabled(False)
-            btn.setVisible(False)
+        for attr in ("btn_previous", "btn_next", "btn_complete"):
+            btn = getattr(iso_window, attr, None)
+            if btn is not None:
+                btn.setEnabled(False)
+                btn.setVisible(False)
         self.iso_layout.addWidget(iso_window)
         self.iso_window = iso_window
         self.iso_placeholder.setVisible(False)

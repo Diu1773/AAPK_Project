@@ -362,6 +362,10 @@ class DeblendConfig(BaseModel):
         gt=0, le=1.0,
         description="Soft deblend contrast"
     )
+    mode: str = Field(
+        default="exponential",
+        description="Deblend level spacing mode: 'linear' or 'exponential'"
+    )
 
 
 class PeakConfig(BaseModel):
@@ -1335,6 +1339,181 @@ class HUD5XConfig(BaseModel):
     )
 
 
+class PSFConfig(BaseModel):
+    """PSF photometry configuration (Step 6, optional)"""
+    model_config = ConfigDict(validate_assignment=True)
+
+    model_mode: str = Field(
+        default="per_frame",
+        description="EPSF model reuse mode (fixed): per_frame"
+    )
+    parallel_workers: int = Field(
+        default=0,
+        ge=0, le=64,
+        description="Step6-only worker count (0 = auto/global)"
+    )
+    epsf_oversampling: int = Field(
+        default=2,
+        ge=1, le=8,
+        description="EPSF oversampling factor"
+    )
+    epsf_size_px: int = Field(
+        default=25,
+        ge=11, le=101,
+        description="Cutout size for EPSF building (pixels, must be odd)"
+    )
+    epsf_size_fwhm_mult: float = Field(
+        default=4.0,
+        ge=1.0, le=10.0,
+        description="FWHM multiplier for adaptive EPSF cutout size"
+    )
+    n_stars_max: int = Field(
+        default=50,
+        ge=5, le=500,
+        description="Maximum number of stars used to build EPSF"
+    )
+    isolation_fwhm_mult: float = Field(
+        default=3.0,
+        ge=1.0, le=10.0,
+        description="Isolation radius = FWHM × this value (pixels)"
+    )
+    flux_percentile_lo: float = Field(
+        default=75.0,
+        ge=10.0, le=95.0,
+        description="Lower flux percentile for EPSF star selection"
+    )
+    flux_percentile_hi: float = Field(
+        default=95.0,
+        ge=50.0, le=99.9,
+        description="Upper flux percentile for EPSF star selection (saturation guard)"
+    )
+    fit_shape_px: int = Field(
+        default=5,
+        ge=3, le=25,
+        description="PSF fitting box size (pixels, must be odd)"
+    )
+    fit_shape_fwhm_mult: float = Field(
+        default=3.0,
+        ge=0.5, le=5.0,
+        description="FWHM multiplier for adaptive fit shape size"
+    )
+    max_iter: int = Field(
+        default=2,
+        ge=1, le=10,
+        description="Maximum PSF fitting iterations (residual re-detection)"
+    )
+    redetect_sigma: float = Field(
+        default=4.0,
+        ge=1.0, le=10.0,
+        description="Detection threshold in residual image (sigma above background)"
+    )
+    redetect_sigma_g: Optional[float] = Field(
+        default=None,
+        description="Per-filter re-detect sigma override for g-band (None = use redetect_sigma)"
+    )
+    redetect_sigma_r: Optional[float] = Field(
+        default=None,
+        description="Per-filter re-detect sigma override for r-band (None = use redetect_sigma)"
+    )
+    redetect_sigma_i: Optional[float] = Field(
+        default=None,
+        description="Per-filter re-detect sigma override for i-band (None = use redetect_sigma)"
+    )
+    duplicate_radius_fwhm_mult: float = Field(
+        default=0.8,
+        ge=0.1, le=5.0,
+        description="Duplicate suppression radius = FWHM × this value"
+    )
+    new_sources_cap_per_iter: int = Field(
+        default=70,
+        ge=0, le=100000,
+        description="Absolute cap for residual new detections per iteration"
+    )
+    new_sources_cap_frac: float = Field(
+        default=0.02,
+        ge=0.0, le=1.0,
+        description="Relative cap for residual new detections per iteration"
+    )
+    conv_new_frac: float = Field(
+        default=0.02,
+        ge=0.0, le=1.0,
+        description="Convergence threshold on new-source fraction per iteration"
+    )
+    redetect_sharp_lo: float = Field(
+        default=0.15,
+        description="Lower sharpness bound for residual detections"
+    )
+    redetect_sharp_hi: float = Field(
+        default=0.95,
+        description="Upper sharpness bound for residual detections"
+    )
+    redetect_round_abs_max: float = Field(
+        default=0.8,
+        ge=0.0, le=10.0,
+        description="Absolute roundness bound for residual detections"
+    )
+    flux_conv_threshold: float = Field(
+        default=0.01,
+        ge=1e-4, le=0.5,
+        description="Convergence: stop when Σ|Δflux|/Σflux < this value"
+    )
+    use_error_image: bool = Field(
+        default=False,
+        description="Use per-pixel error image in PSF fit (slower, higher memory)"
+    )
+    save_residuals: bool = Field(
+        default=True,
+        description="Save residual FITS images per iteration"
+    )
+    save_model_image: bool = Field(
+        default=True,
+        description="Save full-frame PSF model FITS image"
+    )
+
+    @model_validator(mode='after')
+    def validate_odd_sizes(self) -> 'PSFConfig':
+        if self.model_mode != "per_frame":
+            raise ValueError(
+                f"model_mode must be 'per_frame' (got '{self.model_mode}'); "
+                "other modes are not yet implemented"
+            )
+        if self.epsf_size_px % 2 == 0:
+            raise ValueError("epsf_size_px must be odd")
+        if self.fit_shape_px % 2 == 0:
+            raise ValueError("fit_shape_px must be odd")
+        if self.flux_percentile_lo >= self.flux_percentile_hi:
+            raise ValueError(
+                "flux_percentile_lo must be less than flux_percentile_hi"
+            )
+        return self
+
+
+class CrossFrameConfig(BaseModel):
+    """Cross-frame pixel matching configuration (Steps 7–8)"""
+    model_config = ConfigDict(validate_assignment=True)
+
+    ransac_tol_px: float = Field(
+        default=2.0,
+        ge=0.5, le=20.0,
+        description="RANSAC inlier tolerance in pixels"
+    )
+    ransac_max_iter: int = Field(
+        default=1000,
+        ge=100, le=10000,
+        description="RANSAC maximum iterations"
+    )
+    ransac_min_inliers: int = Field(
+        default=6,
+        ge=3, le=100,
+        description="Minimum inliers for a valid affine solution"
+    )
+    match_tol_px: float = Field(
+        default=3.0,
+        ge=0.5, le=20.0,
+        description="Final cross-match tolerance in pixels"
+    )
+
+
 class TransformConfig(BaseModel):
     """Transformation/alignment output configuration"""
     model_config = ConfigDict(validate_assignment=True)
@@ -1377,6 +1556,8 @@ class Parameters(BaseModel):
 
     # Photometry
     photometry: PhotConfig = Field(default_factory=PhotConfig)
+    psf: PSFConfig = Field(default_factory=PSFConfig)
+    cross_frame: CrossFrameConfig = Field(default_factory=CrossFrameConfig)
 
     # WCS and astrometry
     wcs: WCSConfig = Field(default_factory=WCSConfig)
@@ -1449,6 +1630,8 @@ class Parameters(BaseModel):
             detection=DetectionConfig(**detection_data),
             background=Background2DConfig(**data.get("background", {})),
             photometry=PhotConfig(**photometry_data),
+            psf=PSFConfig(**data.get("psf", {})),
+            cross_frame=CrossFrameConfig(**data.get("cross_frame", {})),
             wcs=WCSConfig(**data.get("wcs", {})),
             wcs_refine=WCSRefineConfig(**data.get("wcs_refine", {})),
             gaia=GAIAConfig(**data.get("gaia", {})),

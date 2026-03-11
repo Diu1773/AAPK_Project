@@ -5,11 +5,23 @@ Compares AAPKI photometry results with IRAF photometry for quality validation.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        tomllib = None  # type: ignore
 
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
+
+from astropy.io import fits
+from astropy.stats import SigmaClip
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -22,6 +34,123 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QProgressBar, QSplitter, QTableWidget,
     QTableWidgetItem, QTabWidget
 )
+
+from ...utils.step_paths import step4_dir
+
+
+# Module-level constant — avoids reinstantiating SigmaClip per star (hot path)
+_SIGMA_CLIP = SigmaClip(sigma=3.0, maxiters=5)
+
+
+# ---------------------------------------------------------------------------
+# IRAF aperture re-measurement helpers
+# ---------------------------------------------------------------------------
+
+def _load_iraf_phot_params(toml_path: Path) -> dict:
+    """Read [tools.iraf.params] from parameters.toml.
+
+    Returns dict with keys: aperture_mult, annulus_mult, dannulus_mult,
+    zmag, epadu, readnoise, itime.  Falls back to safe defaults.
+    """
+    defaults = dict(aperture_mult=1.0, annulus_mult=4.0, dannulus_mult=2.0,
+                    zmag=25.0, epadu=1.0, readnoise=7.5, itime=1.0)
+    if tomllib is None or not toml_path.exists():
+        return defaults
+    try:
+        cfg = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+        p = cfg.get("tools", {}).get("iraf", {}).get("params", {})
+        if not isinstance(p, dict):
+            return defaults
+        for k, v in p.items():
+            if k in defaults:
+                try:
+                    defaults[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return defaults
+
+
+def _load_detect_csv(fname: str, result_dir: Path, cache_dir: Path) -> pd.DataFrame | None:
+    """Load step4 detect_{fname}.csv from cache or step4_dir."""
+    for p in (
+        cache_dir / f"detect_{fname}.csv",
+        step4_dir(result_dir) / f"detect_{fname}.csv",
+        result_dir / f"detect_{fname}.csv",
+    ):
+        if p.exists():
+            try:
+                return pd.read_csv(p)
+            except Exception:
+                pass
+    return None
+
+
+def _load_fwhm(fname: str, cache_dir: Path) -> float:
+    """Read median FWHM from detect_{fname}.json."""
+    jp = cache_dir / f"detect_{fname}.json"
+    if jp.exists():
+        try:
+            d = json.loads(jp.read_text(encoding="utf-8"))
+            for key in ("fwhm_med", "fwhm_median", "fwhm"):
+                v = d.get(key)
+                if v is not None:
+                    f = float(v)
+                    if np.isfinite(f) and f > 0:
+                        return f
+        except Exception:
+            pass
+    return 5.0  # safe fallback
+
+
+def _phot_at_iraf_ap(img: np.ndarray, x: float, y: float,
+                     r_ap: float, r_in: float, r_out: float,
+                     gain: float = 1.0, cut_r: int | None = None) -> tuple[float, float]:
+    """Aperture photometry at a single position.
+
+    Returns (flux_e, mag_inst) where mag_inst = -2.5*log10(flux_e).
+    flux_e = (ap_sum - sky*ap_area) * gain.
+    """
+    h, w = img.shape
+    if cut_r is None:
+        cut_r = int(np.ceil(r_out + 2))
+    xi, yi = int(round(x)), int(round(y))
+    x0 = max(0, xi - cut_r)
+    x1 = min(w, xi + cut_r + 1)
+    y0 = max(0, yi - cut_r)
+    y1 = min(h, yi + cut_r + 1)
+    cut = img[y0:y1, x0:x1]
+    lx = x - x0
+    ly = y - y0
+
+    # Compute pixel-distance grid once; reuse for aperture and annulus masks
+    ch, cw = cut.shape
+    yy, xx = np.ogrid[:ch, :cw]
+    dist2 = (xx - lx) ** 2 + (yy - ly) ** 2
+    ap_mask = dist2 <= r_ap ** 2
+    ann_mask = (dist2 <= r_out ** 2) & (dist2 > r_in ** 2)
+
+    ann_vals = cut[ann_mask & np.isfinite(cut)]
+    if ann_vals.size >= 3:
+        clipped = _SIGMA_CLIP(ann_vals)
+        sky = float(np.nanmedian(clipped.compressed()
+                                  if np.ma.isMaskedArray(clipped) else clipped))
+    elif ann_vals.size > 0:
+        sky = float(np.nanmedian(ann_vals))
+    else:
+        sky = 0.0
+
+    ap_vals = cut[ap_mask]
+    ap_sum = float(np.nansum(ap_vals))
+    ap_area = float(np.count_nonzero(ap_mask))
+    flux_adu = ap_sum - sky * ap_area
+    flux_e = flux_adu * gain
+    if flux_e > 0:
+        mag_inst = -2.5 * np.log10(flux_e)
+    else:
+        mag_inst = np.nan
+    return flux_e, mag_inst
 
 
 def _read_iraf_txt(path: Path) -> pd.DataFrame:
@@ -70,7 +199,7 @@ def _read_iraf_mag(path: Path) -> pd.DataFrame:
                 if len(seg0) >= 3:
                     try:
                         obj_id = int(float(seg0[2]))
-                    except:
+                    except (ValueError, IndexError, TypeError):
                         pass
 
             if len(segments) > 1:
@@ -79,7 +208,7 @@ def _read_iraf_mag(path: Path) -> pd.DataFrame:
                     try:
                         x_val = float(seg1[0])
                         y_val = float(seg1[1])
-                    except:
+                    except (ValueError, IndexError, TypeError):
                         pass
 
             if len(segments) > 4:
@@ -87,7 +216,7 @@ def _read_iraf_mag(path: Path) -> pd.DataFrame:
                 if len(seg4) >= 5:
                     try:
                         mag_val = float(seg4[4])
-                    except:
+                    except (ValueError, IndexError, TypeError):
                         pass
 
             if obj_id is None:
@@ -151,7 +280,7 @@ def _read_aapki_tsv(path: Path) -> pd.DataFrame:
     """Read AAPKI photometry TSV file."""
     try:
         return pd.read_csv(path, sep="\t")
-    except:
+    except Exception:
         return pd.read_csv(path)
 
 
@@ -190,7 +319,12 @@ def _auto_axis_shift(delta_med: float) -> float:
 
 
 class IRAFComparisonWorker(QThread):
-    """Worker thread for comparing AAPKI and IRAF photometry."""
+    """Worker thread for comparing AAPKI (re-measured) and IRAF photometry.
+
+    Re-measures AAPKI aperture photometry on step4 detect positions using
+    the same aperture parameters as IRAF ([tools.iraf.params] in parameters.toml),
+    then compares instrumental magnitudes frame-by-frame.
+    """
 
     progress = pyqtSignal(int, int, str)
     log = pyqtSignal(str)
@@ -199,18 +333,24 @@ class IRAFComparisonWorker(QThread):
 
     def __init__(
         self,
-        aapki_dir: Path,
+        data_dir: Path,
+        result_dir: Path,
+        cache_dir: Path,
         iraf_dir: Path,
+        toml_path: Path,
         tol_px: float = 1.5,
-        pos_mode: str = "xcenter/ycenter",
         iraf_mode: str = "auto",
+        filename_prefix: str = "",
     ):
         super().__init__()
-        self.aapki_dir = Path(aapki_dir)
+        self.data_dir = Path(data_dir)
+        self.result_dir = Path(result_dir)
+        self.cache_dir = Path(cache_dir)
         self.iraf_dir = Path(iraf_dir)
+        self.toml_path = Path(toml_path)
         self.tol_px = tol_px
-        self.pos_mode = pos_mode
         self.iraf_mode = iraf_mode
+        self.filename_prefix = filename_prefix
         self._stop_requested = False
 
     def stop(self):
@@ -221,11 +361,23 @@ class IRAFComparisonWorker(QThread):
 
     def run(self):
         try:
+            # Load IRAF aperture params
+            iraf_p = _load_iraf_phot_params(self.toml_path)
+            self._log(
+                f"IRAF params: aperture_mult={iraf_p['aperture_mult']:.2f}  "
+                f"annulus_mult={iraf_p['annulus_mult']:.2f}  "
+                f"dannulus_mult={iraf_p['dannulus_mult']:.2f}  "
+                f"zmag={iraf_p['zmag']:.2f}  epadu={iraf_p['epadu']:.3f}"
+            )
+
             # Collect files
-            aapki_map = self._collect_aapki(self.aapki_dir)
+            aapki_map = self._collect_aapki_fits(
+                self.data_dir, self.result_dir, self.cache_dir,
+                self.filename_prefix
+            )
             iraf_map = self._collect_iraf(self.iraf_dir, self.iraf_mode)
 
-            self._log(f"AAPKI files: {len(aapki_map)}")
+            self._log(f"AAPKI FITS frames with detect: {len(aapki_map)}")
             self._log(f"IRAF files: {len(iraf_map)}")
 
             frames = sorted(set(aapki_map) & set(iraf_map))
@@ -248,7 +400,7 @@ class IRAFComparisonWorker(QThread):
                 self.progress.emit(idx + 1, len(frames), f"Comparing {frame}")
 
                 match_df, info = self._match_frame(
-                    aapki_map[frame], iraf_map[frame]
+                    aapki_map[frame], iraf_map[frame], iraf_p
                 )
                 frame_matches[frame] = match_df
 
@@ -334,11 +486,25 @@ class IRAFComparisonWorker(QThread):
             return np.nan, np.nan
         return float(np.nanmedian(values)), float(np.nanstd(values))
 
-    def _collect_aapki(self, base_dir: Path):
+    def _collect_aapki_fits(self, data_dir: Path, result_dir: Path,
+                              cache_dir: Path, prefix: str) -> dict:
+        """Collect {frame_key: (fits_path, fname, det_df)} for frames
+        that have both a FITS image and a step4 detect CSV."""
         mapping = {}
-        for path in base_dir.rglob("*_photometry.tsv"):
-            base = _normalize_frame_key(path.stem)
-            mapping.setdefault(base, path)
+        _exts = {".fits", ".fit", ".fts"}
+        # Two patterns cover *.fits/*.fit (fit*) and *.fts
+        for pat in (f"{prefix}*.fit*" if prefix else "*.fit*",
+                    f"{prefix}*.fts"  if prefix else "*.fts"):
+            for fits_p in sorted(data_dir.glob(pat)):
+                if fits_p.suffix.lower() not in _exts:
+                    continue
+                fname = fits_p.name
+                key = _normalize_frame_key(fits_p.stem)
+                if key in mapping:
+                    continue
+                det_df = _load_detect_csv(fname, result_dir, cache_dir)
+                if det_df is not None:
+                    mapping[key] = (fits_p, fname, det_df)
         return mapping
 
     def _collect_iraf(self, base_dir: Path, mode: str):
@@ -357,102 +523,101 @@ class IRAFComparisonWorker(QThread):
                 mapping.setdefault(base, path)
         return mapping
 
-    def _match_frame(self, aapki_path: Path, iraf_path: Path):
-        aapki = _read_aapki_tsv(aapki_path)
+    def _match_frame(self, aapki_entry: tuple, iraf_path: Path, iraf_p: dict):
+        """Re-measure AAPKI at IRAF aperture on detect positions, then match IRAF.
+
+        aapki_entry: (fits_path, fname, det_df) from _collect_aapki_fits
+        iraf_p: dict from _load_iraf_phot_params
+        """
+        fits_path, fname, det_df = aapki_entry
         iraf = _read_iraf_file(iraf_path)
-        n_aapki_total = len(aapki)
         n_iraf_total = len(iraf)
 
-        mag_col = _pick_first(aapki.columns, ["mag_inst", "mag", "MAG", "mag_raw"])
-        if mag_col is None:
-            raise ValueError(f"Missing mag column in {aapki_path}")
-
-        if self.pos_mode.startswith("xcenter"):
-            x_col = _pick_first(aapki.columns, ["xcenter", "x", "x_init"])
-            y_col = _pick_first(aapki.columns, ["ycenter", "y", "y_init"])
-        else:
-            x_col = _pick_first(aapki.columns, ["x_init", "xcenter", "x"])
-            y_col = _pick_first(aapki.columns, ["y_init", "ycenter", "y"])
-
+        # detect positions already loaded; validate
+        if det_df is None or det_df.empty:
+            raise ValueError(f"No detect CSV for {fname}")
+        x_col = _pick_first(det_df.columns, ["x", "xcenter", "x_init"])
+        y_col = _pick_first(det_df.columns, ["y", "ycenter", "y_init"])
         if x_col is None or y_col is None:
-            raise ValueError(f"Missing XY columns in {aapki_path}")
+            raise ValueError(f"No XY columns in detect CSV for {fname}")
+        axy = det_df[[x_col, y_col]].dropna().to_numpy(float)
+        n_aapki_total = len(axy)
+
+        # Load FWHM and compute aperture radii matching IRAF
+        fwhm = _load_fwhm(fname, self.cache_dir)
+        r_ap = max(iraf_p["aperture_mult"] * fwhm, 3.0)
+        r_in = iraf_p["annulus_mult"] * fwhm
+        r_out = r_in + iraf_p["dannulus_mult"] * fwhm
+        gain = max(iraf_p["epadu"], 0.01)
+
+        # Load FITS image
+        img = fits.getdata(fits_path).astype(float)
+
+        # Re-measure at each detect position
+        mags = []
+        for xi, yi in axy:
+            _, m = _phot_at_iraf_ap(img, xi, yi, r_ap, r_in, r_out, gain=gain)
+            mags.append(m)
+        mags = np.array(mags, dtype=float)
+
+        aapki_df = pd.DataFrame({"x": axy[:, 0], "y": axy[:, 1], "mag": mags})
+        aapki_df = aapki_df[np.isfinite(aapki_df["mag"])].reset_index(drop=True)
 
         def _match_with_iraf(iraf_df):
-            axy = aapki[[x_col, y_col]].to_numpy(float)
-            ixy = iraf_df[["x", "y"]].to_numpy(float)
-
-            if axy.size == 0 or ixy.size == 0:
+            a_xy = aapki_df[["x", "y"]].to_numpy(float)
+            i_xy = iraf_df[["x", "y"]].to_numpy(float)
+            if a_xy.size == 0 or i_xy.size == 0:
                 return pd.DataFrame()
-
-            tree = cKDTree(axy)
-            dist, idx = tree.query(ixy, distance_upper_bound=self.tol_px)
+            tree = cKDTree(a_xy)
+            dist, idx = tree.query(i_xy, distance_upper_bound=self.tol_px)
             mask = np.isfinite(dist) & (dist <= self.tol_px)
-
             if not np.any(mask):
                 return pd.DataFrame()
-
-            match = pd.DataFrame({
-                "iraf_id": iraf_df.loc[mask, "ID"].to_numpy(),
-                "iraf_x": iraf_df.loc[mask, "x"].to_numpy(),
-                "iraf_y": iraf_df.loc[mask, "y"].to_numpy(),
+            df = pd.DataFrame({
+                "iraf_id":  iraf_df.loc[mask, "ID"].to_numpy(),
+                "iraf_x":   iraf_df.loc[mask, "x"].to_numpy(),
+                "iraf_y":   iraf_df.loc[mask, "y"].to_numpy(),
                 "iraf_mag": iraf_df.loc[mask, "mag"].to_numpy(),
-                "aapki_x": aapki.loc[idx[mask], x_col].to_numpy(),
-                "aapki_y": aapki.loc[idx[mask], y_col].to_numpy(),
-                "aapki_mag": aapki.loc[idx[mask], mag_col].to_numpy(),
-                "dist_px": dist[mask],
+                "aapki_x":  aapki_df.loc[idx[mask], "x"].to_numpy(),
+                "aapki_y":  aapki_df.loc[idx[mask], "y"].to_numpy(),
+                "aapki_mag": aapki_df.loc[idx[mask], "mag"].to_numpy(),
+                "dist_px":  dist[mask],
             })
-            match["dx"] = match["aapki_x"] - match["iraf_x"]
-            match["dy"] = match["aapki_y"] - match["iraf_y"]
-            match["dmag"] = match["aapki_mag"] - match["iraf_mag"]
-            return match
+            df["dx"] = df["aapki_x"] - df["iraf_x"]
+            df["dy"] = df["aapki_y"] - df["iraf_y"]
+            df["dmag"] = df["aapki_mag"] - df["iraf_mag"]
+            return df
 
         match = _match_with_iraf(iraf)
         if not match.empty:
-            dx_med = float(np.nanmedian(match["dx"]))
-            dy_med = float(np.nanmedian(match["dy"]))
+            shift_x = _auto_axis_shift(float(np.nanmedian(match["dx"])))
+            shift_y = _auto_axis_shift(float(np.nanmedian(match["dy"])))
+            if shift_x != 0.0 or shift_y != 0.0:
+                iraf_adj = iraf.copy()
+                iraf_adj["x"] += shift_x
+                iraf_adj["y"] += shift_y
+                match = _match_with_iraf(iraf_adj)
         else:
-            dx_med = np.nan
-            dy_med = np.nan
+            shift_x = shift_y = 0.0
 
-        shift_x = _auto_axis_shift(dx_med)
-        shift_y = _auto_axis_shift(dy_med)
-        if (shift_x != 0.0) or (shift_y != 0.0):
-            iraf_adj = iraf.copy()
-            iraf_adj["x"] = iraf_adj["x"] + shift_x
-            iraf_adj["y"] = iraf_adj["y"] + shift_y
-            match = _match_with_iraf(iraf_adj)
-
+        _empty_info = {
+            "r_ap": r_ap, "fwhm": fwhm, "aperture_mult": iraf_p["aperture_mult"],
+            "best_shift_x": np.nan, "best_shift_y": np.nan,
+            "dist_med": np.nan, "dist_p95": np.nan,
+            "frac_within_tol": 0.0,
+            "n_iraf_total": n_iraf_total, "n_aapki_total": n_aapki_total,
+        }
         if match.empty:
-            return pd.DataFrame(), {
-                "x_col": x_col,
-                "y_col": y_col,
-                "mag_col": mag_col,
-                "best_shift_x": np.nan,
-                "best_shift_y": np.nan,
-                "dist_med": np.nan,
-                "dist_p95": np.nan,
-                "frac_within_tol": 0.0,
-                "n_iraf_total": n_iraf_total,
-                "n_aapki_total": n_aapki_total,
-            }
+            return pd.DataFrame(), _empty_info
 
         dist_vals = match["dist_px"].to_numpy(float)
-        dist_med = float(np.nanmedian(dist_vals)) if dist_vals.size else np.nan
-        dist_p95 = float(np.nanpercentile(dist_vals, 95)) if dist_vals.size else np.nan
-        frac_within = float(np.mean(dist_vals <= self.tol_px)) if dist_vals.size else 0.0
-
-        best_shift_x = BASE_IRAF_SHIFT + shift_x
-        best_shift_y = BASE_IRAF_SHIFT + shift_y
-
         return match, {
-            "x_col": x_col,
-            "y_col": y_col,
-            "mag_col": mag_col,
-            "best_shift_x": best_shift_x,
-            "best_shift_y": best_shift_y,
-            "dist_med": dist_med,
-            "dist_p95": dist_p95,
-            "frac_within_tol": frac_within,
+            "r_ap": r_ap, "fwhm": fwhm, "aperture_mult": iraf_p["aperture_mult"],
+            "best_shift_x": BASE_IRAF_SHIFT + shift_x,
+            "best_shift_y": BASE_IRAF_SHIFT + shift_y,
+            "dist_med": float(np.nanmedian(dist_vals)),
+            "dist_p95": float(np.nanpercentile(dist_vals, 95)),
+            "frac_within_tol": float(np.mean(dist_vals <= self.tol_px)),
             "n_iraf_total": n_iraf_total,
             "n_aapki_total": n_aapki_total,
         }
@@ -486,16 +651,10 @@ class IRAFComparisonWindow(QMainWindow):
         settings_group = QGroupBox("Paths and Settings")
         settings_layout = QFormLayout()
 
-        # AAPKI result directory
-        aapki_row = QHBoxLayout()
-        self.aapki_edit = QLineEdit(str(self.result_dir))
-        aapki_btn = QPushButton("Browse")
-        aapki_btn.clicked.connect(lambda: self._browse_dir(self.aapki_edit))
-        aapki_row.addWidget(self.aapki_edit)
-        aapki_row.addWidget(aapki_btn)
-        aapki_widget = QWidget()
-        aapki_widget.setLayout(aapki_row)
-        settings_layout.addRow("AAPKI Result Dir:", aapki_widget)
+        # AAPKI: auto-detected from params (data_dir + step4 detect CSVs)
+        info_label = QLabel(f"AAPKI data: {self.data_dir}  (step4 detect positions + IRAF aperture re-measurement)")
+        info_label.setWordWrap(True)
+        settings_layout.addRow("AAPKI Source:", info_label)
 
         # IRAF result directory
         iraf_row = QHBoxLayout()
@@ -515,11 +674,6 @@ class IRAFComparisonWindow(QMainWindow):
         self.tol_spin.setSingleStep(0.1)
         self.tol_spin.setValue(1.5)
         settings_layout.addRow("Match Tolerance (px):", self.tol_spin)
-
-        # Position mode
-        self.pos_combo = QComboBox()
-        self.pos_combo.addItems(["xcenter/ycenter", "x_init/y_init"])
-        settings_layout.addRow("AAPKI Position:", self.pos_combo)
 
         # IRAF file mode
         self.iraf_combo = QComboBox()
@@ -622,15 +776,20 @@ class IRAFComparisonWindow(QMainWindow):
             line_edit.setText(path)
 
     def run_comparison(self):
-        aapki_dir = Path(self.aapki_edit.text())
         iraf_dir = Path(self.iraf_edit.text())
-
-        if not aapki_dir.exists():
-            QMessageBox.warning(self, "Error", f"AAPKI directory not found:\n{aapki_dir}")
-            return
         if not iraf_dir.exists():
             QMessageBox.warning(self, "Error", f"IRAF directory not found:\n{iraf_dir}")
             return
+
+        P = self.params.P
+        data_dir = Path(P.data_dir)
+        result_dir = Path(P.result_dir)
+        cache_dir = Path(getattr(P, "cache_dir", result_dir / "cache"))
+        if not cache_dir.is_absolute():
+            cache_dir = result_dir / cache_dir
+        toml_path = Path(getattr(self.params, "param_file",
+                                 getattr(P, "param_file", "parameters.toml")))
+        prefix = str(getattr(P, "filename_prefix", ""))
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -639,11 +798,14 @@ class IRAFComparisonWindow(QMainWindow):
         self.log_text.clear()
 
         self.worker = IRAFComparisonWorker(
-            aapki_dir=aapki_dir,
+            data_dir=data_dir,
+            result_dir=result_dir,
+            cache_dir=cache_dir,
             iraf_dir=iraf_dir,
+            toml_path=toml_path,
             tol_px=self.tol_spin.value(),
-            pos_mode=self.pos_combo.currentText(),
             iraf_mode=self.iraf_combo.currentText(),
+            filename_prefix=prefix,
         )
 
         self.worker.progress.connect(self._on_progress)
@@ -863,7 +1025,7 @@ class IRAFComparisonWindow(QMainWindow):
             QMessageBox.information(self, "Export", "No data to export.")
             return
 
-        out_dir = Path(self.aapki_edit.text()) / "iraf_comparison"
+        out_dir = self.result_dir / "iraf_comparison"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Export all matches

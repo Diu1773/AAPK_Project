@@ -424,3 +424,134 @@ The recommended enhancements would elevate this tool from a **teaching pipeline*
 ---
 
 *End of Review*
+
+---
+
+## 5. Step 6 PSF Photometry — QC 탭 설계 (미구현)
+
+> **작성일**: 2026-03-02
+> **현황**: 설계 문서. 구현 전.
+> **관련 파일**: `aperture_photometry/gui/workflow/step6_psf_photometry.py`
+
+### 5.1 배경
+
+Step 4 Detection에는 이미 "QC" 탭(프레임별 z-score 이상치 검출 목적)이 존재한다.
+Step 6의 QC 탭은 **목적이 다르다** — PSF 측광 결과의 통계 요약 리포트.
+중복 아님. Step 4 QC = 프레임 품질 판정, Step 6 QC = 측광 결과 품질 확인.
+
+### 5.2 탭 구조 변경
+
+현재 Step 6 탭 구성 (추정):
+```
+[설정] [실행/로그]
+```
+
+변경 후:
+```
+[설정] [로그] [QC Report]
+```
+
+- **[로그] 탭**: 기존 실행 버튼 + Worker progress → QTextEdit 로그 창 (step4 방식)
+  - `log_text = QTextEdit(readOnly=True, monospace)`
+  - Worker `progress` signal → `log_text.append()`
+  - 완료/오류도 로그에 표시
+- **[QC Report] 탭**: 측광 완료 후 자동 생성되는 통계 리포트
+
+### 5.3 QC Report 탭 레이아웃
+
+```
+┌──────────────────────────────────────────────────────┐
+│  [Refresh QC]                              [Export]  │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  ── 개요 ──────────────────────────────────────────  │
+│  총 프레임 | 39개 (g:14, r:13, i:12)                │
+│  총 검출   | 33,441개                                │
+│  flags=0   | 33,369 / 33,441 = 99.8%                │
+│                                                      │
+│  ── 1. 필터별 검출 통계 ────────────────────────────  │
+│  [QTableWidget: 필터 | 프레임 | 평균검출 | 성공률 |  │
+│                실패율 | iter2추가]                   │
+│                                                      │
+│  ── 2. 등급 범위 및 오차 ───────────────────────────  │
+│  [QTableWidget: 필터 | mag범위 | 평균 | 중앙값 | σ]  │
+│  [QTableWidget: 구간 | g_err | r_err | i_err]        │
+│                                                      │
+│  ── 3. SNR 분포 (flags=0) ──────────────────────────  │
+│  [QTableWidget: 필터 | 10pct | median | 90pct]       │
+│                                                      │
+│  ── 4. PSF 적합 품질 (qfit) ────────────────────────  │
+│  [QTableWidget: 필터 | qfit중앙값 | 불량(>5) 비율]   │
+│  ⚠ g밴드 3.9% 불량 fit → 이후 단계 컷 권장          │
+│                                                      │
+│  ── 5. Residual STD ────────────────────────────────  │
+│  [QTableWidget: 필터 | iter1 STD | iter2 STD | 개선] │
+│                                                      │
+│  ── 6. Ap vs PSF 비교 ──────────────────────────────  │
+│  [QTableWidget: 필터 | n_common | median(ap-psf) |   │
+│                        σ(ap-psf) | n_outlier]        │
+│  → step5 aperture 결과와 교차 비교                   │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+### 5.4 데이터 소스
+
+| 섹션 | 읽는 파일 | 비고 |
+|------|-----------|------|
+| 개요, 1번 | `step6_psf/photometry_index.csv` | 항상 존재 |
+| 2, 3, 4번 | `step6_psf/photometry_*.tsv` 전체 로드 | pandas concat |
+| 5번 | `step6_psf/residual_meta_*.json` 전체 | json glob |
+| 6번 (Ap vs PSF) | `step5_aperture/photometry_*.tsv` + step6 TSV | det_uid 기준 join |
+
+### 5.5 구현 포인트
+
+```python
+class PsfQcPanel(QWidget):
+    """Step 6 완료 후 QC Report 탭에 표시되는 패널."""
+
+    def refresh(self, psf_dir: Path, ap_dir: Path):
+        """측광 완료 시 또는 [Refresh QC] 클릭 시 호출."""
+        idx = pd.read_csv(psf_dir / "photometry_index.csv")
+        tsv_files = sorted(psf_dir.glob("photometry_*.tsv"))
+        all_df = pd.concat([pd.read_csv(f, sep='\t') for f in tsv_files])
+        meta_files = sorted(psf_dir.glob("residual_meta_*.json"))
+        # ... 각 섹션별 QTableWidget 업데이트
+        self._fill_overview(idx, all_df)
+        self._fill_filter_stats(idx)
+        self._fill_mag_stats(all_df)
+        self._fill_snr(all_df)
+        self._fill_qfit(all_df)
+        self._fill_residual(meta_files)
+        self._fill_ap_vs_psf(ap_dir, all_df)
+
+    def _warn_if_bad(self, filt, bad_pct):
+        """qfit 불량률 > 5% 이면 경고 라벨 표시."""
+        pass
+```
+
+- Step 6 Worker 완료 signal → `qc_panel.refresh()` 자동 호출
+- `[Refresh QC]` 버튼으로 수동 재실행도 가능 (이미 완료된 결과 재확인용)
+- `[Export]` 버튼 → `step6_psf/qc_report.txt` 텍스트 파일 저장 (ASCII 테이블 형식)
+
+### 5.6 Ap vs PSF 비교 섹션 상세
+
+```
+필터 | 공통소스 수 | median(ap−psf) | σ(ap−psf) | |ap−psf|>0.1 비율
+  g  |    9,800   |   −0.023 mag   |  0.031 mag |     4.2%
+  r  |   10,500   |   −0.018 mag   |  0.027 mag |     3.1%
+  i  |   11,200   |   −0.012 mag   |  0.022 mag |     1.8%
+```
+
+- det_uid 기준으로 step5 + step6 TSV inner join
+- 체계적 offset(median ap−psf)이 크면 → aperture correction 문제 시사
+- σ 크면 → 혼잡 영역에서 두 방법 차이 큼
+
+### 5.7 Step 4 QC 탭과의 차별화
+
+| | Step 4 QC 탭 | Step 6 QC Report 탭 |
+|--|-------------|---------------------|
+| 목적 | 프레임 품질 판정 (이상 프레임 제거) | 측광 결과 품질 확인 |
+| 액션 | QC 실패 프레임 제외 → 다음 단계 영향 | 참고용 통계 (제외 없음) |
+| 주요 지표 | z-score, FWHM outlier | qfit, SNR, mag_err, Ap vs PSF |
+| 자동화 | 자동 판정 + 경고 | 통계 표시만 (판정은 사용자) |

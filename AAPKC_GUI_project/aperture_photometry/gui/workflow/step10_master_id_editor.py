@@ -1,5 +1,5 @@
 """
-Step 7: Master Star IDs Editor
+Step 10: Master Star IDs Editor
 Ported from AAPKI_GUI.ipynb Cell 10 (GUI adaptation).
 """
 
@@ -21,18 +21,20 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.patches import Circle as MplCircle
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QDialog, QFormLayout, QDialogButtonBox, QProgressBar,
     QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QWidget, QComboBox,
-    QSlider
+    QSlider, QColorDialog, QFrame
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QPoint
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, step9_dir, crop_is_active
+from ...utils.step_paths import step2_cropped_dir, step5_dir, step6_dir, step7_dir, step8_dir, step9_dir, step6_psf_dir, crop_is_active
 from ...utils.io_utils import (
     parse_int64_scalar,
     parse_int64_series,
@@ -42,7 +44,7 @@ from ...utils.io_utils import (
 
 
 class MasterIdEditorWindow(StepWindowBase):
-    """Step 7: Master Star IDs Editor"""
+    """Step 10: Master Star IDs Editor"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -90,6 +92,33 @@ class MasterIdEditorWindow(StepWindowBase):
         self._scat_gaia = None
         self._scat_member = None
         self._scat_selected = None
+        self._scat_psf_iter2 = None
+
+        # PSF iter2 source tracking (det_uid < 0)
+        self.psf_iter2_ids: set = set()
+
+        # CMD ROI (circle in image pixel coords, saved to cmd_roi.json)
+        self._roi_circle: dict | None = None   # {cx, cy, radius}
+        self._roi_patch = None                 # matplotlib Circle artist on ax
+        self._roi_preview_patch = None         # temporary preview during drag
+        self._roi_mode = False                 # draw-mode toggle
+        self._roi_drag_start: tuple | None = None
+
+        # Overlay color customization
+        self._overlay_colors: dict = {
+            "gaia":      "#00FF00",
+            "member":    "#FF4DA6",
+            "psf_iter2": "#FF5722",
+            "local":     "#00BCD4",
+            "removed":   "#FFEB3B",
+            "unmatched": "#FF9800",
+            "selected":  "#FF0000",
+        }
+        self._color_window: "QWidget | None" = None
+        self._color_btns: dict = {}
+        self._overlay_visible: dict = {k: True for k in (
+            "gaia", "member", "psf_iter2", "local", "removed", "unmatched", "selected"
+        )}
 
         # Frame data caches: filename -> data  (LRU, max _FITS_CACHE_SIZE entries)
         self._fits_cache: dict = {}        # filename -> (image_data, header)
@@ -105,7 +134,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._display_cache_order: list = []
 
         super().__init__(
-            step_index=7,
+            step_index=9,
             step_name="Master ID Editor",
             params=params,
             project_state=project_state,
@@ -135,6 +164,15 @@ class MasterIdEditorWindow(StepWindowBase):
         btn_log.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 15px; }")
         btn_log.clicked.connect(self.show_log_window)
         control_layout.addWidget(btn_log)
+
+        self.btn_colors = QPushButton("🎨 Colors")
+        self.btn_colors.setCheckable(True)
+        self.btn_colors.setStyleSheet(
+            "QPushButton { background-color: #455A64; color: white; font-weight: bold; padding: 8px 12px; }"
+            "QPushButton:checked { background-color: #78909C; }"
+        )
+        self.btn_colors.toggled.connect(self._toggle_color_panel)
+        control_layout.addWidget(self.btn_colors)
 
         self.content_layout.addLayout(control_layout)
 
@@ -210,6 +248,29 @@ class MasterIdEditorWindow(StepWindowBase):
         stretch_layout.addStretch()
         viewer_layout.addLayout(stretch_layout)
 
+        # CMD ROI controls
+        roi_layout = QHBoxLayout()
+        self.btn_set_roi = QPushButton("Set CMD ROI")
+        self.btn_set_roi.setCheckable(True)
+        self.btn_set_roi.setToolTip("Click to enter ROI draw mode, then click+drag on the image to define a circle.\nThis ROI filters sources shown in the CMD (ZP/photometry are unaffected).")
+        self.btn_set_roi.setStyleSheet(
+            "QPushButton { background-color: #37474F; color: white; font-weight: bold; padding: 4px 10px; }"
+            "QPushButton:checked { background-color: #00BCD4; color: black; }"
+        )
+        self.btn_set_roi.toggled.connect(self._on_set_roi_toggled)
+        roi_layout.addWidget(self.btn_set_roi)
+
+        self.btn_clear_roi = QPushButton("Clear ROI")
+        self.btn_clear_roi.setStyleSheet("QPushButton { background-color: #546E7A; color: white; padding: 4px 10px; }")
+        self.btn_clear_roi.clicked.connect(self._on_clear_roi)
+        roi_layout.addWidget(self.btn_clear_roi)
+
+        self.roi_info_label = QLabel("No ROI set")
+        self.roi_info_label.setStyleSheet("QLabel { color: #90A4AE; font-size: 9pt; }")
+        roi_layout.addWidget(self.roi_info_label)
+        roi_layout.addStretch()
+        viewer_layout.addLayout(roi_layout)
+
         self.figure = Figure(figsize=(6, 5))
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
@@ -242,6 +303,9 @@ class MasterIdEditorWindow(StepWindowBase):
 
         self.content_layout.addLayout(main_layout)
 
+        # Floating color-legend window (built now, shown on demand)
+        self._color_window = self._build_color_window()
+
         self.log_window = QWidget(self, Qt.Window)
         self.log_window.setWindowTitle("Master ID Log")
         self.log_window.resize(700, 350)
@@ -253,7 +317,9 @@ class MasterIdEditorWindow(StepWindowBase):
 
         self.populate_file_list()
         self.load_master_ids()
+        self.load_psf_new_sources()
         self.load_gaia_catalog()
+        self._load_roi()
 
     def log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -298,14 +364,14 @@ class MasterIdEditorWindow(StepWindowBase):
                     wcs_ok = pd.Series(True, index=s7.index, dtype=bool)
                 keep = set(s7.loc[wcs_ok, "file"].astype(str).tolist())
                 files = [f for f in files if f in keep]
-                self.log(f"Step8 frame filter (wcs_ok): {len(files)}/{base_count} kept")
+                self.log(f"Step10 frame filter (wcs_ok): {len(files)}/{base_count} kept")
 
-        # Also hide frames without Step7 idmatch output.
+        # Also hide frames without Step9 ID-match output.
         idmatch_dir = self.params.P.cache_dir / "idmatch"
         if idmatch_dir.exists():
             before_idm = len(files)
             files = [f for f in files if (idmatch_dir / f"idmatch_{f}.csv").exists()]
-            self.log(f"Step8 frame filter (idmatch csv): {len(files)}/{before_idm} kept")
+            self.log(f"Step10 frame filter (Step9 idmatch csv): {len(files)}/{before_idm} kept")
 
         self.file_list = list(files)
         self.file_combo.clear()
@@ -427,18 +493,69 @@ class MasterIdEditorWindow(StepWindowBase):
                         self.source_id_from_internal[id_i] = sid_i
                     for sid_i in sorted(self.master_ids):
                         self._ensure_stable_id(sid_i)
-                    # Fallback: preload Gaia G magnitudes from Step6 ref catalog.
+                    # Fallback: preload Gaia G magnitudes from Step8 RefBuild catalog (legacy path).
                     self._load_step6_gmag_map()
                     self.log(f"Loaded {len(self.master_ids)} master IDs from {master_path.name}")
                     self.update_master_table()
             except Exception as e:
                 self.log(f"Error loading master IDs: {e}")
 
+    def load_psf_new_sources(self):
+        """Step 6 PSF iter2에서 발견된 새 소스(det_uid < 0)를 마스터 목록에 추가.
+
+        PSF 측광 iter2에서 잔차 이미지로부터 새로 검출된 별들은 음수 det_uid를
+        가진다. 이 소스들은 RefBuild ref catalog에 없으므로 별도로 master_id를
+        부여하여 마스터 목록에 추가한다.
+        """
+        psf_dir = step6_psf_dir(self.params.P.result_dir)
+        if not psf_dir.exists():
+            return
+
+        rows = []
+        for tsv in sorted(psf_dir.glob("photometry_*.tsv")):
+            try:
+                df = pd.read_csv(tsv, sep="\t")
+                if "det_uid" not in df.columns or "iter_found" not in df.columns:
+                    continue
+                new = df[(pd.to_numeric(df["det_uid"], errors="coerce") < 0) &
+                         (pd.to_numeric(df["iter_found"], errors="coerce") > 1)].copy()
+                if not new.empty:
+                    fname = tsv.name.replace("photometry_", "").replace(".tsv", "")
+                    new["_source_file"] = fname
+                    rows.append(new)
+            except Exception:
+                continue
+
+        if not rows:
+            return
+
+        all_new = pd.concat(rows, ignore_index=True)
+        # per det_uid 대표값 (첫 번째 등장 프레임 기준)
+        unique_new = all_new.groupby("det_uid", as_index=False).first()
+        n_new = len(unique_new)
+        if n_new == 0:
+            return
+
+        # 기존 master_id 최대값 다음부터 부여 (Gaia source_id와 충돌 없이 음수 psf_uid 사용)
+        # PSF 새 소스는 source_id = det_uid (음수) 로 내부 식별
+        added = 0
+        for _, row in unique_new.iterrows():
+            det_uid = int(row["det_uid"])
+            if det_uid not in self.internal_id_map:
+                self._ensure_stable_id(det_uid)
+                self.master_ids.add(det_uid)
+                added += 1
+            self.psf_iter2_ids.add(det_uid)
+
+        if added > 0:
+            self.log(f"PSF new sources: {added} iter2 소스 master_id 부여 완료 (det_uid<0)")
+            self.update_master_table()
+
     def _repair_legacy_step8_source_ids(self) -> dict[int, int]:
         """Repair legacy Step8 source_ids affected by float rounding of Gaia IDs.
 
         Old runs could save Gaia source_id via float path, producing offsets that are
-        typically multiples of 128. This remaps positive IDs to Step6 canonical IDs
+        typically multiples of 128. This remaps positive IDs to Step8 canonical IDs
         when a unique nearby candidate exists.
         """
         sid_map: dict[int, int] = {}
@@ -493,13 +610,13 @@ class MasterIdEditorWindow(StepWindowBase):
                     self.master_gmag_map[new_sid] = self.master_gmag_map[old_sid]
             self.master_ids = repaired_ids
             self.log(
-                "[Step8] Repaired legacy source_id precision drift: "
+                "[Step10] Repaired legacy source_id precision drift: "
                 f"mapped={repaired_count}, ambiguous={ambiguous}, unresolved={unresolved}"
             )
         return sid_map
 
     def _load_step6_gmag_map(self):
-        """Fallback G-mag map from Step6 ref catalog when Gaia lookup is unavailable."""
+        """Fallback G-mag map from Step8 RefBuild catalog (legacy step6_refbuild path)."""
         candidates = [
             step6_dir(self.params.P.result_dir) / "ref_catalog.tsv",
             self.params.P.result_dir / "ref_catalog.tsv",
@@ -538,7 +655,7 @@ class MasterIdEditorWindow(StepWindowBase):
                 break
 
     def _load_global_id_map(self):
-        """Load source_id -> ID map generated by Step 6 (RefBuild)."""
+        """Load source_id -> ID map generated by Step 8/9 (legacy path compatible)."""
         self._global_id_map = {}
         candidates = [
             step6_dir(self.params.P.result_dir) / "sourceid_to_ID.csv",
@@ -574,7 +691,7 @@ class MasterIdEditorWindow(StepWindowBase):
         if sid in self.internal_id_map:
             return int(self.internal_id_map[sid])
 
-        # Prefer Step 7 global mapping when conflict-free.
+        # Prefer global ID mapping from upstream ID match when conflict-free.
         gid = self._global_id_map.get(sid)
         if gid is not None:
             gid = int(gid)
@@ -903,7 +1020,7 @@ class MasterIdEditorWindow(StepWindowBase):
                 )
                 return
 
-        # Fallback: compute membership from Step6 astrometric columns.
+        # Fallback: compute membership from RefBuild astrometric columns (Step8; legacy path compatible).
         if self._compute_membership_from_master():
             return
 
@@ -1154,7 +1271,11 @@ class MasterIdEditorWindow(StepWindowBase):
                 self.ylim_original = None
                 self._imshow_obj = None
             self.load_idmatch_for_file(filename)
-            self.display_image(full_redraw=(self._imshow_obj is None))
+            full_redraw = self._imshow_obj is None
+            self.display_image(full_redraw=full_redraw)
+            if not full_redraw:
+                # Fast path skipped display_image's full rebuild; refresh ROI for new WCS
+                self._redraw_roi_patch()
             self.update_overlay()
             if self._auto_master_dirty:
                 self.save_master_ids(log_action="auto_add")
@@ -1277,22 +1398,30 @@ class MasterIdEditorWindow(StepWindowBase):
             vmin=0, vmax=1, interpolation='nearest'
         )
         # Pre-create persistent scatter artists (updated via set_offsets, no remove/recreate)
+        c = self._overlay_colors
         self._scat_unmatched = self.ax.scatter([], [], s=20, facecolors='none',
-                                               edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+                                               edgecolors=c["unmatched"], linewidths=0.8, alpha=0.7)
         self._scat_removed   = self.ax.scatter([], [], s=22, facecolors='none',
-                                               edgecolors='yellow', linewidths=0.9, alpha=0.75)
+                                               edgecolors=c["removed"], linewidths=0.9, alpha=0.75)
         self._scat_local     = self.ax.scatter([], [], s=26, facecolors='none',
-                                               edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+                                               edgecolors=c["local"], linewidths=1.0, alpha=0.8)
         self._scat_gaia      = self.ax.scatter([], [], s=28, facecolors='none',
-                                               edgecolors='lime', linewidths=1.1, alpha=0.85)
+                                               edgecolors=c["gaia"], linewidths=1.1, alpha=0.85)
+        self._scat_psf_iter2 = self.ax.scatter([], [], s=32, facecolors='none',
+                                               edgecolors=c["psf_iter2"], linewidths=1.2, alpha=0.85)
         self._scat_member    = self.ax.scatter([], [], s=30, facecolors='none',
-                                               edgecolors='#FF4DA6', linewidths=1.2, alpha=0.9)
+                                               edgecolors=c["member"], linewidths=1.2, alpha=0.9)
         self._scat_selected  = self.ax.scatter([], [], s=60, facecolors='none',
-                                               edgecolors='red', linewidths=1.5, alpha=0.9)
+                                               edgecolors=c["selected"], linewidths=1.5, alpha=0.9)
 
         self.ax.set_title(title)
         self.ax.set_xlabel("X")
         self.ax.set_ylabel("Y")
+
+        # Re-add ROI patch (ax.clear() removes it)
+        self._roi_patch = None
+        self._roi_preview_patch = None
+        self._redraw_roi_patch()
 
         if self.xlim_original is None:
             self.xlim_original = self.ax.get_xlim()
@@ -1320,7 +1449,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if self.idmatch_df is None or self.idmatch_df.empty:
             for s in (self._scat_unmatched, self._scat_removed,
-                      self._scat_local, self._scat_gaia, self._scat_member, self._scat_selected):
+                      self._scat_local, self._scat_psf_iter2, self._scat_gaia, self._scat_member, self._scat_selected):
                 s.set_offsets(empty)
             self.canvas.draw_idle()
             return
@@ -1346,7 +1475,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if sids.size == 0:
             for s in (self._scat_unmatched, self._scat_removed,
-                      self._scat_local, self._scat_gaia, self._scat_member, self._scat_selected):
+                      self._scat_local, self._scat_psf_iter2, self._scat_gaia, self._scat_member, self._scat_selected):
                 s.set_offsets(empty)
             self.canvas.draw_idle()
             return
@@ -1379,15 +1508,32 @@ class MasterIdEditorWindow(StepWindowBase):
                 is_member[idx_gaia] = np.isfinite(pmem) & (pmem >= thr)
         is_gaia_nonmember = is_gaia_master & (~is_member)
 
-        self._scat_unmatched.set_offsets(self._safe_offsets(x[is_unmatched], y[is_unmatched]))
-        self._scat_removed.set_offsets(self._safe_offsets(x[is_removed], y[is_removed]))
-        self._scat_local.set_offsets(self._safe_offsets(x[is_local_master], y[is_local_master]))
-        self._scat_gaia.set_offsets(self._safe_offsets(x[is_gaia_nonmember], y[is_gaia_nonmember]))
-        self._scat_member.set_offsets(self._safe_offsets(x[is_member], y[is_member]))
+        # Split local sources: PSF iter2 (det_uid<0 from PSF residuals) vs other local
+        if self.psf_iter2_ids:
+            _psf2_arr = np.fromiter(self.psf_iter2_ids, dtype=np.int64, count=len(self.psf_iter2_ids))
+            is_psf_iter2   = is_local_master & np.isin(sids, _psf2_arr)
+            is_local_other = is_local_master & ~is_psf_iter2
+        else:
+            is_psf_iter2   = np.zeros(len(sids), dtype=bool)
+            is_local_other = is_local_master
+
+        vis = self._overlay_visible
+
+        def _off(mask, key):
+            return self._safe_offsets(x[mask], y[mask]) if vis.get(key, True) else empty
+
+        self._scat_unmatched.set_offsets(_off(is_unmatched,    "unmatched"))
+        self._scat_removed.set_offsets(  _off(is_removed,      "removed"))
+        self._scat_local.set_offsets(    _off(is_local_other,  "local"))
+        self._scat_psf_iter2.set_offsets(_off(is_psf_iter2,    "psf_iter2"))
+        self._scat_gaia.set_offsets(     _off(is_gaia_nonmember, "gaia"))
+        self._scat_member.set_offsets(   _off(is_member,       "member"))
 
         if self.selected_source_id is not None:
             sel_mask = sids == self.selected_source_id
-            self._scat_selected.set_offsets(self._safe_offsets(x[sel_mask], y[sel_mask]))
+            self._scat_selected.set_offsets(
+                self._safe_offsets(x[sel_mask], y[sel_mask]) if vis.get("selected", True) else empty
+            )
         else:
             self._scat_selected.set_offsets(empty)
 
@@ -1398,6 +1544,8 @@ class MasterIdEditorWindow(StepWindowBase):
             return
         if event.button != 1:
             return
+        if self._roi_mode:
+            return  # handled by on_button_press/release
         x, y = event.xdata, event.ydata
         if x is None or y is None:
             return
@@ -1801,6 +1949,131 @@ class MasterIdEditorWindow(StepWindowBase):
             master_path = self.params.P.result_dir / "master_star_ids.csv"
         return master_path.exists()
 
+    # ── Color legend floating window ─────────────────────────────────────────
+
+    def _build_color_window(self) -> QWidget:
+        """Build the overlay color/visibility window (floating, Qt.Tool)."""
+        win = QWidget(None, Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        win.setWindowTitle("Overlay Colors")
+        win.setFixedWidth(200)
+        win.closeEvent = lambda e: (self.btn_colors.setChecked(False), e.accept())
+
+        layout = QVBoxLayout(win)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        hint = QLabel("Left-click: toggle on/off\nRight-click: change color")
+        hint.setStyleSheet("color: #888; font-size: 8pt;")
+        layout.addWidget(hint)
+
+        entries = [
+            ("gaia",      "Gaia (master)"),
+            ("member",    "Membership"),
+            ("psf_iter2", "PSF iter2 (new)"),
+            ("local",     "Local (other)"),
+            ("removed",   "Removed"),
+            ("unmatched", "Unmatched"),
+            ("selected",  "Selected"),
+        ]
+        for key, label_text in entries:
+            row_w = QWidget()
+            row = QHBoxLayout(row_w)
+            row.setContentsMargins(0, 2, 0, 2)
+            row.setSpacing(8)
+
+            btn = QPushButton()
+            btn.setFixedSize(24, 24)
+            btn.setCheckable(True)
+            btn.setChecked(True)
+            btn.setToolTip("Left-click: toggle  |  Right-click: change color")
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda _, k=key: self._on_pick_color(k))
+            btn.toggled.connect(lambda on, k=key: self._toggle_layer_visible(k, on))
+            self._color_btns[key] = btn
+            self._refresh_color_btn(key)
+
+            lbl = QLabel(label_text)
+            row.addWidget(btn)
+            row.addWidget(lbl)
+            row.addStretch()
+            layout.addWidget(row_w)
+
+        layout.addStretch()
+        return win
+
+    def _refresh_color_btn(self, key: str):
+        """Update a color button's appearance based on current color + visibility."""
+        btn = self._color_btns.get(key)
+        if btn is None:
+            return
+        visible = self._overlay_visible.get(key, True)
+        color = self._overlay_colors.get(key, "#ffffff")
+        if visible:
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {color}; border: 2px solid #aaa; border-radius: 3px; }}"
+                f"QPushButton:hover {{ border: 2px solid #fff; }}"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton { background-color: #333; border: 2px solid #555; border-radius: 3px; "
+                "color: #666; }"
+            )
+
+    def _toggle_layer_visible(self, key: str, on: bool):
+        """Toggle a specific overlay layer on/off."""
+        self._overlay_visible[key] = on
+        self._refresh_color_btn(key)
+        self.update_overlay()
+
+    def _on_pick_color(self, key: str):
+        cur = QColor(self._overlay_colors.get(key, "#ffffff"))
+        col = QColorDialog.getColor(cur, self, f"Pick color — {key}")
+        if not col.isValid():
+            return
+        hex_color = col.name()
+        self._overlay_colors[key] = hex_color
+        self._refresh_color_btn(key)
+        # Update live scatter artist edge color
+        scat_map = {
+            "gaia":      "_scat_gaia",
+            "member":    "_scat_member",
+            "psf_iter2": "_scat_psf_iter2",
+            "local":     "_scat_local",
+            "removed":   "_scat_removed",
+            "unmatched": "_scat_unmatched",
+            "selected":  "_scat_selected",
+        }
+        scat = getattr(self, scat_map.get(key, ""), None)
+        if scat is not None:
+            scat.set_edgecolors(hex_color)
+            if self.canvas is not None:
+                self.canvas.draw_idle()
+
+    def _toggle_color_panel(self, checked: bool):
+        if self._color_window is None:
+            return
+        if checked:
+            # Position to the left of this widget
+            top_left = self.mapToGlobal(QPoint(0, 0))
+            win_w = self._color_window.sizeHint().width() or 200
+            x = max(0, top_left.x() - win_w - 8)
+            y = top_left.y()
+            self._color_window.move(x, y)
+            self._color_window.show()
+            self._color_window.raise_()
+        else:
+            self._color_window.hide()
+
+    @staticmethod
+    def _apply_color_btn_style(btn: QPushButton, color: str):
+        """Legacy helper kept for compat — use _refresh_color_btn instead."""
+        btn.setStyleSheet(
+            f"QPushButton {{ background-color: {color}; border: 2px solid #aaa; border-radius: 3px; }}"
+            f"QPushButton:hover {{ border: 2px solid #fff; }}"
+        )
+
+    # ────────────────────────────────────────────────────────────────────────
+
     def save_state(self):
         state_data = {
             "search_radius_px": getattr(self.params.P, "search_radius_px", 7.0),
@@ -1817,6 +2090,127 @@ class MasterIdEditorWindow(StepWindowBase):
             for key, val in state_data.items():
                 if hasattr(self.params.P, key):
                     setattr(self.params.P, key, val)
+
+    # ------------------------------------------------------------------
+    # CMD ROI helpers
+    # ------------------------------------------------------------------
+    def _roi_path(self) -> Path:
+        return step8_dir(self.params.P.result_dir) / "cmd_roi.json"
+
+    def _load_roi(self):
+        p = self._roi_path()
+        try:
+            if p.exists():
+                self._roi_circle = json.loads(p.read_text())
+            else:
+                self._roi_circle = None
+        except Exception:
+            self._roi_circle = None
+        self._update_roi_info_label()
+
+    def _save_roi(self):
+        p = self._roi_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if self._roi_circle:
+                p.write_text(json.dumps(self._roi_circle))
+            elif p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    def _pixels_to_sky_roi(self, cx_px: float, cy_px: float, r_px: float) -> dict | None:
+        """Convert pixel-space ROI to sky ROI {ra_deg, dec_deg, radius_arcsec} using current frame WCS."""
+        if self.header is None:
+            return None
+        try:
+            wcs = WCS(self.header, naxis=2)
+            ra, dec = wcs.all_pix2world([[cx_px, cy_px]], 0)[0]
+            # pixel scale: sqrt(|det(CD matrix)|) in deg/px → arcsec/px
+            ps_deg = float(np.sqrt(abs(np.linalg.det(wcs.pixel_scale_matrix))))
+            ps_arcsec = ps_deg * 3600.0
+            if ps_arcsec <= 0:
+                ps_arcsec = float(getattr(self.params.P, "pixel_scale_arcsec", 1.0))
+            return {
+                "ra_deg": float(ra),
+                "dec_deg": float(dec),
+                "radius_arcsec": r_px * ps_arcsec,
+            }
+        except Exception:
+            return None
+
+    def _sky_roi_to_pixels(self) -> tuple[float, float, float] | None:
+        """Convert stored sky ROI to pixel coords for the current frame. Returns (cx, cy, r_px) or None."""
+        if self._roi_circle is None or self.header is None:
+            return None
+        try:
+            wcs = WCS(self.header, naxis=2)
+            ra = self._roi_circle["ra_deg"]
+            dec = self._roi_circle["dec_deg"]
+            r_arcsec = self._roi_circle["radius_arcsec"]
+            cx_px, cy_px = wcs.all_world2pix([[ra, dec]], 0)[0]
+            ps_deg = float(np.sqrt(abs(np.linalg.det(wcs.pixel_scale_matrix))))
+            ps_arcsec = ps_deg * 3600.0
+            if ps_arcsec <= 0:
+                ps_arcsec = float(getattr(self.params.P, "pixel_scale_arcsec", 1.0))
+            r_px = r_arcsec / ps_arcsec
+            return float(cx_px), float(cy_px), float(r_px)
+        except Exception:
+            return None
+
+    def _update_roi_info_label(self):
+        if self._roi_circle:
+            ra = self._roi_circle["ra_deg"]
+            dec = self._roi_circle["dec_deg"]
+            r = self._roi_circle["radius_arcsec"]
+            self.roi_info_label.setText(f"ROI: RA={ra:.4f} Dec={dec:.4f}  r={r:.0f}\"")
+            self.roi_info_label.setStyleSheet("QLabel { color: #00E5FF; font-size: 9pt; }")
+        else:
+            self.roi_info_label.setText("No ROI set")
+            self.roi_info_label.setStyleSheet("QLabel { color: #90A4AE; font-size: 9pt; }")
+
+    def _redraw_roi_patch(self):
+        """Draw (or remove) the ROI circle patch, projected to the current frame's pixel coords."""
+        if self._roi_patch is not None:
+            try:
+                self._roi_patch.remove()
+            except Exception:
+                pass
+            self._roi_patch = None
+        if self._roi_circle is not None:
+            pix = self._sky_roi_to_pixels()
+            if pix is not None:
+                cx_px, cy_px, r_px = pix
+                self._roi_patch = MplCircle(
+                    (cx_px, cy_px), r_px, fill=False,
+                    edgecolor='#00E5FF', linestyle='--', linewidth=1.5, alpha=0.85
+                )
+                self.ax.add_patch(self._roi_patch)
+        self.canvas.draw_idle()
+
+    def _on_set_roi_toggled(self, checked: bool):
+        self._roi_mode = checked
+        if checked:
+            self.btn_set_roi.setText("Cancel (click+drag to draw)")
+            self._roi_drag_start = None
+        else:
+            self.btn_set_roi.setText("Set CMD ROI")
+            self._roi_drag_start = None
+            if self._roi_preview_patch is not None:
+                try:
+                    self._roi_preview_patch.remove()
+                except Exception:
+                    pass
+                self._roi_preview_patch = None
+            self.canvas.draw_idle()
+
+    def _on_clear_roi(self):
+        self._roi_circle = None
+        self._save_roi()
+        self._update_roi_info_label()
+        self._redraw_roi_patch()
+
+    # ------------------------------------------------------------------
 
     def show_log_window(self):
         self.log_window.show()
@@ -2182,11 +2576,44 @@ class MasterIdEditorWindow(StepWindowBase):
         self.canvas.draw_idle()
 
     def on_button_press(self, event):
+        if self._roi_mode and event.button == 1 and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                self._roi_drag_start = (event.xdata, event.ydata)
+            return
         if event.button == 3:
             self.panning = True
             self.pan_start = (event.xdata, event.ydata)
 
     def on_button_release(self, event):
+        if self._roi_mode and event.button == 1:
+            if self._roi_drag_start is not None and event.inaxes == self.ax:
+                x0, y0 = self._roi_drag_start
+                x1 = event.xdata if event.xdata is not None else x0
+                y1 = event.ydata if event.ydata is not None else y0
+                r_px = float(np.hypot(x1 - x0, y1 - y0))
+                if r_px >= 1.0:
+                    roi = self._pixels_to_sky_roi(x0, y0, r_px)
+                    if roi is not None:
+                        self._roi_circle = roi
+                        self._save_roi()
+                        self._update_roi_info_label()
+                        if self._roi_preview_patch is not None:
+                            try:
+                                self._roi_preview_patch.remove()
+                            except Exception:
+                                pass
+                            self._roi_preview_patch = None
+                        self._redraw_roi_patch()
+                    else:
+                        self.log("ROI: no WCS in current frame header, cannot convert to sky coords")
+            self._roi_drag_start = None
+            # exit draw mode
+            self.btn_set_roi.blockSignals(True)
+            self.btn_set_roi.setChecked(False)
+            self.btn_set_roi.setText("Set CMD ROI")
+            self.btn_set_roi.blockSignals(False)
+            self._roi_mode = False
+            return
         if event.button == 3:
             self.panning = False
             self.pan_start = None
@@ -2195,6 +2622,24 @@ class MasterIdEditorWindow(StepWindowBase):
         # Track hover position for G key
         if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
             self.hover_xy = (event.xdata, event.ydata)
+
+        # ROI drag preview
+        if self._roi_mode and self._roi_drag_start is not None and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                x0, y0 = self._roi_drag_start
+                r = float(np.hypot(event.xdata - x0, event.ydata - y0))
+                if self._roi_preview_patch is not None:
+                    try:
+                        self._roi_preview_patch.remove()
+                    except Exception:
+                        pass
+                self._roi_preview_patch = MplCircle(
+                    (x0, y0), r, fill=False,
+                    edgecolor='#00E5FF', linestyle=':', linewidth=1.5, alpha=0.7
+                )
+                self.ax.add_patch(self._roi_preview_patch)
+                self.canvas.draw_idle()
+            return
 
         if not self.panning or event.inaxes != self.ax:
             return

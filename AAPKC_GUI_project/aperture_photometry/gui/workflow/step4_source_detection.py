@@ -53,6 +53,9 @@ _DETECT_MODE_PRESETS = {
         "peak_pass_enable": False,
         "peak_nsigma": 3.4,
         "peak_max_add": 500,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",   # faster than linear (photutils>=1.0.1)
     },
     "crowded": {
         "detect_sigma": 3.0,
@@ -66,6 +69,9 @@ _DETECT_MODE_PRESETS = {
         "peak_pass_enable": False,
         "peak_nsigma": 3.8,
         "peak_max_add": 300,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",
     },
     "faint": {
         "detect_sigma": 2.6,
@@ -79,6 +85,9 @@ _DETECT_MODE_PRESETS = {
         "peak_pass_enable": True,
         "peak_nsigma": 2.8,
         "peak_max_add": 1200,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",
     },
 }
 
@@ -162,6 +171,7 @@ class DetectionWorker(QThread):
             deblend_cont = float(getattr(P, 'deblend_cont', 0.004))
             deblend_max_labels = int(getattr(P, 'deblend_max_labels', 4000))
             deblend_label_hard_max = int(getattr(P, 'deblend_label_hard_max', 7000))
+            deblend_mode = str(getattr(P, 'deblend_mode', 'exponential')).strip().lower()
             bkg2d_enable = getattr(P, 'bkg2d_in_detect', True)
             bkg2d_box = int(getattr(P, 'bkg2d_box', 64))
             dao_refine_enable = getattr(P, 'dao_refine_enable', False)
@@ -220,7 +230,7 @@ class DetectionWorker(QThread):
                     else:
                         file_path = self.params.get_file_path(filename)
                     source_sig = {
-                        "cache_schema": 2,
+                        "cache_schema": 3,  # v3: added det_uid column
                         "source_path": str(Path(file_path)).replace("\\", "/").lower(),
                         "source_use_cropped": bool(self.use_cropped),
                         "source_size": None,
@@ -439,7 +449,7 @@ class DetectionWorker(QThread):
                     if bkg2d_enable:
                         if self._stop_requested:
                             return filename, None
-                        ds = max(1, int(getattr(P, 'bkg2d_downsample', 4)))
+                        ds = max(1, int(getattr(P, 'bkg2d_downsample', 8)))
                         k = max(3, int(round(bkg2d_box / ds)))
                         small = data_filled[::ds, ::ds]
                         bkg_small = median_filter(small, size=k, mode="nearest")
@@ -453,7 +463,7 @@ class DetectionWorker(QThread):
                         data_sub = data.copy()
 
                     work = np.where(np.isfinite(data_sub), data_sub, 0.0)
-                    _, bkg_median, _ = sigma_clipped_stats(work, sigma=3.0, maxiters=5)
+                    _, bkg_median, _ = sigma_clipped_stats(work, sigma=3.0, maxiters=3)
                     if self._stop_requested:
                         return filename, None
 
@@ -465,7 +475,7 @@ class DetectionWorker(QThread):
                         return filename, None
 
                     # Threshold (median + nsig * std)
-                    _, mF, stdF = sigma_clipped_stats(fim, sigma=3.0, maxiters=5)
+                    _, mF, stdF = sigma_clipped_stats(fim, sigma=3.0, maxiters=3)
                     bkg_rms = float(stdF)
                     threshold = mF + nsig * max(stdF, 1e-9)
 
@@ -512,20 +522,27 @@ class DetectionWorker(QThread):
                                 if self._stop_requested:
                                     return filename, None
                                 try:
+                                    # mode='exponential' (photutils>=1.0.1) is ~2× faster
+                                    # than 'linear'; falls back gracefully on older versions
                                     segm = deblend_sources(
                                         fim, segm,
                                         npixels=minarea_pix,
                                         nlevels=nlevels,
                                         contrast=cont,
+                                        mode=deblend_mode,
                                         progress_bar=False
                                     )
                                 except TypeError:
-                                    segm = deblend_sources(
-                                        fim, segm,
-                                        npixels=minarea_pix,
-                                        nlevels=nlevels,
-                                        contrast=cont
-                                    )
+                                    # older photutils: no mode/progress_bar kwarg
+                                    try:
+                                        segm = deblend_sources(
+                                            fim, segm,
+                                            npixels=minarea_pix,
+                                            nlevels=nlevels,
+                                            contrast=cont
+                                        )
+                                    except Exception:
+                                        pass  # Keep original segmentation
                                 except Exception:
                                     pass  # Keep original segmentation
                             else:
@@ -535,7 +552,13 @@ class DetectionWorker(QThread):
                         self.worker_status.emit(worker_id, short_name, "Catalog", 75)
 
                         cat = SourceCatalog(work, segm)
-                        tab = cat.to_table(columns=("xcentroid", "ycentroid", "elongation", "segment_flux"))
+                        try:
+                            tab = cat.to_table(columns=("xcentroid", "ycentroid", "elongation", "segment_flux", "area"))
+                            area_col = np.asarray([float(v.value) if hasattr(v, 'value') else float(v)
+                                                   for v in tab["area"]], float)
+                        except Exception:
+                            tab = cat.to_table(columns=("xcentroid", "ycentroid", "elongation", "segment_flux"))
+                            area_col = np.zeros(len(tab), float)
                         xcen = np.asarray(tab["xcentroid"], float)
                         ycen = np.asarray(tab["ycentroid"], float)
                         flux = np.asarray(tab["segment_flux"], float)
@@ -546,16 +569,80 @@ class DetectionWorker(QThread):
                             except Exception:
                                 median_elongation = np.nan
 
+                        # area → per-source fwhm estimate
+                        fwhm_est_all = np.where(
+                            area_col > 0,
+                            2.0 * np.sqrt(area_col / np.pi),
+                            np.nan
+                        )
+                        fwhm_values = list(fwhm_est_all[np.isfinite(fwhm_est_all)])
+
                         order = np.argsort(flux)[::-1]
                         x0 = xcen[order]
                         y0 = ycen[order]
                         e0 = elong[order]
+                        f0_est = fwhm_est_all[order]
 
                         elong_max = float(getattr(P, 'fwhm_elong_max', 1.3))
                         keep = np.isfinite(x0) & np.isfinite(y0) & (e0 <= elong_max)
-                        x0, y0, e0 = x0[keep], y0[keep], e0[keep]
+                        x0, y0, e0, f0_est = x0[keep], y0[keep], e0[keep], f0_est[keep]
 
-                        cand = np.vstack([x0, y0]).T
+                        # ── Preliminary FWHM from top bright isolated sources ──────────
+                        # Use top ~10 bright sources to get fwhm_prelim before DAO refine.
+                        # This feeds measured PSF FWHM into DAOStarFinder instead of
+                        # the fixed fwhm_seed param (closes the feedback loop).
+                        fwhm_prelim = fwhm_seed  # fallback
+                        try:
+                            _n_prelim = min(10, len(x0))
+                            _fwhm_prelim_vals = []
+                            for _xi, _yi in zip(x0[:_n_prelim], y0[:_n_prelim]):
+                                _rc = refine_centroid(data, _xi, _yi, fwhm_seed)
+                                if _rc is None:
+                                    continue
+                                _xc, _yc, _, _ = _rc
+                                _fpx, _, _ = radial_fwhm(
+                                    data, _xc, _yc, fwhm_seed,
+                                    float(getattr(P, 'fitsky_annulus_scale', 4.0)),
+                                    float(getattr(P, 'fitsky_dannulus_scale', 2.0)),
+                                    float(getattr(P, 'annulus_min_gap_px', 6.0)),
+                                    float(getattr(P, 'annulus_min_width_px', 12.0)),
+                                    sigma=float(getattr(P, 'annulus_sigma_clip', 3.0)),
+                                    maxiters=int(getattr(P, 'fitsky_max_iter', 5)),
+                                    dr=float(getattr(P, 'fwhm_dr', 0.5)),
+                                )
+                                if np.isfinite(_fpx) and _fpx > 0:
+                                    _fwhm_prelim_vals.append(float(_fpx))
+                            if len(_fwhm_prelim_vals) >= 3:
+                                fwhm_prelim = float(np.nanmedian(_fwhm_prelim_vals))
+                                self.worker_status.emit(
+                                    worker_id, short_name,
+                                    f"FWHM={fwhm_prelim:.1f}px", 77
+                                )
+                        except Exception:
+                            pass
+
+                        # ── FWHM-based source filter ───────────────────────────────────
+                        # Reject sources whose area-FWHM deviates too much from fwhm_prelim.
+                        # fwhm_est = 2√(area/π) is a rough proxy but sufficient to flag
+                        # extended sources (galaxies) and cosmic rays / hot pixels.
+                        fwhm_filter_lo = float(getattr(P, 'fwhm_filter_lo_mult', 0.4))
+                        fwhm_filter_hi = float(getattr(P, 'fwhm_filter_hi_mult', 2.5))
+                        fwhm_filter_enable = bool(getattr(P, 'fwhm_filter_enable', True))
+                        if fwhm_filter_enable and np.isfinite(f0_est).any():
+                            _lo = fwhm_prelim * fwhm_filter_lo
+                            _hi = fwhm_prelim * fwhm_filter_hi
+                            _fwhm_ok = ~np.isfinite(f0_est) | ((f0_est >= _lo) & (f0_est <= _hi))
+                            _n_before = len(x0)
+                            x0, y0, e0, f0_est = x0[_fwhm_ok], y0[_fwhm_ok], e0[_fwhm_ok], f0_est[_fwhm_ok]
+                            _n_rejected = _n_before - len(x0)
+                            if _n_rejected > 0:
+                                self.worker_status.emit(
+                                    worker_id, short_name,
+                                    f"FWHM filter: -{_n_rejected}", 79
+                                )
+                        # ─────────────────────────────────────────────────────────────
+
+                        cand = np.vstack([x0, y0]).T if len(x0) else np.zeros((0, 2), float)
                         e_cand = e0.copy()
                         detect_keep_max = int(getattr(P, 'detect_keep_max', 6000))
                         if len(cand) > detect_keep_max:
@@ -589,14 +676,6 @@ class DetectionWorker(QThread):
                             }
                         n_sources = len(positions)
 
-                        for src in cat:
-                            try:
-                                area = float(src.area.value)
-                                fwhm_est = 2.0 * np.sqrt(area / np.pi)
-                                fwhm_values.append(fwhm_est)
-                            except Exception:
-                                pass
-
                     # Optional DAO refine to reject hot pixels (cutout-based for speed)
                     # Also collect DAO statistics for each source
                     source_dao_info = {}
@@ -610,7 +689,7 @@ class DetectionWorker(QThread):
                             # DAO as primary detector: full image scan
                             try:
                                 daofind = DAOStarFinder(
-                                    fwhm=dao_fwhm_px,
+                                    fwhm=fwhm_prelim,
                                     threshold=threshold,
                                     sharplo=dao_sharp_lo,
                                     sharphi=dao_sharp_hi,
@@ -656,12 +735,13 @@ class DetectionWorker(QThread):
                                 detect_method = "none"
                         elif positions:
                             # DAO refine: cutout-based validation (fast)
-                            cutout_half = int(dao_fwhm_px * 3)  # 3x FWHM radius
+                            # Use measured fwhm_prelim instead of fixed dao_fwhm_px
+                            cutout_half = int(fwhm_prelim * 3)  # 3x FWHM radius
                             ny, nx = data_sub.shape
                             filtered = []
 
                             daofind = DAOStarFinder(
-                                fwhm=dao_fwhm_px,
+                                fwhm=fwhm_prelim,
                                 threshold=threshold * 0.8,  # slightly lower for cutout
                                 sharplo=dao_sharp_lo,
                                 sharphi=dao_sharp_hi,
@@ -746,8 +826,8 @@ class DetectionWorker(QThread):
 
                     # Calculate median FWHM (radial)
                     fwhm_median = float(np.nanmedian(fwhm_values)) if fwhm_values else 0.0
-                    fwhm_qc_max = int(getattr(P, 'fwhm_qc_max_sources', 40))
-                    fwhm_measure_max = int(getattr(P, 'fwhm_measure_max', 25))
+                    fwhm_qc_max = int(getattr(P, 'fwhm_qc_max_sources', 20))
+                    fwhm_measure_max = int(getattr(P, 'fwhm_measure_max', 20))
                     fwhm_dr = float(getattr(P, 'fwhm_dr', 0.5))
                     ann_sigma = float(getattr(P, 'annulus_sigma_clip', 3.0))
                     ann_maxiter = int(getattr(P, 'fitsky_max_iter', 5))
@@ -846,6 +926,7 @@ class DetectionWorker(QThread):
                             if self._stop_requested:
                                 return filename, None
                             record = {
+                                'det_uid': idx,       # 0-indexed, per-frame detection key
                                 'id': idx + 1,
                                 'x': x,
                                 'y': y,
@@ -2010,7 +2091,9 @@ class SourceDetectionWindow(StepWindowBase):
         except Exception:
             schema = 0
         if schema < 2:
+            # v2: minimum supported schema (no det_uid — fallback allowed)
             return False
+        # v3 adds det_uid column; v2 caches are still read but det_uid derived from row index
         if bool(payload.get("source_use_cropped", None)) != bool(sig["source_use_cropped"]):
             return False
         if self._norm_path_key(payload.get("source_path")) != sig["source_path"]:
@@ -3348,6 +3431,7 @@ class SourceDetectionWindow(StepWindowBase):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(pending_files))
         self.progress_label.setText(f"0/{len(pending_files)} | Starting...")
+        self._detect_start_time = time.time()
 
         # Start
         self.log("Starting worker thread...")
@@ -3370,7 +3454,15 @@ class SourceDetectionWindow(StepWindowBase):
     def on_progress(self, current, total, filename, active_workers):
         """Handle progress update"""
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{current}/{total} | Active: {active_workers} | {filename}")
+        eta_str = ""
+        if current > 0 and hasattr(self, "_detect_start_time"):
+            elapsed = time.time() - self._detect_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {remaining:.0f}s"
+            else:
+                eta_str = f" | ETA {remaining/60:.1f}m"
+        self.progress_label.setText(f"{current}/{total}{eta_str} | Active: {active_workers} | {filename}")
 
     def on_worker_status(self, worker_id, filename, status, progress):
         """Update worker status panel"""
@@ -3810,7 +3902,12 @@ class SourceDetectionWindow(StepWindowBase):
 
         layout.addWidget(dao_group)
 
-        # Peak assist parameters
+        # Peak assist parameters (collapsible)
+        peak_toggle = QPushButton()
+        peak_toggle.setCheckable(True)
+        peak_toggle.setFlat(True)
+        peak_toggle.setStyleSheet("QPushButton { text-align: left; font-weight: bold; padding: 4px; }")
+
         peak_group = QGroupBox("Peak Assist (segm supplement)")
         peak_layout = QFormLayout(peak_group)
 
@@ -3858,7 +3955,15 @@ class SourceDetectionWindow(StepWindowBase):
         self.param_peak_skip_if_nsrc.setValue(int(getattr(self.params.P, 'peak_skip_if_nsrc_ge', 4500)))
         peak_layout.addRow("Skip if Nsrc >=:", self.param_peak_skip_if_nsrc)
 
+        def _set_peak_panel(expanded: bool):
+            peak_group.setVisible(bool(expanded))
+            peak_toggle.setText(("▼ " if expanded else "▶ ") + "Peak Assist (segm supplement)")
+
+        peak_toggle.toggled.connect(_set_peak_panel)
+        layout.addWidget(peak_toggle)
         layout.addWidget(peak_group)
+        # Default: collapsed (can be expanded on demand)
+        peak_toggle.setChecked(False)
 
         self.param_detect_mode.currentIndexChanged.connect(self._update_detect_mode_ui_state)
         self.param_detect_mode_apply.clicked.connect(self._on_apply_detect_mode_clicked)

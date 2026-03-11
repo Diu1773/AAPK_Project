@@ -44,14 +44,21 @@ from PyQt5.QtGui import QFont, QColor
 
 try:  # Python 3.11+
     import tomllib  # type: ignore
-except Exception:
-    import tomli as tomllib  # type: ignore
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        tomllib = None  # type: ignore
 try:
     import tomli_w  # type: ignore
-except Exception:
+except ImportError:
     tomli_w = None
 
-from ...utils.step_paths import step9_dir
+from ...utils.step_paths import (
+    step5_aperture_dir,
+    step6_psf_dir,
+    step9_dir,
+)
 
 
 class QAReportWorker(QThread):
@@ -120,18 +127,31 @@ class QAReportWorker(QThread):
             self._log("Loading photometry data...")
             tsvs = sorted(self.result_dir.glob("*_photometry.tsv"))
             if not tsvs:
-                raise FileNotFoundError("No *_photometry.tsv files found")
+                tsvs = sorted(self.result_dir.glob("photometry_*.tsv"))
+            if not tsvs:
+                raise FileNotFoundError("No photometry TSV files found")
 
             all_rows = []
             for i, tsv in enumerate(tsvs):
                 if self._stop_requested:
                     return
                 df = pd.read_csv(tsv, sep="\t")
-                df["frame"] = tsv.stem.replace("_photometry", "")
+                stem = tsv.stem
+                if stem.startswith("photometry_"):
+                    frame = stem[len("photometry_"):]
+                else:
+                    frame = stem.replace("_photometry", "")
+                df["frame"] = frame
                 all_rows.append(df)
                 self.progress.emit(i + 1, len(tsvs), f"Loading {tsv.name}")
 
             big = pd.concat(all_rows, ignore_index=True)
+            # Normalize snr column: PSF photometry uses snr_psf
+            if "snr" not in big.columns and "snr_psf" in big.columns:
+                big["snr"] = big["snr_psf"]
+                self._log("INFO: Using snr_psf as snr (PSF photometry detected)")
+            elif "snr" not in big.columns:
+                big["snr"] = np.nan
             self._log(f"Loaded {len(tsvs)} frames, {len(big)} measurements")
 
             # Store original data for frame quality (BEFORE any filtering)
@@ -558,7 +578,7 @@ class QAReportWorker(QThread):
         if "is_saturated" not in df.columns:
             return {
                 "error": "is_saturated column not found in photometry output",
-                "recommendation": "Add is_saturated to TSV output in step9_forced_photometry.py"
+                "recommendation": "Add is_saturated to TSV output in Step5 aperture photometry writer"
             }
 
         n_total = len(df)
@@ -784,11 +804,18 @@ class QAReportWindow(QMainWindow):
         super().__init__(parent)
         self.params = params
         base_dir = Path(result_dir)
-        step_dir = step9_dir(base_dir)
-        if not (base_dir / "photometry_index.csv").exists() and (step_dir / "photometry_index.csv").exists():
-            self.result_dir = step_dir
-        else:
-            self.result_dir = base_dir
+        candidates = [
+            step5_aperture_dir(base_dir),
+            step6_psf_dir(base_dir),
+            step9_dir(base_dir),  # legacy
+            base_dir,
+        ]
+        self.result_dir = base_dir
+        for d in candidates:
+            idx = d / "photometry_index.csv"
+            if idx.exists() and idx.stat().st_size > 0:
+                self.result_dir = d
+                break
         self.worker = None
         self.results = {}
 
@@ -840,6 +867,8 @@ class QAReportWindow(QMainWindow):
                     pass
             if not filters_found:
                 tsvs = sorted(self.result_dir.glob("*_photometry.tsv"))
+                if not tsvs:
+                    tsvs = sorted(self.result_dir.glob("photometry_*.tsv"))
                 for tsv in tsvs[:20]:  # Sample first 20 files
                     try:
                         df = pd.read_csv(tsv, sep="\t", nrows=1)

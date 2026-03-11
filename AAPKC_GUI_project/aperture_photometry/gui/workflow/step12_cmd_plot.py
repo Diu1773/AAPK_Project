@@ -14,8 +14,8 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QGroupBox, QTextEdit, QMessageBox
 
 from .step_window_base import StepWindowBase
-from .step10_zeropoint_calibration import CmdViewerWindow
-from ...utils.step_paths import step9_dir, step11_dir, step12_dir
+from .step11_zeropoint_calibration import CmdViewerWindow
+from ...utils.step_paths import step11_dir, step12_dir, step5_aperture_dir, step9_dir
 
 
 class CmdPlotWindow(StepWindowBase):
@@ -74,8 +74,9 @@ class CmdPlotWindow(StepWindowBase):
             return
 
         idx_candidates = [
-            step9_dir(self.params.P.result_dir) / "photometry_index.csv",
-            step9_dir(self.params.P.result_dir) / "phot_index.csv",
+            step5_aperture_dir(self.params.P.result_dir) / "photometry_index.csv",
+            step9_dir(self.params.P.result_dir) / "photometry_index.csv",   # legacy
+            step9_dir(self.params.P.result_dir) / "phot_index.csv",         # legacy
             self.params.P.result_dir / "photometry_index.csv",
             self.params.P.result_dir / "phot_index.csv",
             self.params.P.result_dir / "phot" / "photometry_index.csv",
@@ -87,7 +88,7 @@ class CmdPlotWindow(StepWindowBase):
 
         df = pd.read_csv(wide_path)
         self._reset_viewer()
-        viewer = CmdViewerWindow(df, output_dir, self, embedded=True, params=self.params)
+        viewer = CmdViewerWindow(df, self.params.P.result_dir, self, embedded=True, params=self.params)
         self.viewer_layout.addWidget(viewer)
         self.viewer = viewer
         self.viewer_placeholder.setVisible(False)

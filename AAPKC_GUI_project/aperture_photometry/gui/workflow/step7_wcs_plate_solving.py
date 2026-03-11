@@ -1,5 +1,5 @@
 """
-Step 5: WCS Plate Solving (ASTAP)
+Step 7: WCS Plate Solving (ASTAP)
 Minimal GUI wrapper for ASTAP-based WCS solving with cache/summary output.
 """
 
@@ -50,6 +50,7 @@ from ...utils.step_paths import (
     crop_rect_path,
     step4_dir,
     step5_dir,
+    step7_wcs_dir,
     legacy_step5_refbuild_dir,
     legacy_step7_wcs_dir,
     legacy_step7_refbuild_dir,
@@ -125,9 +126,9 @@ def _source_signature_matches(saved_sig: dict, current_sig: dict) -> bool:
 
 
 def _source_signature_detection_compatible(saved_sig: dict, current_sig: dict) -> bool:
-    """Compatibility check for Step4 detection caches consumed by Step5.
+    """Compatibility check for Step4 detection caches consumed by Step7.
 
-    Step5 can update FITS headers in-place after solving, which changes mtime
+    Step7 can update FITS headers in-place after solving, which changes mtime
     without invalidating detection XY. In that case, accept cache when path,
     crop mode, and file size still match.
     """
@@ -437,7 +438,7 @@ def _save_gaia_derived_catalog(
         pmem_min_fit=min_fit,
     )
 
-    step5_out = step5_dir(Path(result_dir))
+    step5_out = step7_wcs_dir(Path(result_dir))
     step5_out.mkdir(parents=True, exist_ok=True)
     out_csv = step5_out / "gaia_derived.csv"
     out_meta = step5_out / "gaia_derived_meta.json"
@@ -1206,6 +1207,7 @@ class WcsWorker(QThread):
                 return np.nan
 
         reasons: list[str] = []
+        gaia_available = bool(metrics.get("gaia_available", True))
 
         require_wcs_ok = bool(getattr(self.params.P, "wcs_qc_require_wcs_ok", True))
         if require_wcs_ok and not wcs_ok:
@@ -1216,20 +1218,21 @@ class WcsWorker(QThread):
         if n_detect <= 0:
             reasons.append("no_detect_data")
 
-        min_match_n = int(getattr(self.params.P, "wcs_qc_min_match_n", 20))
-        if min_match_n > 0 and n_match < min_match_n:
-            reasons.append("low_match_n")
+        if gaia_available:
+            min_match_n = int(getattr(self.params.P, "wcs_qc_min_match_n", 20))
+            if min_match_n > 0 and n_match < min_match_n:
+                reasons.append("low_match_n")
 
-        min_match_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
-        mrate_det = _num("match_rate")
-        mrate_cat = _num("match_rate_cat")
-        mrate_eff = _num("match_rate_eff")
-        if not np.isfinite(mrate_eff):
-            if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
-                mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
-        if np.isfinite(min_match_rate) and min_match_rate > 0:
-            if (not np.isfinite(mrate_eff)) or (mrate_eff < min_match_rate):
-                reasons.append("low_match_rate")
+            min_match_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
+            mrate_det = _num("match_rate")
+            mrate_cat = _num("match_rate_cat")
+            mrate_eff = _num("match_rate_eff")
+            if not np.isfinite(mrate_eff):
+                if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
+                    mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
+            if np.isfinite(min_match_rate) and min_match_rate > 0:
+                if (not np.isfinite(mrate_eff)) or (mrate_eff < min_match_rate):
+                    reasons.append("low_match_rate")
 
         max_rms_px = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
         if n_match > 0 and np.isfinite(max_rms_px) and max_rms_px > 0:
@@ -1277,6 +1280,52 @@ class WcsWorker(QThread):
         except Exception:
             return None
 
+    def _query_gaia_vizier(self, center: SkyCoord, radius_deg: float, mag_max: float):
+        """VizieR 미러 fallback (스트라스부르 CDS). ESA 서버 장애/IP차단 시 사용."""
+        try:
+            from astroquery.utils.tap.core import TapPlus
+        except ImportError:
+            raise RuntimeError("astroquery.utils.tap not available")
+        mag_where = f'AND "I/355/gaiadr3".Gmag <= {mag_max:.4f}' if np.isfinite(mag_max) and mag_max > 0 else ""
+        adql = f"""
+SELECT
+  "I/355/gaiadr3".Source AS source_id,
+  "I/355/gaiadr3".RA_ICRS AS ra,
+  "I/355/gaiadr3".DE_ICRS AS dec,
+  "I/355/gaiadr3".Gmag AS phot_g_mean_mag,
+  "I/355/gaiadr3".BPmag AS phot_bp_mean_mag,
+  "I/355/gaiadr3".RPmag AS phot_rp_mean_mag,
+  "I/355/gaiadr3".RUWE AS ruwe,
+  "I/355/gaiadr3".Plx AS parallax,
+  "I/355/gaiadr3".e_Plx AS parallax_error,
+  "I/355/gaiadr3".pmRA AS pmra,
+  "I/355/gaiadr3".e_pmRA AS pmra_error,
+  "I/355/gaiadr3".pmDE AS pmdec,
+  "I/355/gaiadr3".e_pmDE AS pmdec_error
+FROM "I/355/gaiadr3"
+WHERE 1=CONTAINS(
+    POINT('ICRS', "I/355/gaiadr3".RA_ICRS, "I/355/gaiadr3".DE_ICRS),
+    CIRCLE('ICRS', {center.ra.deg:.8f}, {center.dec.deg:.8f}, {radius_deg:.8f})
+)
+{mag_where}
+        """.strip()
+        tap = TapPlus(url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap")
+        try:
+            job = tap.launch_job(adql)  # sync: mag 필터가 WHERE절에 있어 row limit 문제 없음
+            tab = job.get_results()
+        except Exception as e:
+            raise RuntimeError(f"VizieR fallback query failed: {_exc_brief(e)}") from e
+        df = tab.to_pandas()
+        df.columns = [c.lower() for c in df.columns]
+        if "bp_rp" not in df.columns and "phot_bp_mean_mag" in df.columns and "phot_rp_mean_mag" in df.columns:
+            bp = pd.to_numeric(df["phot_bp_mean_mag"], errors="coerce")
+            rp = pd.to_numeric(df["phot_rp_mean_mag"], errors="coerce")
+            df["bp_rp"] = bp - rp
+        if "phot_g_mean_mag" in df.columns and np.isfinite(mag_max):
+            g = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce")
+            df = df[g.notna() & (g <= float(mag_max))]
+        return _coerce_source_id_int64(df)
+
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
             raise RuntimeError("astroquery.gaia not available")
@@ -1307,13 +1356,41 @@ class WcsWorker(QThread):
             job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
         except Exception as e:
-            raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(e)}") from e
+            err_str = str(e).lower()
+            if "ip" in err_str and any(w in err_str for w in ("disabled", "blocked", "banned", "heavy")):
+                cause = "IP_BANNED"
+            elif "404" in err_str or "job not found" in err_str:
+                cause = "SERVER_JOB_LOST(인프라 장애/점검)"
+            elif any(c in err_str for c in ("503", "502", "500")):
+                cause = "SERVER_DOWN"
+            elif "timeout" in err_str or "timed out" in err_str:
+                cause = "TIMEOUT"
+            elif any(w in err_str for w in ("connection", "refused", "unreachable")):
+                cause = "NETWORK_ERROR"
+            else:
+                cause = "UNKNOWN"
+            # ESA 장애/차단 시 VizieR 미러 자동 fallback
+            if cause in ("IP_BANNED", "SERVER_JOB_LOST(인프라 장애/점검)", "SERVER_DOWN"):
+                try:
+                    df_viz = self._query_gaia_vizier(center, radius_deg, mag_max)
+                    self.log_message.emit(
+                        f"[Gaia][WARN] ESA TAP failed [{cause}] → VizieR fallback 사용 (N={len(df_viz)}). "
+                        f"mag_max={mag_max:.2f}. WCS-QC match rate가 예상보다 낮을 수 있음."
+                    )
+                    df_viz.attrs["gaia_source"] = "vizier_fallback"
+                    return df_viz
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}; "
+                        f"VizieR fallback also failed: {_exc_brief(e2)}"
+                    ) from e
+            raise RuntimeError(f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
         return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
-        step5_out = step5_dir(self.result_dir)
+        step5_out = step7_wcs_dir(self.result_dir)
         step5_out.mkdir(parents=True, exist_ok=True)
         cache_path = step5_out / "gaia_fov.ecsv"
         meta_path = step5_out / "gaia_fov_meta.json"
@@ -1487,7 +1564,8 @@ class WcsWorker(QThread):
                     )
                 except Exception:
                     pass
-                return df, "query"
+                gaia_src_tag = df.attrs.get("gaia_source", "query") if hasattr(df, "attrs") else "query"
+                return df, gaia_src_tag
             except Exception as e:
                 if self._stop_requested:
                     raise RuntimeError("stopped")
@@ -1706,7 +1784,7 @@ class WcsWorker(QThread):
             # Optional QC filtering
             require_qc = bool(getattr(self.params.P, "wcs_require_qc_pass", True))
             if require_qc:
-                step5_out = step5_dir(self.result_dir)
+                step5_out = step7_wcs_dir(self.result_dir)
                 step5_out.mkdir(parents=True, exist_ok=True)
                 qpath = step5_out / "frame_quality.csv"
                 if not qpath.exists():
@@ -1837,7 +1915,9 @@ class WcsWorker(QThread):
                 return
             L(
                 f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) "
-                f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} source={gaia_src} N={len(gaia_df)}"
+                f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} "
+                f"source={gaia_src}({'ESA TAP' if gaia_src == 'query' else 'VizieR' if gaia_src == 'vizier_fallback' else 'disk cache' if gaia_src == 'cache' else gaia_src}) "
+                f"N={len(gaia_df)}"
             )
             gaia_ra_vals = np.array([], dtype=float)
             gaia_dec_vals = np.array([], dtype=float)
@@ -2087,6 +2167,7 @@ class WcsWorker(QThread):
                             pix_fit_arcsec=float(pix_fit) if np.isfinite(pix_fit) else np.nan,
                             center_coord=center_coord,
                         )
+                        qc_metrics["gaia_available"] = len(gaia_ra_vals) > 0
 
                         hdr["WCS_OK"] = (True, "WCS solve success")
                         hdr["WCSPIXI"] = (float(pix_arc), "pixscale input (arcsec/pix)")
@@ -2139,6 +2220,8 @@ class WcsWorker(QThread):
                         sip_order = 0
 
                     qc_pass, qc_reasons = self._evaluate_wcs_qc_pass(qc_metrics, wcs_ok=bool(wcs_ok))
+                    if not qc_metrics.get("gaia_available", True):
+                        qc_reasons = ["no_gaia"] + [r for r in qc_reasons if r != "no_gaia"]
                     qc_reason = ",".join(qc_reasons)
 
                 if self._stop_requested:
@@ -2235,7 +2318,7 @@ class WcsWorker(QThread):
             # Save summary CSV
             try:
                 df = pd.DataFrame(results)
-                step5_out = step5_dir(self.result_dir)
+                step5_out = step7_wcs_dir(self.result_dir)
                 step5_out.mkdir(parents=True, exist_ok=True)
                 df.to_csv(step5_out / "wcs_solve_summary.csv", index=False)
                 qc_cols = [
@@ -2345,6 +2428,52 @@ class AstrometryNetWorker(QThread):
         except Exception:
             return None
 
+    def _query_gaia_vizier(self, center: SkyCoord, radius_deg: float, mag_max: float):
+        """VizieR 미러 fallback (스트라스부르 CDS). ESA 서버 장애/IP차단 시 사용."""
+        try:
+            from astroquery.utils.tap.core import TapPlus
+        except ImportError:
+            raise RuntimeError("astroquery.utils.tap not available")
+        mag_where = f'AND "I/355/gaiadr3".Gmag <= {mag_max:.4f}' if np.isfinite(mag_max) and mag_max > 0 else ""
+        adql = f"""
+SELECT
+  "I/355/gaiadr3".Source AS source_id,
+  "I/355/gaiadr3".RA_ICRS AS ra,
+  "I/355/gaiadr3".DE_ICRS AS dec,
+  "I/355/gaiadr3".Gmag AS phot_g_mean_mag,
+  "I/355/gaiadr3".BPmag AS phot_bp_mean_mag,
+  "I/355/gaiadr3".RPmag AS phot_rp_mean_mag,
+  "I/355/gaiadr3".RUWE AS ruwe,
+  "I/355/gaiadr3".Plx AS parallax,
+  "I/355/gaiadr3".e_Plx AS parallax_error,
+  "I/355/gaiadr3".pmRA AS pmra,
+  "I/355/gaiadr3".e_pmRA AS pmra_error,
+  "I/355/gaiadr3".pmDE AS pmdec,
+  "I/355/gaiadr3".e_pmDE AS pmdec_error
+FROM "I/355/gaiadr3"
+WHERE 1=CONTAINS(
+    POINT('ICRS', "I/355/gaiadr3".RA_ICRS, "I/355/gaiadr3".DE_ICRS),
+    CIRCLE('ICRS', {center.ra.deg:.8f}, {center.dec.deg:.8f}, {radius_deg:.8f})
+)
+{mag_where}
+        """.strip()
+        tap = TapPlus(url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap")
+        try:
+            job = tap.launch_job(adql)  # sync: mag 필터가 WHERE절에 있어 row limit 문제 없음
+            tab = job.get_results()
+        except Exception as e:
+            raise RuntimeError(f"VizieR fallback query failed: {_exc_brief(e)}") from e
+        df = tab.to_pandas()
+        df.columns = [c.lower() for c in df.columns]
+        if "bp_rp" not in df.columns and "phot_bp_mean_mag" in df.columns and "phot_rp_mean_mag" in df.columns:
+            bp = pd.to_numeric(df["phot_bp_mean_mag"], errors="coerce")
+            rp = pd.to_numeric(df["phot_rp_mean_mag"], errors="coerce")
+            df["bp_rp"] = bp - rp
+        if "phot_g_mean_mag" in df.columns and np.isfinite(mag_max):
+            g = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce")
+            df = df[g.notna() & (g <= float(mag_max))]
+        return _coerce_source_id_int64(df)
+
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
             raise RuntimeError("astroquery.gaia not available")
@@ -2375,13 +2504,41 @@ class AstrometryNetWorker(QThread):
             job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
         except Exception as e:
-            raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(e)}") from e
+            err_str = str(e).lower()
+            if "ip" in err_str and any(w in err_str for w in ("disabled", "blocked", "banned", "heavy")):
+                cause = "IP_BANNED"
+            elif "404" in err_str or "job not found" in err_str:
+                cause = "SERVER_JOB_LOST(인프라 장애/점검)"
+            elif any(c in err_str for c in ("503", "502", "500")):
+                cause = "SERVER_DOWN"
+            elif "timeout" in err_str or "timed out" in err_str:
+                cause = "TIMEOUT"
+            elif any(w in err_str for w in ("connection", "refused", "unreachable")):
+                cause = "NETWORK_ERROR"
+            else:
+                cause = "UNKNOWN"
+            # ESA 장애/차단 시 VizieR 미러 자동 fallback
+            if cause in ("IP_BANNED", "SERVER_JOB_LOST(인프라 장애/점검)", "SERVER_DOWN"):
+                try:
+                    df_viz = self._query_gaia_vizier(center, radius_deg, mag_max)
+                    self.log_message.emit(
+                        f"[Gaia][WARN] ESA TAP failed [{cause}] → VizieR fallback 사용 (N={len(df_viz)}). "
+                        f"mag_max={mag_max:.2f}. WCS-QC match rate가 예상보다 낮을 수 있음."
+                    )
+                    df_viz.attrs["gaia_source"] = "vizier_fallback"
+                    return df_viz
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}; "
+                        f"VizieR fallback also failed: {_exc_brief(e2)}"
+                    ) from e
+            raise RuntimeError(f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
         return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
-        step5_out = step5_dir(self.result_dir)
+        step5_out = step7_wcs_dir(self.result_dir)
         step5_out.mkdir(parents=True, exist_ok=True)
         cache_path = step5_out / "gaia_fov.ecsv"
         meta_path = step5_out / "gaia_fov_meta.json"
@@ -2551,7 +2708,8 @@ class AstrometryNetWorker(QThread):
                     )
                 except Exception:
                     pass
-                return df, "query"
+                gaia_src_tag = df.attrs.get("gaia_source", "query") if hasattr(df, "attrs") else "query"
+                return df, gaia_src_tag
             except Exception as e:
                 if self._stop_requested:
                     raise RuntimeError("stopped")
@@ -2996,23 +3154,25 @@ class AstrometryNetWorker(QThread):
                 return np.nan
 
         reasons: list[str] = []
+        gaia_available = bool(metrics.get("gaia_available", True))
         if bool(getattr(self.params.P, "wcs_qc_require_wcs_ok", True)) and not wcs_ok:
             reasons.append("wcs_fail")
         n_detect = int(metrics.get("n_detect", 0) or 0)
         n_match = int(metrics.get("n_match", 0) or 0)
         if n_detect <= 0:
             reasons.append("no_detect_data")
-        if int(getattr(self.params.P, "wcs_qc_min_match_n", 20)) > 0 and n_match < int(getattr(self.params.P, "wcs_qc_min_match_n", 20)):
-            reasons.append("low_match_n")
-        mrate_det = _num("match_rate")
-        mrate_cat = _num("match_rate_cat")
-        mrate_eff = _num("match_rate_eff")
-        if not np.isfinite(mrate_eff):
-            if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
-                mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
-        min_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
-        if np.isfinite(min_rate) and min_rate > 0 and ((not np.isfinite(mrate_eff)) or (mrate_eff < min_rate)):
-            reasons.append("low_match_rate")
+        if gaia_available:
+            if int(getattr(self.params.P, "wcs_qc_min_match_n", 20)) > 0 and n_match < int(getattr(self.params.P, "wcs_qc_min_match_n", 20)):
+                reasons.append("low_match_n")
+            mrate_det = _num("match_rate")
+            mrate_cat = _num("match_rate_cat")
+            mrate_eff = _num("match_rate_eff")
+            if not np.isfinite(mrate_eff):
+                if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
+                    mrate_eff = float(np.nanmax([mrate_det, mrate_cat]))
+            min_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
+            if np.isfinite(min_rate) and min_rate > 0 and ((not np.isfinite(mrate_eff)) or (mrate_eff < min_rate)):
+                reasons.append("low_match_rate")
         max_rms = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
         if n_match > 0 and np.isfinite(max_rms) and max_rms > 0:
             rms_px = _num("rms_px")
@@ -3359,6 +3519,8 @@ class AstrometryNetWorker(QThread):
         keep_outputs = bool(getattr(self.params.P, "astnet_local_keep_outputs", True))
         use_cache = bool(getattr(self.params.P, "astnet_local_use_cache", True))
         cpulimit_s = float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0))
+        blind_retry = bool(getattr(self.params.P, "astnet_blind_retry_on_fail", True))
+        blind_cpulimit_s = float(getattr(self.params.P, "astnet_blind_cpulimit_s", 120.0))
         max_workers = get_parallel_workers(self.params)
 
         if scale_low <= 0 or scale_high <= 0:
@@ -3454,6 +3616,19 @@ class AstrometryNetWorker(QThread):
                     fail_reason = "astnet_cache_hit_without_solution_marker"
                 else:
                     fail_reason = "astnet_fail_no_solution"
+                    # Blind retry: hint 좌표가 틀렸을 때 (ex. 잘못된 OBJCTRA 헤더)
+                    # center_coord=None으로 --ra/--dec/--radius 없이 재시도
+                    if blind_retry and center_coord is not None and not self._stop_requested:
+                        LOG(f"{filename}: hint solve failed → blind retry (no ra/dec hint, cpulimit={blind_cpulimit_s:.0f}s)")
+                        ok_b, dt_b, out_b, err_b, cmd_b, new_path_b = self._run_solve_field(
+                            fits_path, None, scale_low, scale_high, radius_deg,
+                            downsample, timeout_s, outdir, use_wsl, True, False,
+                            max_objs, blind_cpulimit_s,
+                        )
+                        if ok_b:
+                            ok, dt, out_s, err_s, cmd, new_path = ok_b, dt_b, out_b, err_b, cmd_b, new_path_b
+                            fail_reason = ""
+                            LOG(f"{filename}: blind retry solved dt={dt_b:.1f}s")
 
             result = {
                 "fname": filename,
@@ -3658,7 +3833,9 @@ class AstrometryNetWorker(QThread):
                 gaia_df, gaia_src = self._load_or_query_gaia(center_coord, gaia_r)
                 self.log_message.emit(
                     f"[Gaia] center=({center_coord.ra.deg:.6f},{center_coord.dec.deg:.6f}) "
-                    f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} source={gaia_src} N={len(gaia_df)}"
+                    f"r={gaia_r:.4f}deg mag_max={gaia_mag_max:.2f} "
+                f"source={gaia_src}({'ESA TAP' if gaia_src == 'query' else 'VizieR' if gaia_src == 'vizier_fallback' else 'disk cache' if gaia_src == 'cache' else gaia_src}) "
+                f"N={len(gaia_df)}"
                 )
             except Exception as e:
                 msg = _exc_brief(e, limit=240)
@@ -3804,7 +3981,10 @@ class AstrometryNetWorker(QThread):
                 pix_fit_arcsec=float(pix_fit) if np.isfinite(pix_fit) else np.nan,
                 center_coord=center_coord,
             )
+            qc_metrics["gaia_available"] = len(gaia_ra_vals) > 0
             qc_pass, qc_reasons = self._evaluate_wcs_qc_pass(qc_metrics, wcs_ok=bool(wcs_ok))
+            if not qc_metrics.get("gaia_available", True):
+                qc_reasons = ["no_gaia"] + [r for r in qc_reasons if r != "no_gaia"]
 
             elapsed_s = float(res.get("elapsed_s", np.nan))
             elapsed = elapsed_s if np.isfinite(elapsed_s) else np.nan
@@ -3846,7 +4026,7 @@ class AstrometryNetWorker(QThread):
             self.file_done.emit(filename, res)
 
         try:
-            step5_out = step5_dir(self.result_dir)
+            step5_out = step7_wcs_dir(self.result_dir)
             step5_out.mkdir(parents=True, exist_ok=True)
             df = pd.DataFrame(results)
             df.to_csv(step5_out / "wcs_solve_summary.csv", index=False)
@@ -3910,7 +4090,7 @@ class AstrometryNetWorker(QThread):
 
 
 class WcsPlateSolvingWindow(StepWindowBase):
-    """Step 5: WCS Plate Solving"""
+    """Step 7: WCS Plate Solving"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -3923,7 +4103,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.use_cropped = False
 
         super().__init__(
-            step_index=4,
+            step_index=6,
             step_name="WCS Plate Solving",
             params=params,
             project_state=project_state,
@@ -4440,7 +4620,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
     def _resolve_wcs_summary_path(self) -> Path | None:
         candidates = [
-            step5_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
+            step7_wcs_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
             legacy_step7_wcs_dir(self.params.P.result_dir) / "wcs_solve_summary.csv",
             self.params.P.result_dir / "wcs_solve_summary.csv",
         ]
@@ -4495,7 +4675,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
                 f"[CACHE] ignored {ignored} stale/incompatible WCS rows from {summary_path.name}"
             )
         if loaded <= 0 and ignored > 0:
-            self.log("[CACHE] no compatible WCS summary rows loaded; re-run Step5 for current frame set.")
+            self.log("[CACHE] no compatible WCS summary rows loaded; re-run Step7 for current frame set.")
 
     def open_parameters_dialog(self):
         dialog = QDialog(self)
@@ -4582,7 +4762,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
         wcs_form.addRow(QLabel("── Gaia query / hybrid ID ─────────────"))
         gaia_help = QLabel(
-            "Step5 outputs:\n"
+            "WCS outputs:\n"
             "1) gaia_fov.ecsv (raw Gaia query/cache)\n"
             "2) gaia_derived.csv (gaia_pmem + derived physics: distance_pc, abs_g_mag, "
             "pm_total_masyr, vtan_kms, ...)\n"
@@ -4602,7 +4782,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_gaia_mag_max.setRange(10.0, 25.0)
         self.param_gaia_mag_max.setSingleStep(0.5)
         self.param_gaia_mag_max.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
-        wcs_form.addRow("Gaia Query Mag Max (Step5):", self.param_gaia_mag_max)
+        wcs_form.addRow("Gaia Query Mag Max (WCS):", self.param_gaia_mag_max)
 
         self.param_ref_gaia_match_tol = QDoubleSpinBox()
         self.param_ref_gaia_match_tol.setRange(0.1, 30.0)
@@ -4618,20 +4798,6 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_wcs_qc_match_radius.setValue(float(getattr(self.params.P, "wcs_qc_match_radius_arcsec", 2.0)))
         wcs_form.addRow("WCS-QC Match Radius (arcsec):", self.param_wcs_qc_match_radius)
 
-        self.param_gaia_g_limit = QDoubleSpinBox()
-        self.param_gaia_g_limit.setRange(10.0, 25.0)
-        self.param_gaia_g_limit.setDecimals(2)
-        self.param_gaia_g_limit.setSingleStep(0.5)
-        self.param_gaia_g_limit.setValue(
-            float(
-                getattr(
-                    self.params.P,
-                    "idmatch_gaia_g_limit",
-                    getattr(self.params.P, "gaia_mag_max", 18.0),
-                )
-            )
-        )
-        wcs_form.addRow("Gaia G Limit (Hybrid ID, Step6/7):", self.param_gaia_g_limit)
 
         self.param_gaia_retry = QSpinBox()
         self.param_gaia_retry.setRange(0, 10)
@@ -4724,7 +4890,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_gaia_mag_max.setDecimals(2)
         self.param_astnet_gaia_mag_max.setSingleStep(0.5)
         self.param_astnet_gaia_mag_max.setValue(float(getattr(self.params.P, "gaia_mag_max", 18.0)))
-        form.addRow("Gaia Query Mag Max (Step5):", self.param_astnet_gaia_mag_max)
+        form.addRow("Gaia Query Mag Max (WCS):", self.param_astnet_gaia_mag_max)
 
         self.param_astnet_ref_gaia_match_tol = QDoubleSpinBox()
         self.param_astnet_ref_gaia_match_tol.setRange(0.1, 30.0)
@@ -4736,7 +4902,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         form.addRow("Gaia Match Tol (Ref, arcsec):", self.param_astnet_ref_gaia_match_tol)
 
         gaia_help = QLabel(
-            "Step5 outputs:\n"
+            "WCS outputs:\n"
             "1) gaia_fov.ecsv (raw Gaia query/cache)\n"
             "2) gaia_derived.csv (gaia_pmem + derived physics)\n"
             "Downstream steps (6/8/10/tools) prioritize gaia_derived.csv."
@@ -4745,20 +4911,6 @@ class WcsPlateSolvingWindow(StepWindowBase):
         gaia_help.setStyleSheet("color: #555;")
         form.addRow("Help:", gaia_help)
 
-        self.param_astnet_gaia_g_limit = QDoubleSpinBox()
-        self.param_astnet_gaia_g_limit.setRange(10.0, 25.0)
-        self.param_astnet_gaia_g_limit.setDecimals(2)
-        self.param_astnet_gaia_g_limit.setSingleStep(0.5)
-        self.param_astnet_gaia_g_limit.setValue(
-            float(
-                getattr(
-                    self.params.P,
-                    "idmatch_gaia_g_limit",
-                    getattr(self.params.P, "gaia_mag_max", 18.0),
-                )
-            )
-        )
-        form.addRow("Gaia G Limit (Hybrid ID, Step6/7):", self.param_astnet_gaia_g_limit)
 
         self.param_astnet_gaia_retry = QSpinBox()
         self.param_astnet_gaia_retry.setRange(0, 10)
@@ -4795,6 +4947,18 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_cpulimit.setValue(float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0)))
         form.addRow("CPU Limit (s):", self.param_astnet_cpulimit)
 
+        form.addRow(QLabel("── Blind retry ─────────────────────────"))
+
+        self.param_astnet_blind_retry = QCheckBox("Retry blind when hint-based solve fails")
+        self.param_astnet_blind_retry.setChecked(bool(getattr(self.params.P, "astnet_blind_retry_on_fail", True)))
+        form.addRow("Blind Retry:", self.param_astnet_blind_retry)
+
+        self.param_astnet_blind_cpulimit = QDoubleSpinBox()
+        self.param_astnet_blind_cpulimit.setRange(10, 600)
+        self.param_astnet_blind_cpulimit.setValue(float(getattr(self.params.P, "astnet_blind_cpulimit_s", 120.0)))
+        self.param_astnet_blind_cpulimit.setSuffix(" s")
+        form.addRow("Blind CPU Limit:", self.param_astnet_blind_cpulimit)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -4822,7 +4986,6 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.gaia_mag_max = self.param_gaia_mag_max.value()
         self.params.P.ref_wcs_match_radius_arcsec = self.param_ref_gaia_match_tol.value()
         self.params.P.wcs_qc_match_radius_arcsec = self.param_wcs_qc_match_radius.value()
-        self.params.P.idmatch_gaia_g_limit = self.param_gaia_g_limit.value()
         self.params.P.gaia_retry = self.param_gaia_retry.value()
         self.params.P.gaia_backoff_s = self.param_gaia_backoff.value()
         self.params.P.gaia_allow_no_cache = self.param_gaia_allow_no_cache.isChecked()
@@ -4844,11 +5007,12 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astnet_local_use_cache = self.param_astnet_use_cache.isChecked()
         self.params.P.astnet_local_max_objs = self.param_astnet_max_objs.value()
         self.params.P.astnet_local_cpulimit_s = self.param_astnet_cpulimit.value()
+        self.params.P.astnet_blind_retry_on_fail = self.param_astnet_blind_retry.isChecked()
+        self.params.P.astnet_blind_cpulimit_s = self.param_astnet_blind_cpulimit.value()
         self.params.P.wcs_qc_match_radius_arcsec = self.param_astnet_wcs_qc_match_radius.value()
         self.params.P.gaia_radius_fudge = self.param_astnet_gaia_fudge.value()
         self.params.P.gaia_mag_max = self.param_astnet_gaia_mag_max.value()
         self.params.P.ref_wcs_match_radius_arcsec = self.param_astnet_ref_gaia_match_tol.value()
-        self.params.P.idmatch_gaia_g_limit = self.param_astnet_gaia_g_limit.value()
         self.params.P.gaia_retry = self.param_astnet_gaia_retry.value()
         self.params.P.gaia_backoff_s = self.param_astnet_gaia_backoff.value()
         self.params.P.gaia_allow_no_cache = self.param_astnet_gaia_allow_no_cache.isChecked()
@@ -5018,8 +5182,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
             "wcs_refine_min_match": getattr(self.params.P, "wcs_refine_min_match", 50),
             "gaia_radius_fudge": getattr(self.params.P, "gaia_radius_fudge", 1.35),
             "gaia_mag_max": getattr(self.params.P, "gaia_mag_max", 18.0),
-            "ref_wcs_match_radius_arcsec": getattr(self.params.P, "ref_wcs_match_radius_arcsec", 2.0),
-            "idmatch_gaia_g_limit": getattr(self.params.P, "idmatch_gaia_g_limit", getattr(self.params.P, "gaia_mag_max", 18.0)),
+            # ref_wcs_match_radius_arcsec managed by step8 — not duplicated here
             "gaia_retry": getattr(self.params.P, "gaia_retry", 2),
             "gaia_backoff_s": getattr(self.params.P, "gaia_backoff_s", 6.0),
             "gaia_allow_no_cache": getattr(self.params.P, "gaia_allow_no_cache", True),

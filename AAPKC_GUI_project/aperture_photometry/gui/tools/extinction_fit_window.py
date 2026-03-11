@@ -24,13 +24,12 @@ from PyQt5.QtWidgets import (
 
 from ...utils.astro_utils import compute_airmass_from_header, normalize_filter_name
 from ...utils.step_paths import (
-    step2_cropped_dir,
-    step5_dir,
-    step6_dir,
-    step9_dir,
-    step11_dir,
-    step11_extinction_dir,
-    crop_is_active,
+    step2_cropped_dir, crop_is_active,
+    step11_dir, step11_extinction_dir,
+    # New pipeline paths
+    step5_aperture_dir, step6_dir, step7_wcs_dir,
+    # Legacy paths
+    step5_dir, step6_dir, step9_dir,
 )
 from ...utils.io_utils import parse_int64_series, read_ecsv_int64_source_id
 
@@ -150,17 +149,19 @@ class ExtinctionFitWorker(QThread):
         try:
             P = self.params.P
             result_dir = self.result_dir
-            phot_dir = step9_dir(result_dir)
+            phot_dir_new = step5_aperture_dir(result_dir)  # new pipeline
+            phot_dir     = step9_dir(result_dir)             # legacy
             output_dir = step11_extinction_dir(result_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
             idx_candidates = [
-                phot_dir / "photometry_index.csv",
-                phot_dir / "phot_index.csv",
-                result_dir / "photometry_index.csv",
-                result_dir / "phot_index.csv",
-                result_dir / "phot" / "photometry_index.csv",
-                result_dir / "phot" / "phot_index.csv",
+                phot_dir_new / "photometry_index.csv",
+                phot_dir     / "photometry_index.csv",
+                phot_dir     / "phot_index.csv",
+                result_dir   / "photometry_index.csv",
+                result_dir   / "phot_index.csv",
+                result_dir   / "phot" / "photometry_index.csv",
+                result_dir   / "phot" / "phot_index.csv",
             ]
             idx_path = next((p for p in idx_candidates if p.exists()), None)
             if idx_path is None:
@@ -171,6 +172,10 @@ class ExtinctionFitWorker(QThread):
                     if cand in idx.columns:
                         idx = idx.rename(columns={cand: "path"})
                         break
+            if "path" not in idx.columns and "file" in idx.columns:
+                idx["path"] = idx["file"].apply(
+                    lambda f: str(idx_path.parent / f"photometry_{f}.tsv")
+                )
             if "file" not in idx.columns:
                 for cand in ("fname", "frame", "image", "fits", "name"):
                     if cand in idx.columns:
@@ -193,7 +198,19 @@ class ExtinctionFitWorker(QThread):
                 p = str(p) if p is not None else ""
                 if p.strip() == "":
                     continue
-                tsv = phot_dir / p
+                tsv = Path(p)
+                if not (tsv.is_absolute() and tsv.exists()):
+                    # Windows absolute path fallback when running in POSIX-like env.
+                    if len(p) >= 3 and p[1] == ":" and (p[2] == "\\" or p[2] == "/"):
+                        drv = p[0].lower()
+                        rest = p[2:].replace("\\", "/").lstrip("/")
+                        tsv = Path(f"/mnt/{drv}/{rest}")
+                if not tsv.exists():
+                    tsv = idx_path.parent / p
+                if not tsv.exists():
+                    tsv = phot_dir_new / p
+                if not tsv.exists():
+                    tsv = phot_dir / p
                 if not tsv.exists():
                     tsv = self.result_dir / p
                 if not tsv.exists():
@@ -214,7 +231,8 @@ class ExtinctionFitWorker(QThread):
                 if err_col is None:
                     dfp["mag_err"] = np.nan
                     err_col = "mag_err"
-                snr_col = "snr" if "snr" in dfp.columns else None
+                snr_col = ("snr" if "snr" in dfp.columns
+                           else ("snr_psf" if "snr_psf" in dfp.columns else None))
                 if "FILTER" in dfp.columns:
                     dfp["FILTER"] = dfp["FILTER"].map(normalize_filter_name)
                 else:
@@ -287,9 +305,11 @@ class ExtinctionFitWorker(QThread):
                 if "source_id" not in df.columns:
                     raise RuntimeError("Gaia mags not available and source_id missing")
                 gaia_candidates = [
-                    step5_dir(result_dir) / "gaia_derived.csv",
+                    step7_wcs_dir(result_dir) / "gaia_fov.ecsv",
+                    step7_wcs_dir(result_dir) / "gaia_derived.csv",
+                    step5_dir(result_dir) / "gaia_derived.csv",  # legacy
                     result_dir / "gaia_derived.csv",
-                    step5_dir(result_dir) / "gaia_fov.ecsv",
+                    step5_dir(result_dir) / "gaia_fov.ecsv",    # legacy
                     result_dir / "gaia_fov.ecsv",
                 ]
                 gaia_df = None

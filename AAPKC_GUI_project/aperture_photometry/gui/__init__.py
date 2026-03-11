@@ -1,5 +1,8 @@
-"""GUI components for aperture photometry application"""
+"""GUI components for aperture photometry application."""
 
-from .main_window import MainWindow
+from .main_window_workflow import MainWindowWorkflow
 
-__all__ = ['MainWindow']
+# Backward-compatible alias.
+MainWindow = MainWindowWorkflow
+
+__all__ = ["MainWindowWorkflow", "MainWindow"]

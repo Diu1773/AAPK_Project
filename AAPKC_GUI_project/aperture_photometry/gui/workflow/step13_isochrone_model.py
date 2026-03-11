@@ -8,6 +8,7 @@ Extended with automatic isochrone fitting:
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -24,13 +25,13 @@ from scipy.spatial import cKDTree
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QFormLayout, QDoubleSpinBox, QComboBox,
-    QLineEdit, QWidget, QFileDialog, QProgressBar,
+    QCheckBox, QLineEdit, QWidget, QFileDialog, QProgressBar,
     QTabWidget, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step11_dir, step13_dir
+from ...utils.step_paths import step8_dir, step11_dir, step13_dir
 from ...analysis.isochrone_fitter_v2 import IsochroneFitterV2, FitMode, FitResult, FitBounds, GridScanResult
 
 # SDSS extinction coefficients: R = A / E(B-V)
@@ -459,6 +460,80 @@ class IsochroneModelWindow(StepWindowBase):
         filter_layout.addStretch()
         self.content_layout.addWidget(filter_group)
 
+        # === Source Filters ===
+        sf_group = QGroupBox("Source Filters")
+        sf_layout = QHBoxLayout(sf_group)
+
+        # Parallax filter
+        self.plx_check = QCheckBox("Parallax filter")
+        self.plx_check.setChecked(False)
+        self.plx_check.setToolTip("Filter sources by Gaia parallax range.")
+        sf_layout.addWidget(self.plx_check)
+
+        self.plx_min_spin = QDoubleSpinBox()
+        self.plx_min_spin.setRange(-5.0, 20.0)
+        self.plx_min_spin.setDecimals(3)
+        self.plx_min_spin.setSingleStep(0.05)
+        self.plx_min_spin.setValue(-0.5)
+        self.plx_min_spin.setSuffix(" mas")
+        sf_layout.addWidget(self.plx_min_spin)
+
+        sf_layout.addWidget(QLabel("–"))
+
+        self.plx_max_spin = QDoubleSpinBox()
+        self.plx_max_spin.setRange(-5.0, 20.0)
+        self.plx_max_spin.setDecimals(3)
+        self.plx_max_spin.setSingleStep(0.05)
+        self.plx_max_spin.setValue(0.5)
+        self.plx_max_spin.setSuffix(" mas")
+        sf_layout.addWidget(self.plx_max_spin)
+
+        sf_layout.addSpacing(20)
+
+        # ROI filter
+        self.roi_check = QCheckBox("ROI filter")
+        self.roi_check.setChecked(False)
+        self.roi_check.setEnabled(False)
+        self.roi_check.setToolTip(
+            "Filter sources by the spatial ROI circle saved in Step 10.\n"
+            "Enable Step 10's ROI tool first."
+        )
+        sf_layout.addWidget(self.roi_check)
+
+        self.roi_label = QLabel("(no ROI)")
+        self.roi_label.setStyleSheet("QLabel { color: #888; font-style: italic; }")
+        sf_layout.addWidget(self.roi_label)
+
+        sf_layout.addSpacing(20)
+
+        # SNR display filter
+        self.snr_display_check = QCheckBox("SNR >=")
+        self.snr_display_check.setChecked(False)
+        self.snr_display_check.setToolTip("Filter CMD display sources by minimum SNR.")
+        sf_layout.addWidget(self.snr_display_check)
+
+        self.snr_display_spin = QDoubleSpinBox()
+        self.snr_display_spin.setRange(0.0, 200.0)
+        self.snr_display_spin.setDecimals(1)
+        self.snr_display_spin.setSingleStep(1.0)
+        self.snr_display_spin.setValue(5.0)
+        sf_layout.addWidget(self.snr_display_spin)
+
+        sf_layout.addStretch()
+        self.content_layout.addWidget(sf_group)
+
+        # Internal ROI state
+        self._roi_data: dict | None = None
+        self._load_roi_data()
+
+        # Connect filter signals
+        self.plx_check.stateChanged.connect(self._on_source_filter_changed)
+        self.plx_min_spin.valueChanged.connect(self._on_source_filter_changed)
+        self.plx_max_spin.valueChanged.connect(self._on_source_filter_changed)
+        self.roi_check.stateChanged.connect(self._on_source_filter_changed)
+        self.snr_display_check.stateChanged.connect(self._on_source_filter_changed)
+        self.snr_display_spin.valueChanged.connect(self._on_source_filter_changed)
+
         # === Tabs ===
         self.tabs = QTabWidget()
         self.content_layout.addWidget(self.tabs, stretch=1)
@@ -771,6 +846,78 @@ class IsochroneModelWindow(StepWindowBase):
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
 
+    # =========================================================================
+    # Source Filters
+    # =========================================================================
+
+    def _load_roi_data(self):
+        """Try to load ROI circle from step10's saved JSON."""
+        try:
+            roi_path = step8_dir(self.params.P.result_dir) / "cmd_roi.json"
+            if roi_path.exists():
+                self._roi_data = json.loads(roi_path.read_text())
+                ra  = self._roi_data.get("ra_deg", 0.0)
+                dec = self._roi_data.get("dec_deg", 0.0)
+                r   = self._roi_data.get("radius_arcsec", 0.0)
+                self.roi_label.setText(f"RA={ra:.4f}° Dec={dec:.4f}° r={r:.1f}\"")
+                self.roi_label.setStyleSheet("QLabel { color: #2E7D32; font-style: normal; }")
+                self.roi_check.setEnabled(True)
+            else:
+                self._roi_data = None
+                self.roi_label.setText("(no ROI saved)")
+                self.roi_label.setStyleSheet("QLabel { color: #888; font-style: italic; }")
+                self.roi_check.setEnabled(False)
+        except Exception:
+            self._roi_data = None
+            self.roi_check.setEnabled(False)
+
+    def _apply_source_filters(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return a filtered copy of df based on parallax and ROI settings."""
+        if df is None:
+            return df
+        mask = np.ones(len(df), dtype=bool)
+
+        # Parallax filter
+        if self.plx_check.isChecked() and "parallax" in df.columns:
+            plx = pd.to_numeric(df["parallax"], errors="coerce").to_numpy(float)
+            plx_min = float(self.plx_min_spin.value())
+            plx_max = float(self.plx_max_spin.value())
+            mask &= np.isfinite(plx) & (plx >= plx_min) & (plx <= plx_max)
+
+        # ROI filter
+        if self.roi_check.isChecked() and self._roi_data is not None:
+            roi_ra       = float(self._roi_data["ra_deg"])
+            roi_dec      = float(self._roi_data["dec_deg"])
+            roi_r_arcsec = float(self._roi_data["radius_arcsec"])
+            if "ra_deg" in df.columns and "dec_deg" in df.columns:
+                ra  = pd.to_numeric(df["ra_deg"],  errors="coerce").to_numpy(float)
+                dec = pd.to_numeric(df["dec_deg"], errors="coerce").to_numpy(float)
+                cos_dec = np.cos(np.radians(roi_dec))
+                d_ra    = (ra  - roi_ra)  * cos_dec * 3600.0
+                d_dec   = (dec - roi_dec) * 3600.0
+                dist    = np.sqrt(d_ra**2 + d_dec**2)
+                mask &= np.isfinite(dist) & (dist <= roi_r_arcsec)
+
+        # SNR display filter
+        if self.snr_display_check.isChecked():
+            snr_cut = float(self.snr_display_spin.value())
+            if snr_cut > 0:
+                for band in ["g", "r", "i"]:
+                    sc = f"snr_{band}"
+                    if sc in df.columns:
+                        sv = pd.to_numeric(df[sc], errors="coerce").to_numpy(float)
+                        mask &= ~(np.isfinite(sv) & (sv < snr_cut))
+
+        if not mask.all():
+            df = df[mask].reset_index(drop=True)
+        return df
+
+    def _on_source_filter_changed(self):
+        """Called when any source filter widget changes."""
+        self._cc_ax = None          # force full redraw of color-color plot
+        self._update_cc_plot()
+        self.refresh_cmd_viewer(show_error=False)
+
     def _get_iso_path(self) -> str:
         iso_path = ""
         if self.iso_path_edit is not None:
@@ -895,6 +1042,7 @@ class IsochroneModelWindow(StepWindowBase):
             )
             return False
 
+        df = self._apply_source_filters(df)
         self._clear_viewer_widget()
         bc = self._get_band_config()
         viewer = IsochroneViewerWindow(
@@ -904,7 +1052,12 @@ class IsochroneModelWindow(StepWindowBase):
         )
         self.viewer_layout.addWidget(viewer, stretch=1)
         self.viewer = viewer
-        self.log(f"CMD viewer updated: {iso_file.name}  bands={bc['band_color'][0]}-{bc['band_color'][1]}, mag={bc['band_mag']}")
+        n_total = len(self._cached_df) if self._cached_df is not None else len(df)
+        self.log(
+            f"CMD viewer updated: {iso_file.name}  "
+            f"bands={bc['band_color'][0]}-{bc['band_color'][1]}, mag={bc['band_mag']}  "
+            f"N={len(df)}/{n_total}"
+        )
         return True
 
     def _get_fit_initial_guess(self):
@@ -943,6 +1096,7 @@ class IsochroneModelWindow(StepWindowBase):
         df, iso_raw, iso_file = self._load_cmd_and_iso_data(show_error=False)
         if df is None or iso_raw is None:
             return
+        df = self._apply_source_filters(df)
 
         # ---- First draw: full rebuild ----
         need_full = not hasattr(self, "_cc_ax") or self._cc_ax is None
@@ -1051,6 +1205,7 @@ class IsochroneModelWindow(StepWindowBase):
         df, iso_raw, _ = self._load_cmd_and_iso_data(show_error=True)
         if df is None or iso_raw is None:
             return
+        df = self._apply_source_filters(df)
 
         def _get(band):
             s = f"mag_std_{band}"
@@ -1220,7 +1375,7 @@ class IsochroneModelWindow(StepWindowBase):
         cmd_df, _, iso_file = self._load_cmd_and_iso_data(show_error=True)
         if cmd_df is None or iso_file is None:
             return
-        self.cmd_df = cmd_df
+        self.cmd_df = self._apply_source_filters(cmd_df)
 
         extracted = self._extract_cmd_columns()
         if extracted is None:
@@ -1350,7 +1505,7 @@ class IsochroneModelWindow(StepWindowBase):
         cmd_df, _, iso_file = self._load_cmd_and_iso_data(show_error=True)
         if cmd_df is None or iso_file is None:
             return
-        self.cmd_df = cmd_df
+        self.cmd_df = self._apply_source_filters(cmd_df)
 
         extracted = self._extract_cmd_columns()
         if extracted is None:

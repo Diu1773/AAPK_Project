@@ -18,7 +18,11 @@ from ..config import Parameters
 from ..core import InstrumentConfig
 from ..core.file_manager import FileManager
 from ..core.project_state import ProjectState
-from ..utils.step_paths import step9_dir
+from ..utils.step_paths import (
+    step5_aperture_dir,
+    step6_psf_dir,
+    step9_dir,
+)
 
 
 class StepButton(QPushButton):
@@ -209,21 +213,21 @@ class MainWindowWorkflow(QMainWindow):
             )
             raise
 
-        # Step definitions (updated workflow)
+        # Step definitions (WCS-first pipeline)
         self.step_names = [
-            "File Selection",
-            "Image Crop",
-            "Sky Preview & QC",
-            "Source Detection",
-            "WCS Plate Solving",
-            "Reference Build",
-            "Star ID Matching",
-            "Master ID Editor",
-            "Aperture Photometry",
-            "PSF Photometry",
-            "Zeropoint Calibration",
-            "CMD Plot",
-            "Isochrone Model",
+            "File Selection",           # 0
+            "Image Crop",               # 1
+            "Sky Preview & QC",         # 2
+            "Source Detection",         # 3  → step4_detection/
+            "Aperture Photometry",      # 4  → step5_aperture/
+            "PSF Photometry",           # 5  → step6_psf/ (skippable)
+            "WCS Plate Solving",        # 6  → Step7 UI (legacy dir: step5_wcs/)
+            "Reference Catalog Build",  # 7  → Step8 UI (legacy dir: step6_refbuild/)
+            "Star ID Matching",         # 8  → Step9 UI (legacy dir: step7_idmatch/)
+            "Master ID Editor",         # 9  → Step10 UI (legacy dir: step8_selection/)
+            "Zeropoint Calibration",    # 10
+            "CMD Plot",                 # 11
+            "Isochrone Model",          # 12
         ]
 
         # Step buttons
@@ -469,47 +473,53 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 4:
-            from .workflow.step5_wcs_plate_solving import WcsPlateSolvingWindow
-            self.current_step_window = WcsPlateSolvingWindow(
+            # Step 5: Aperture Photometry (detection-based, det_uid keyed)
+            from .workflow.step5_aperture_photometry import AperturePhotometryWindow
+            self.current_step_window = AperturePhotometryWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 5:
-            from .workflow.step6_ref_build import RefBuildWindow
-            self.current_step_window = RefBuildWindow(
+            # Step 6: PSF Photometry (photutils, skippable)
+            from .workflow.step6_psf_photometry import PSFPhotometryWindow
+            self.current_step_window = PSFPhotometryWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 6:
-            from .workflow.step7_star_id_matching import StarIdMatchingWindow
-            self.current_step_window = StarIdMatchingWindow(
+            # Step 7: WCS Plate Solving (astrometry.net + Gaia FOV match)
+            from .workflow.step7_wcs_plate_solving import WcsPlateSolvingWindow
+            self.current_step_window = WcsPlateSolvingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 7:
-            from .workflow.step8_master_id_editor import MasterIdEditorWindow
-            self.current_step_window = MasterIdEditorWindow(
+            # Step 8: Reference Catalog Build (WCS-based, PSF positions)
+            from .workflow.step8_ref_build import RefBuildWindow
+            self.current_step_window = RefBuildWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 8:
-            from .workflow.step9_forced_photometry import ForcedPhotometryWindow
-            self.current_step_window = ForcedPhotometryWindow(
+            # Step 9: Star ID Matching (RA/Dec KDTree)
+            from .workflow.step9_star_id_matching import StarIdMatchingWindow
+            self.current_step_window = StarIdMatchingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 9:
-            from .workflow.step10_psf_photometry import PsfPhotometryWindow
-            self.current_step_window = PsfPhotometryWindow(
+            # Step 10: Master ID Editor (includes PSF iter2 new sources)
+            from .workflow.step10_master_id_editor import MasterIdEditorWindow
+            self.current_step_window = MasterIdEditorWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 10:
-            from .workflow.step10_zeropoint_calibration import ZeropointCalibrationWindow
+            from .workflow.step11_zeropoint_calibration import ZeropointCalibrationWindow
             self.current_step_window = ZeropointCalibrationWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 11:
-            from .workflow.step11_cmd_plot import CmdPlotWindow
+            from .workflow.step12_cmd_plot import CmdPlotWindow
             self.current_step_window = CmdPlotWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 12:
-            from .workflow.step12_isochrone_model import IsochroneModelWindow
+            from .workflow.step13_isochrone_model import IsochroneModelWindow
             self.current_step_window = IsochroneModelWindow(
                 self.params, self.file_manager, self.project_state, self
             )
@@ -846,19 +856,16 @@ class MainWindowWorkflow(QMainWindow):
             tab: Initial tab to show (0=Error Model, 1=Centroid, 2=Frame, 3=Background, 4=Publication)
         """
         # Check if photometry data exists
-        phot_dir = step9_dir(self.params.P.result_dir)
-        photometry_index = phot_dir / "photometry_index.csv"
-        if not photometry_index.exists():
-            photometry_index = self.params.P.result_dir / "photometry_index.csv"
+        photometry_index = self._find_photometry_index(require_aperture=True)
         if not photometry_index.exists():
             QMessageBox.warning(
                 self, "No Data",
-                "Photometry data not found.\n"
-                "Please complete the Forced Photometry step first."
+                "Aperture photometry data not found.\n"
+                "Please complete Step 5 (Aperture Photometry) first."
             )
             return
 
-        from .workflow.qa_report_window import QAReportWindow
+        from .tools.qa_report_window import QAReportWindow
 
         self.qa_window = QAReportWindow(
             self.params,
@@ -879,19 +886,16 @@ class MainWindowWorkflow(QMainWindow):
 
     def open_extinction_fit(self):
         """Open extinction (airmass fit) tool window"""
-        phot_dir = step9_dir(self.params.P.result_dir)
-        photometry_index = phot_dir / "photometry_index.csv"
-        if not photometry_index.exists():
-            photometry_index = self.params.P.result_dir / "photometry_index.csv"
+        photometry_index = self._find_photometry_index(require_aperture=True)
         if not photometry_index.exists():
             QMessageBox.warning(
                 self, "No Data",
-                "Photometry data not found.\n"
-                "Please complete the Forced Photometry step first."
+                "Aperture photometry data not found.\n"
+                "Please complete Step 5 (Aperture Photometry) first."
             )
             return
 
-        from .workflow.extinction_fit_window import ExtinctionFitWindow
+        from .tools.extinction_fit_window import ExtinctionFitWindow
 
         self.ext_window = ExtinctionFitWindow(
             self.params,
@@ -905,6 +909,27 @@ class MainWindowWorkflow(QMainWindow):
         self.ext_window.activateWindow()
         self.append_log("Opened Extinction Fit window")
 
+    def _find_photometry_index(self, require_aperture: bool = False) -> Path:
+        result_dir = Path(self.params.P.result_dir)
+        ap_idx = step5_aperture_dir(result_dir) / "photometry_index.csv"
+        legacy_idx = step9_dir(result_dir) / "photometry_index.csv"
+        if require_aperture:
+            if ap_idx.exists() and ap_idx.stat().st_size > 0:
+                return ap_idx
+            if legacy_idx.exists() and legacy_idx.stat().st_size > 0:
+                return legacy_idx
+            return ap_idx
+        candidates = [
+            step6_psf_dir(result_dir) / "photometry_index.csv",
+            ap_idx,
+            legacy_idx,  # legacy
+            result_dir / "photometry_index.csv",
+        ]
+        for p in candidates:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        return candidates[0]
+
     def open_cmd_iso_tool(self):
         """Open CMD + Isochrone tool using a previous result folder"""
         start_dir = str(getattr(self.params.P, "result_dir", Path.cwd()))
@@ -914,7 +939,7 @@ class MainWindowWorkflow(QMainWindow):
         if not selected:
             return
 
-        from .workflow.cmd_iso_tool_window import CmdIsoToolWindow
+        from .tools.cmd_iso_tool_window import CmdIsoToolWindow
 
         self.cmd_tool_window = CmdIsoToolWindow(
             self.params,
@@ -932,7 +957,7 @@ class MainWindowWorkflow(QMainWindow):
 
     def open_iraf_tool(self):
         """Open integrated IRAF/DAOPHOT tool window"""
-        from .workflow.iraf_photometry_window import IRAFPhotometryWindow
+        from .tools.iraf_photometry_window import IRAFPhotometryWindow
 
         self.iraf_window = IRAFPhotometryWindow(
             self.params,
@@ -949,7 +974,7 @@ class MainWindowWorkflow(QMainWindow):
 
     def open_gaia_3d_viewer(self):
         """Open Gaia 3D cluster viewer tool window."""
-        from .workflow.gaia_3d_viewer_window import Gaia3DViewerWindow
+        from .tools.gaia_3d_viewer_window import Gaia3DViewerWindow
 
         self.gaia_3d_window = Gaia3DViewerWindow(
             self.params,

@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
-from .step_window_base import StepWindowBase
+from ..workflow.step_window_base import StepWindowBase
 from ...utils.step_paths import step2_cropped_dir, step4_dir, step5_dir, step9_dir, crop_is_active
 
 
