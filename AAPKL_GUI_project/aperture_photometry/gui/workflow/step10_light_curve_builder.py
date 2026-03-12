@@ -48,6 +48,7 @@ from PyQt5.QtWidgets import QShortcut, QStyle, QStyleOptionSlider
 
 from .step_window_base import StepWindowBase
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 
 
 class ClickableSlider(QSlider):
@@ -126,6 +127,28 @@ def _fmt_float(value, default: str = "") -> str:
         return f"{v:.5f}"
     except Exception:
         return default
+
+
+def _build_source_to_id_map(df: pd.DataFrame) -> dict[int, int]:
+    if not {"source_id", "ID"} <= set(df.columns):
+        return {}
+    sid_vals = coerce_int64_source_id(df["source_id"])
+    id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+    mapping: dict[int, int] = {}
+    for sid_val, id_val in zip(sid_vals, id_vals):
+        if pd.isna(sid_val) or pd.isna(id_val):
+            continue
+        sid_int = int(sid_val)
+        if sid_int not in mapping:
+            mapping[sid_int] = int(id_val)
+    return mapping
+
+
+def _select_rows_by_source_id(df: pd.DataFrame, source_id: int | None) -> pd.DataFrame:
+    if source_id is None or "source_id" not in df.columns:
+        return pd.DataFrame()
+    sid_series = coerce_int64_source_id(df["source_id"])
+    return df.loc[sid_series == int(source_id)]
 
 
 def _fmt_percent(value, default: str = "") -> str:
@@ -629,13 +652,10 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
                 if not path.exists():
                     continue
                 try:
-                    df = pd.read_csv(path, sep="\t")
-                    if {"source_id", "ID"} <= set(df.columns):
-                        sid = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
-                        fid = pd.to_numeric(df["ID"], errors="coerce").dropna().astype("int64")
-                        id_map = dict(zip(sid.tolist(), fid.tolist()))
-                        if id_map:
-                            return id_map
+                    df = read_csv_int64_source_id(path, sep="\t")
+                    id_map = _build_source_to_id_map(df)
+                    if id_map:
+                        return id_map
                 except Exception:
                     continue
             return {}
@@ -657,11 +677,13 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
             src_id = target_sid
             if src_path.exists() and src_id is not None:
                 try:
-                    df = pd.read_csv(src_path)
+                    df = read_csv_int64_source_id(src_path)
                     if {"source_id", "ID"} <= set(df.columns):
-                        row = df[df["source_id"].astype("int64") == int(src_id)]
+                        row = _select_rows_by_source_id(df, int(src_id))
                         if not row.empty:
-                            target_id = int(row.iloc[0]["ID"])
+                            id_val = pd.to_numeric(row.iloc[0]["ID"], errors="coerce")
+                            if pd.notna(id_val):
+                                target_id = int(id_val)
                 except Exception:
                     target_id = None
         if (not comp_ids) and comp_sids:
@@ -675,12 +697,12 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
             src_ids = [int(s) for s in comp_sids if s is not None]
             if src_path.exists() and src_ids:
                 try:
-                    df = pd.read_csv(src_path)
+                    df = read_csv_int64_source_id(src_path)
                     if {"source_id", "ID"} <= set(df.columns):
-                        df["source_id"] = df["source_id"].astype("int64")
-                        df["ID"] = df["ID"].astype("int64")
-                        sel = df[df["source_id"].isin(src_ids)]
-                        comp_ids = sel["ID"].astype("int64").tolist()
+                        sid_series = coerce_int64_source_id(df["source_id"])
+                        id_series = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+                        mask = sid_series.notna() & sid_series.isin(src_ids) & id_series.notna()
+                        comp_ids = id_series[mask].astype("int64").tolist()
                 except Exception:
                     comp_ids = []
         if target_id is not None:
@@ -699,6 +721,57 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
     if not step8_out.exists():
         return {}
 
+    id_map_cache: dict[str, dict[int, int]] = {}
+
+    def _load_step8_id_map(flt: str) -> dict[int, int]:
+        key = _normalize_filter_key(flt)
+        if key in id_map_cache:
+            return id_map_cache[key]
+        mapping: dict[int, int] = {}
+        candidates = [
+            (step8_out / f"master_catalog_{key}.tsv", "\t"),
+            (step8_out / f"id_mapping_{key}.csv", ","),
+        ]
+        for path, sep in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = read_csv_int64_source_id(path, sep=sep)
+            except Exception:
+                continue
+            id_map = _build_source_to_id_map(df)
+            for sid_int, id_val in id_map.items():
+                if sid_int not in mapping:
+                    mapping[sid_int] = id_val
+        id_map_cache[key] = mapping
+        return mapping
+
+    def _load_step6_id_map() -> dict[int, int]:
+        key = "__step6__"
+        if key in id_map_cache:
+            return id_map_cache[key]
+        candidates = [
+            step6_dir(result_dir) / "sourceid_to_ID.csv",
+            legacy_step5_refbuild_dir(result_dir) / "sourceid_to_ID.csv",
+            legacy_step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv",
+            result_dir / "sourceid_to_ID.csv",
+        ]
+        mapping: dict[int, int] = {}
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = read_csv_int64_source_id(path)
+            except Exception:
+                continue
+            id_map = _build_source_to_id_map(df)
+            for sid_int, id_val in id_map.items():
+                mapping[sid_int] = id_val
+            if mapping:
+                break
+        id_map_cache[key] = mapping
+        return mapping
+
     for sel_path in step8_out.glob("selection_*.json"):
         flt = sel_path.stem.replace("selection_", "")
         try:
@@ -708,9 +781,37 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
             target_source_id = data.get("target_source_id")
             comp_source_ids = data.get("comparison_source_ids", [])
 
+            target_id_val = int(target_id) if target_id is not None else None
+            comp_id_vals = [int(x) for x in comp_ids if x is not None]
+
+            # Recover IDs from source IDs when selection JSON has null/empty final IDs.
+            if target_id_val is None and target_source_id is not None:
+                sid_map = _load_step8_id_map(flt)
+                if int(target_source_id) in sid_map:
+                    target_id_val = int(sid_map[int(target_source_id)])
+                else:
+                    step6_map = _load_step6_id_map()
+                    if int(target_source_id) in step6_map:
+                        target_id_val = int(step6_map[int(target_source_id)])
+            if not comp_id_vals and comp_source_ids:
+                sid_map = _load_step8_id_map(flt)
+                if sid_map:
+                    comp_id_vals = sorted({
+                        int(sid_map[int(x)])
+                        for x in comp_source_ids
+                        if x is not None and int(x) in sid_map
+                    })
+                if not comp_id_vals:
+                    step6_map = _load_step6_id_map()
+                    comp_id_vals = sorted({
+                        int(step6_map[int(x)])
+                        for x in comp_source_ids
+                        if x is not None and int(x) in step6_map
+                    })
+
             filter_selections[flt] = {
-                "target_id": int(target_id) if target_id is not None else None,
-                "comparison_ids": [int(x) for x in comp_ids if x is not None],
+                "target_id": target_id_val,
+                "comparison_ids": comp_id_vals,
                 "target_source_id": int(target_source_id) if target_source_id is not None else None,
                 "comparison_source_ids": [int(x) for x in comp_source_ids if x is not None],
             }
@@ -1600,8 +1701,12 @@ class LightCurveBuilderWindow(StepWindowBase):
 
     def _update_comp_ids_from_input(self):
         self.comp_ids_list = _safe_int_list(self.comp_edit.text())
-        if not self.comp_candidate_ids:
-            self.comp_candidate_ids = list(self.comp_ids_list)
+        if self.comp_ids_list:
+            # Keep candidate list in sync with currently active IDs loaded from selection/input.
+            merged = sorted({int(x) for x in self.comp_candidate_ids} | set(self.comp_ids_list))
+            self.comp_candidate_ids = merged
+        elif not self.comp_candidate_ids:
+            self.comp_candidate_ids = []
         if self.comp_index >= len(self.comp_ids_list):
             self.comp_index = 0
         self._update_plot_info()
@@ -1672,10 +1777,10 @@ class LightCurveBuilderWindow(StepWindowBase):
             return None
 
         try:
-            df = pd.read_csv(phot_path, sep="\t")
+            df = read_csv_int64_source_id(phot_path, sep="\t")
         except Exception:
             try:
-                df = pd.read_csv(phot_path)
+                df = read_csv_int64_source_id(phot_path)
             except Exception:
                 df = None
 
@@ -1700,10 +1805,10 @@ class LightCurveBuilderWindow(StepWindowBase):
             if not phot_path.exists():
                 return fname, None
             try:
-                df = pd.read_csv(phot_path, sep="\t")
+                df = read_csv_int64_source_id(phot_path, sep="\t")
             except Exception:
                 try:
-                    df = pd.read_csv(phot_path)
+                    df = read_csv_int64_source_id(phot_path)
                 except Exception:
                     df = None
             return fname, df
@@ -1818,7 +1923,7 @@ class LightCurveBuilderWindow(StepWindowBase):
 
             row = pd.DataFrame()
             if use_source_id and comp_source_id is not None and "source_id" in df.columns:
-                row = df[df["source_id"].astype("int64") == int(comp_source_id)]
+                row = _select_rows_by_source_id(df, int(comp_source_id))
             if row.empty and "ID" in df.columns:
                 row = df[df["ID"] == int(star_id)]
 
@@ -1965,7 +2070,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             # Target
             row_t = pd.DataFrame()
             if use_source_id and target_source_id is not None and "source_id" in df.columns:
-                row_t = df[df["source_id"].astype("int64") == int(target_source_id)]
+                row_t = _select_rows_by_source_id(df, int(target_source_id))
             if row_t.empty and "ID" in df.columns:
                 row_t = df[df["ID"] == int(target_id)]
 
@@ -1983,7 +2088,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             for cid in comp_ids:
                 row_c = pd.DataFrame()
                 if use_source_id and cid in comp_source_map and "source_id" in df.columns:
-                    row_c = df[df["source_id"].astype("int64") == int(comp_source_map[cid])]
+                    row_c = _select_rows_by_source_id(df, int(comp_source_map[cid]))
                 if row_c.empty and "ID" in df.columns:
                     row_c = df[df["ID"] == int(cid)]
                 if not row_c.empty and np.isfinite(_safe_float(row_c["mag"].values[0])):
@@ -2170,14 +2275,14 @@ class LightCurveBuilderWindow(StepWindowBase):
             # 타겟 매칭 (source_id 우선, 없으면 ID)
             row_t = pd.DataFrame()
             if use_source_id and target_source_id is not None and "source_id" in df.columns:
-                row_t = df[df["source_id"].astype("int64") == int(target_source_id)]
+                row_t = _select_rows_by_source_id(df, int(target_source_id))
             if row_t.empty and "ID" in df.columns:
                 row_t = df[df["ID"] == int(target_id)]
 
             # 비교성 매칭 (source_id 우선, 없으면 ID)
             row_c = pd.DataFrame()
             if use_source_id and comp_source_id is not None and "source_id" in df.columns:
-                row_c = df[df["source_id"].astype("int64") == int(comp_source_id)]
+                row_c = _select_rows_by_source_id(df, int(comp_source_id))
             if row_c.empty and "ID" in df.columns:
                 row_c = df[df["ID"] == int(comp_id)]
 
@@ -3112,8 +3217,8 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.log(f"[BUILD] Datasets: {len(self.datasets)}")
 
         # QC 요약 저장
-        if self.comp_candidate_ids:
-            qc_rows = self._compute_comp_qc(self.datasets[0][1], target_id, self.comp_candidate_ids, verbose=False)
+        if active_comp_ids:
+            qc_rows = self._compute_comp_qc(self.datasets[0][1], target_id, active_comp_ids, verbose=False)
             self._save_comp_qc_summary(Path(self.datasets[0][1]), qc_rows)
 
         P = self.params.P

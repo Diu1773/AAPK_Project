@@ -82,8 +82,13 @@ min_pairs = 15
 transform_mode = "similarity"
 mutual_nearest = true
 two_pass_enable = true              # Enable two-pass matching (tight -> loose)
-tight_radius_arcsec = 1.0           # Pass 1: high confidence matches
-loose_radius_arcsec = 3.0           # Pass 2: remaining matches
+tight_radius_arcsec = 1.0           # Pass 1: high confidence matches (auto-floored to 0.4 * FWHM-based radius)
+loose_radius_arcsec = 3.0           # Pass 2: remaining matches (auto-floored to FWHM-based radius)
+min_correction_pairs = 3            # Min pass-1 pairs to apply shift/affine correction before pass 2
+min_affine_pairs = 6                # Min pass-1 pairs to use affine correction (else global shift)
+adaptive_retry_threshold = 0.5      # If match_rate < this after pass 2, retry with 2x loose_r (0=disable)
+fwhm_adaptive_floor = true          # Floor tight/loose radii to FWHM-based size (disable to use fixed arcsec only)
+geom_correction_enable = true       # Apply affine/shift correction from pass-1 seeds before pass 2
 
 [detection]
 engine = "dao"
@@ -153,6 +158,15 @@ small_scale = 1.0
 large_scale = 3.0
 min_n = 20
 scatter_max = 0.05
+optimize_scales = true
+small_scale_min = 0.8
+small_scale_max = 1.4
+large_scale_min = 2.4
+large_scale_max = 4.0
+scale_step = 0.2
+min_gap_fwhm = 1.0
+max_pairs = 24
+max_sources = 250
 min_snr = 40.0
 
 [hud5x]

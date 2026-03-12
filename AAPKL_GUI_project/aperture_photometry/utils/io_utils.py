@@ -7,6 +7,59 @@ from __future__ import annotations
 from pathlib import Path
 import time
 from collections import deque
+from typing import Union
+from decimal import Decimal, InvalidOperation
+
+import pandas as pd
+
+
+def _parse_int64_col(series: pd.Series) -> pd.array:
+    """Convert a string/object series of source_ids to pandas Int64.
+
+    - Exact integer strings: "2823345641878527872" → preserved with full precision
+    - Float strings (old format): "2823345641878528000.0" → int (already-rounded)
+    - Blank / nan / NA → pd.NA
+    """
+    def _parse(s):
+        if pd.isna(s):
+            return pd.NA
+        sval = str(s).strip()
+        if sval in ("", "nan", "NaN", "<NA>", "None"):
+            return pd.NA
+        try:
+            # Keep exact precision for integer-like decimal/exponent strings.
+            if "." in sval or "e" in sval.lower():
+                d = Decimal(sval)
+                if not d.is_finite():
+                    return pd.NA
+                if d != d.to_integral_value():
+                    return pd.NA
+                return int(d)
+            return int(sval)
+        except (ValueError, OverflowError, InvalidOperation):
+            return pd.NA
+    return pd.array([_parse(v) for v in series], dtype="Int64")
+
+
+def coerce_int64_source_id(series: pd.Series) -> pd.Series:
+    """Coerce arbitrary source_id values to nullable Int64 without float round-trip."""
+    if series is None:
+        return pd.Series(pd.array([], dtype="Int64"))
+    parsed = _parse_int64_col(series)
+    return pd.Series(parsed, index=series.index, dtype="Int64")
+
+
+def read_csv_int64_source_id(path: Union[str, Path], sep: str = ",", **kwargs) -> pd.DataFrame:
+    """Read a CSV/TSV file preserving 19-digit Gaia source_id precision.
+
+    pandas default read_csv promotes a column with mixed integer/NaN to float64,
+    silently rounding the last 3-4 digits of 19-digit Gaia source_ids.
+    This function reads source_id as string then converts to Int64.
+    """
+    df = pd.read_csv(path, sep=sep, dtype={"source_id": str}, **kwargs)
+    if "source_id" in df.columns:
+        df["source_id"] = coerce_int64_source_id(df["source_id"])
+    return df
 
 
 class TailLogger:

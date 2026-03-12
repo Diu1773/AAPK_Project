@@ -34,6 +34,7 @@ from ...utils.photometry_utils import (
     MAG_ERR_COEFF,
     MAD_TO_SIGMA,
 )
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.step_paths import (
     step2_cropped_dir,
     step4_dir,
@@ -263,7 +264,7 @@ class ExtinctionFitWorker(QThread):
         sub = sub.reset_index(drop=True)
         x = get_numeric_array(sub, "airmass")
         y = get_numeric_array(sub, "mag_inst")
-        star_ids = pd.to_numeric(sub["source_id"], errors="coerce").astype("int64").to_numpy()
+        star_ids = coerce_int64_source_id(sub["source_id"]).astype("int64").to_numpy()
         frame_ids = sub["file"].astype(str).to_numpy()
 
         base_mask = np.isfinite(x) & np.isfinite(y)
@@ -709,7 +710,7 @@ class ExtinctionFitWorker(QThread):
             return ([], 0)
 
         try:
-            df_id = pd.read_csv(idm_path)
+            df_id = read_csv_int64_source_id(idm_path)
         except Exception:
             return ([], 0)
         if "source_id" not in df_id.columns or "x" not in df_id.columns:
@@ -1617,6 +1618,9 @@ class ExtinctionFitWorker(QThread):
             if g_col is None or bp_col is None or rp_col is None:
                 if "source_id" not in df.columns:
                     raise RuntimeError("Gaia mags not available and source_id missing")
+                src_sid = coerce_int64_source_id(df["source_id"])
+                df = df.loc[src_sid.notna()].copy()
+                df["source_id"] = src_sid[src_sid.notna()].astype("int64")
                 gaia_path = step5_dir(result_dir) / "gaia_fov.ecsv"
                 if not gaia_path.exists():
                     gaia_path = legacy_step7_wcs_dir(result_dir) / "gaia_fov.ecsv"
@@ -1626,7 +1630,9 @@ class ExtinctionFitWorker(QThread):
                     raise RuntimeError("gaia_fov.ecsv not found")
                 t_gaia = Table.read(gaia_path, format="ascii.ecsv")
                 gaia_df = t_gaia.to_pandas()
-                gaia_df["source_id"] = gaia_df["source_id"].astype("int64")
+                gaia_sid = coerce_int64_source_id(gaia_df["source_id"])
+                gaia_df = gaia_df.loc[gaia_sid.notna()].copy()
+                gaia_df["source_id"] = gaia_sid[gaia_sid.notna()].astype("int64")
                 gaia_cols = ["source_id", "phot_g_mean_mag"]
                 if "phot_bp_mean_mag" in gaia_df.columns:
                     gaia_cols.append("phot_bp_mean_mag")

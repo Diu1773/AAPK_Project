@@ -13,6 +13,8 @@ from __future__ import annotations
 import time
 import json
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Set, Optional
 
@@ -47,6 +49,7 @@ from ...utils.step_paths import (
     legacy_step7_wcs_dir,
     legacy_step7_refbuild_dir,
 )
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -126,6 +129,27 @@ class MasterIdEditorWindow(StepWindowBase):
         self._id_registry: Dict[str, Dict[int, int]] = {}  # filter -> {source_id: stable_id}
         self._next_id: Dict[str, int] = {}  # filter -> next available ID
         self._retired_ids: Dict[str, Set[int]] = {}  # filter -> set of retired IDs (never reuse)
+
+        # Performance caches
+        self._fits_cache: dict = {}
+        self._fits_cache_order: list = []
+        self._FITS_CACHE_SIZE = max(3, int(getattr(params.P, "step8_fits_cache_size", 8)))
+        self._idmatch_cache: dict = {}
+        self._norm_cache: dict = {}
+        self._display_cache: dict = {}
+        self._display_cache_order: list = []
+        self._file_path_cache: Dict[str, Path] = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending: Set[str] = set()
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        # Scatter artist refs (reused for fast overlay)
+        self._scat_matched_gaia = None
+        self._scat_matched_no_gaia = None
+        self._scat_detection_only = None
+        self._scat_comp = None
+        self._scat_target = None
+        self._scat_ref_only = None
+        self._scat_selected = None
 
         # Matplotlib components
         self.figure = None
@@ -551,7 +575,7 @@ class MasterIdEditorWindow(StepWindowBase):
                         catalog_path = matches[0]
                 if catalog_path.exists():
                     try:
-                        self.filter_catalogs[flt] = pd.read_csv(catalog_path, sep="\t")
+                        self.filter_catalogs[flt] = read_csv_int64_source_id(catalog_path, sep="\t")
                         step7_available = True
                         self.log(f"Ref catalog loaded: {catalog_path.name}")
                     except Exception as e:
@@ -631,11 +655,13 @@ class MasterIdEditorWindow(StepWindowBase):
                     tab.rename_columns(cols, lower)
                 self.gaia_df = tab.to_pandas()
                 if "source_id" in self.gaia_df.columns:
-                    self.gaia_df["source_id"] = self.gaia_df["source_id"].astype("int64")
+                    sid_series = coerce_int64_source_id(self.gaia_df["source_id"])
+                    self.gaia_df = self.gaia_df.loc[sid_series.notna()].copy()
+                    self.gaia_df["source_id"] = sid_series[sid_series.notna()].astype("int64")
                 self._gaia_gmag_map = {}
                 self._gaia_radec_map = {}
                 if self.gaia_df is not None and "source_id" in self.gaia_df.columns:
-                    sid_series = pd.to_numeric(self.gaia_df["source_id"], errors="coerce")
+                    sid_series = coerce_int64_source_id(self.gaia_df["source_id"])
                     g_col = None
                     for c in ("phot_g_mean_mag", "gaia_g", "gaia_G"):
                         if c in self.gaia_df.columns:
@@ -672,12 +698,12 @@ class MasterIdEditorWindow(StepWindowBase):
         if not step6_path.exists():
             return
         try:
-            df = pd.read_csv(step6_path)
+            df = read_csv_int64_source_id(step6_path)
             if "source_id" not in df.columns:
                 return
-            df["source_id"] = pd.to_numeric(df["source_id"], errors="coerce")
-            df = df.dropna(subset=["source_id"])
-            df["source_id"] = df["source_id"].astype("int64")
+            sid_series = coerce_int64_source_id(df["source_id"])
+            df = df.loc[sid_series.notna()].copy()
+            df["source_id"] = sid_series[sid_series.notna()].astype("int64")
             df = df.set_index("source_id", drop=False)
             self.step6_master_df = df
 
@@ -881,7 +907,7 @@ class MasterIdEditorWindow(StepWindowBase):
             if not path.exists():
                 continue
             try:
-                df = pd.read_csv(path, sep="\t")
+                df = read_csv_int64_source_id(path, sep="\t")
                 if "source_id" not in df.columns:
                     continue
                 self.filter_master_ids[flt] = self._sanitize_master_catalog_source_ids(flt, df)
@@ -900,22 +926,22 @@ class MasterIdEditorWindow(StepWindowBase):
         for cat in catalogs:
             if cat is None or "source_id" not in cat.columns:
                 continue
-            vals = pd.to_numeric(cat["source_id"], errors="coerce").dropna().astype("int64")
+            vals = coerce_int64_source_id(cat["source_id"]).dropna().astype("int64")
             known.update(int(v) for v in vals.tolist() if int(v) > 0)
 
         if self.step6_master_df is not None and "source_id" in self.step6_master_df.columns:
-            vals = pd.to_numeric(self.step6_master_df["source_id"], errors="coerce").dropna().astype("int64")
+            vals = coerce_int64_source_id(self.step6_master_df["source_id"]).dropna().astype("int64")
             known.update(int(v) for v in vals.tolist() if int(v) > 0)
 
         if self.gaia_df is not None and "source_id" in self.gaia_df.columns:
-            vals = pd.to_numeric(self.gaia_df["source_id"], errors="coerce").dropna().astype("int64")
+            vals = coerce_int64_source_id(self.gaia_df["source_id"]).dropna().astype("int64")
             known.update(int(v) for v in vals.tolist() if int(v) > 0)
 
         return known
 
     def _sanitize_master_catalog_source_ids(self, flt: str, df: pd.DataFrame) -> Set[int]:
         """Repair legacy/corrupted source_id values in saved Step8 catalogs."""
-        sid_series = pd.to_numeric(df.get("source_id"), errors="coerce").dropna().astype("int64")
+        sid_series = coerce_int64_source_id(df.get("source_id")).dropna().astype("int64")
         raw_ids = [int(v) for v in sid_series.tolist()]
         if not raw_ids:
             return set()
@@ -952,7 +978,7 @@ class MasterIdEditorWindow(StepWindowBase):
         # and small mirrored ID (1,2,3...).
         if "ID" in df.columns:
             pair = pd.DataFrame({
-                "source_id": pd.to_numeric(df["source_id"], errors="coerce"),
+                "source_id": coerce_int64_source_id(df["source_id"]),
                 "ID": pd.to_numeric(df["ID"], errors="coerce"),
             })
             pair = pair[pair["source_id"].notna() & pair["ID"].notna()].copy()
@@ -1040,14 +1066,14 @@ class MasterIdEditorWindow(StepWindowBase):
             return
 
         try:
-            df = pd.read_csv(path)
+            df = read_csv_int64_source_id(path)
             if not {"source_id", "ID"} <= set(df.columns):
                 return
-            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
-            id_vals = pd.to_numeric(df["ID"], errors="coerce")
+            sid_vals = coerce_int64_source_id(df["source_id"])
+            id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
             mapping: Dict[int, int] = {}
             for sid, sid_id in zip(sid_vals, id_vals):
-                if np.isfinite(sid) and np.isfinite(sid_id):
+                if pd.notna(sid) and pd.notna(sid_id):
                     mapping[int(sid)] = int(sid_id)
             if mapping:
                 self._global_id_map = mapping
@@ -1081,9 +1107,9 @@ class MasterIdEditorWindow(StepWindowBase):
         legacy_path = step8_dir / f"master_catalog_{flt}.tsv"
         if legacy_path.exists():
             try:
-                df = pd.read_csv(legacy_path, sep="\t")
+                df = read_csv_int64_source_id(legacy_path, sep="\t")
                 if {"source_id", "ID"} <= set(df.columns):
-                    sid_col = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
+                    sid_col = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
                     id_col = pd.to_numeric(df["ID"], errors="coerce").dropna().astype("int64")
                     if len(sid_col) == len(id_col):
                         self._id_registry[flt] = dict(zip(sid_col.tolist(), id_col.tolist()))
@@ -1178,7 +1204,7 @@ class MasterIdEditorWindow(StepWindowBase):
         if flt in self.filter_catalogs:
             cat = self.filter_catalogs[flt]
             if "source_id" in cat.columns:
-                cat_sids = pd.to_numeric(cat["source_id"], errors="coerce").dropna().astype("int64")
+                cat_sids = coerce_int64_source_id(cat["source_id"]).dropna().astype("int64")
                 all_sids.update(cat_sids.tolist())
 
         # From master_ids
@@ -1224,16 +1250,16 @@ class MasterIdEditorWindow(StepWindowBase):
             if not p.exists():
                 continue
             try:
-                df = pd.read_csv(p, usecols=["source_id"])
+                df = read_csv_int64_source_id(p, usecols=["source_id"])
                 if "source_id" not in df.columns:
                     continue
-                vals = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
+                vals = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
                 sids.update(vals.tolist())
             except Exception:
                 continue
 
         if not sids and self.step6_master_df is not None:
-            sids = set(self.step6_master_df["source_id"].astype("int64").tolist())
+            sids = set(coerce_int64_source_id(self.step6_master_df["source_id"]).dropna().astype("int64").tolist())
 
         self._filter_all_source_ids[flt] = set(sids)
         return set(sids)
@@ -1264,8 +1290,8 @@ class MasterIdEditorWindow(StepWindowBase):
             if not p.exists():
                 continue
             try:
-                df = pd.read_csv(p, usecols=["source_id"])
-                vals = pd.to_numeric(df["source_id"], errors="coerce").dropna().astype("int64")
+                df = read_csv_int64_source_id(p, usecols=["source_id"])
+                vals = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
                 sid_counts.update(vals.tolist())
                 n_frames += 1
             except Exception:
@@ -1508,9 +1534,9 @@ class MasterIdEditorWindow(StepWindowBase):
         if flt in self.filter_catalogs:
             base_df = self.filter_catalogs[flt].copy()
             if "source_id" in base_df.columns:
-                base_df["source_id"] = pd.to_numeric(base_df["source_id"], errors="coerce")
-                base_df = base_df.dropna(subset=["source_id"])
-                base_df["source_id"] = base_df["source_id"].astype("int64")
+                sid_series = coerce_int64_source_id(base_df["source_id"])
+                base_df = base_df.loc[sid_series.notna()].copy()
+                base_df["source_id"] = sid_series[sid_series.notna()].astype("int64")
                 base_df = base_df[base_df["source_id"].isin(master_ids)]
         if base_df is None:
             base_df = pd.DataFrame(columns=["source_id"])
@@ -1521,7 +1547,7 @@ class MasterIdEditorWindow(StepWindowBase):
         else:
             present = set()
             if "source_id" in base_df.columns and not base_df.empty:
-                present = set(base_df["source_id"].astype("int64").tolist())
+                present = set(coerce_int64_source_id(base_df["source_id"]).dropna().astype("int64").tolist())
             missing = set(master_ids) - present
 
             if missing:
@@ -1673,7 +1699,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if self.current_filter in self.filter_catalogs:
             cat = self.filter_catalogs[self.current_filter]
-            self.catalog_ids = set(cat["source_id"].astype("int64").tolist())
+            self.catalog_ids = set(coerce_int64_source_id(cat["source_id"]).dropna().astype("int64").tolist())
 
         # Step 8 master (final) load/init
         self._ensure_master_ids_for_filter(self.current_filter)
@@ -1706,6 +1732,14 @@ class MasterIdEditorWindow(StepWindowBase):
         self.file_combo.clear()
         self.file_combo.addItems(self.file_list)
         self.file_combo.blockSignals(False)
+        with self._prefetch_lock:
+            self._fits_cache.clear()
+            self._fits_cache_order.clear()
+            self._display_cache.clear()
+            self._display_cache_order.clear()
+            self._norm_cache.clear()
+            self._file_path_cache.clear()
+            self._prefetch_pending.clear()
 
         if self.file_list:
             if self._pending_frame_index is not None:
@@ -1720,104 +1754,198 @@ class MasterIdEditorWindow(StepWindowBase):
     def on_file_changed(self, index):
         if index < 0 or index >= len(self.file_list):
             return
-        self.load_and_display()
+        self.load_and_display(quick_switch=True)
 
-    def load_and_display(self):
+    def _resolve_fits_path(self, filename: str) -> Optional[Path]:
+        cached = self._file_path_cache.get(filename)
+        if cached is not None and cached.exists():
+            return cached
+
+        cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+        legacy_cropped_dir = self.params.P.result_dir / "cropped"
+        data_dir = Path(self.params.P.data_dir)
+        mapped_path = None
+        try:
+            mapped_path = self.params.get_file_path(filename)
+        except Exception:
+            mapped_path = None
+
+        candidates = []
+        if mapped_path:
+            candidates.append(Path(mapped_path))
+        candidates.extend([
+            cropped_dir / filename,
+            legacy_cropped_dir / filename,
+            data_dir / filename,
+        ])
+        if not filename.endswith((".fits", ".fit", ".fts", ".fit.fz", ".fits.fz")):
+            candidates.extend([
+                cropped_dir / f"{filename}.fits",
+                cropped_dir / f"{filename}.fit",
+                cropped_dir / f"{filename}.fit.fz",
+                cropped_dir / f"{filename}.fits.fz",
+                legacy_cropped_dir / f"{filename}.fits",
+                legacy_cropped_dir / f"{filename}.fit",
+                legacy_cropped_dir / f"{filename}.fit.fz",
+                legacy_cropped_dir / f"{filename}.fits.fz",
+                data_dir / f"{filename}.fits",
+                data_dir / f"{filename}.fit",
+                data_dir / f"{filename}.fit.fz",
+                data_dir / f"{filename}.fits.fz",
+            ])
+        for cand in candidates:
+            if cand.exists():
+                self._file_path_cache[filename] = cand
+                return cand
+        for d in (cropped_dir, data_dir):
+            if not d.exists():
+                continue
+            matches = list(d.glob(f"{filename}*")) + list(d.glob(f"*{filename}*"))
+            for m in matches:
+                if m.is_file() and m.name.lower().endswith((".fits", ".fit", ".fts", ".fit.fz", ".fits.fz")):
+                    self._file_path_cache[filename] = m
+                    return m
+        return None
+
+    def load_and_display(self, quick_switch: bool = False):
         filename = self.file_combo.currentText()
         if not filename:
             return
         try:
             self._restore_file_context()
-            # 파일 경로 찾기 (여러 위치 시도)
-            file_path = None
-            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-            legacy_cropped_dir = self.params.P.result_dir / "cropped"
-            data_dir = Path(self.params.P.data_dir)
-            mapped_path = None
-            try:
-                mapped_path = self.params.get_file_path(filename)
-            except Exception:
-                mapped_path = None
-
-            # 후보 경로들
-            candidates = []
-            if mapped_path:
-                candidates.append(Path(mapped_path))
-            candidates.extend([
-                cropped_dir / filename,
-                legacy_cropped_dir / filename,
-                data_dir / filename,
-            ])
-            # 확장자 없으면 추가
-            if not filename.endswith(('.fits', '.fit', '.fts', '.fit.fz', '.fits.fz')):
-                candidates.extend([
-                    cropped_dir / f"{filename}.fits",
-                    cropped_dir / f"{filename}.fit",
-                    cropped_dir / f"{filename}.fit.fz",
-                    cropped_dir / f"{filename}.fits.fz",
-                    legacy_cropped_dir / f"{filename}.fits",
-                    legacy_cropped_dir / f"{filename}.fit",
-                    legacy_cropped_dir / f"{filename}.fit.fz",
-                    legacy_cropped_dir / f"{filename}.fits.fz",
-                    data_dir / f"{filename}.fits",
-                    data_dir / f"{filename}.fit",
-                    data_dir / f"{filename}.fit.fz",
-                    data_dir / f"{filename}.fits.fz",
-                ])
-
-            # 후보에서 존재하는 파일 찾기
-            for cand in candidates:
-                if cand.exists():
-                    file_path = cand
-                    break
-
-            # 못 찾으면 glob 시도
-            if file_path is None:
-                for d in [cropped_dir, data_dir]:
-                    if d.exists():
-                        matches = list(d.glob(f"{filename}*")) + list(d.glob(f"*{filename}*"))
-                        for m in matches:
-                            if m.is_file() and m.name.lower().endswith(('.fits', '.fit', '.fts', '.fit.fz', '.fits.fz')):
-                                file_path = m
-                                break
-                    if file_path:
-                        break
+            file_path = self._resolve_fits_path(filename)
 
             if file_path is None or not file_path.exists():
                 raise FileNotFoundError(f"Cannot find {filename}")
 
-            with fits.open(file_path) as hdul:
-                self.image_data = hdul[0].data.astype(float)
-                self.header = hdul[0].header
+            data, header = self._load_fits_cached(file_path)
+            shape_changed = (self.image_data is None or data.shape != self.image_data.shape)
+            self.image_data = data
+            self.header = header
             self.current_filename = filename
-            self.xlim_original = None
-            self.ylim_original = None
-            self._imshow_obj = None
-            self._normalized_cache = None
+            if (not quick_switch) or shape_changed:
+                self.xlim_original = None
+                self.ylim_original = None
+                self._imshow_obj = None
             self.reset_stretch_plot_values()
             self.load_idmatch_for_file(filename)
-            self.display_image(full_redraw=True)
+            self.display_image(full_redraw=(self._imshow_obj is None))
             self.update_overlay()
             self.update_master_table()
+            self._schedule_prefetch_neighbors()
         except Exception as e:
             import traceback
             self.log(f"[ERROR] Failed to load {filename}: {e}\n{traceback.format_exc()}")
             QMessageBox.critical(self, "Error", f"Failed to load {filename}:\n{str(e)}")
 
+    def _load_fits_cached(self, file_path: Path):
+        """Load FITS data/header with LRU cache to avoid repeated disk I/O."""
+        key = str(file_path)
+        with self._prefetch_lock:
+            if key in self._fits_cache:
+                try:
+                    self._fits_cache_order.remove(key)
+                except ValueError:
+                    pass
+                self._fits_cache_order.append(key)
+                return self._fits_cache[key]
+        with fits.open(file_path, memmap=False) as hdul:
+            data_raw = hdul[0].data
+            if data_raw is None:
+                raise ValueError(f"FITS image data is empty: {file_path.name}")
+            data = np.asarray(data_raw, dtype=np.float32)
+            header = hdul[0].header.copy()
+        with self._prefetch_lock:
+            if key in self._fits_cache:
+                try:
+                    self._fits_cache_order.remove(key)
+                except ValueError:
+                    pass
+                self._fits_cache_order.append(key)
+                return self._fits_cache[key]
+            if len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+                evict = self._fits_cache_order.pop(0)
+                self._fits_cache.pop(evict, None)
+            self._fits_cache[key] = (data, header)
+            self._fits_cache_order.append(key)
+            return data, header
+
+    def _prefetch_fits_worker(self, filename: str):
+        try:
+            path = self._resolve_fits_path(filename)
+            if path is None or (not path.exists()):
+                return
+            key = str(path)
+            with self._prefetch_lock:
+                if key in self._fits_cache:
+                    return
+            with fits.open(path, memmap=False) as hdul:
+                data_raw = hdul[0].data
+                if data_raw is None:
+                    return
+                data = np.asarray(data_raw, dtype=np.float32)
+                header = hdul[0].header.copy()
+            with self._prefetch_lock:
+                if key not in self._fits_cache:
+                    if len(self._fits_cache_order) >= self._FITS_CACHE_SIZE:
+                        evict = self._fits_cache_order.pop(0)
+                        self._fits_cache.pop(evict, None)
+                    self._fits_cache[key] = (data, header)
+                    self._fits_cache_order.append(key)
+        except Exception:
+            pass
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_pending.discard(filename)
+
+    def _schedule_prefetch_neighbors(self):
+        if not self.file_list:
+            return
+        idx = self.file_combo.currentIndex()
+        if idx < 0:
+            return
+        candidates = []
+        if idx + 1 < len(self.file_list):
+            candidates.append(self.file_list[idx + 1])
+        if idx - 1 >= 0:
+            candidates.append(self.file_list[idx - 1])
+        for fname in candidates:
+            with self._prefetch_lock:
+                if fname in self._prefetch_pending:
+                    continue
+                self._prefetch_pending.add(fname)
+            try:
+                self._prefetch_executor.submit(self._prefetch_fits_worker, fname)
+            except Exception:
+                with self._prefetch_lock:
+                    self._prefetch_pending.discard(fname)
+
+    def _safe_offsets(self, x, y):
+        """Return Nx2 array for scatter set_offsets(), or empty array if no points."""
+        if len(x) == 0:
+            return np.empty((0, 2))
+        return np.column_stack([x, y])
+
     def load_idmatch_for_file(self, filename):
         """Step 7 idmatch 파일 로드"""
+        if filename in self._idmatch_cache:
+            self.idmatch_df = self._idmatch_cache[filename]
+            return
+
         step6_dir = self.params.P.result_dir / "step7_idmatch"
         legacy_idmatch = legacy_step6_idmatch_dir(self.params.P.result_dir)
         idmatch_path = _resolve_idmatch_path(step6_dir, legacy_idmatch, filename)
 
         if idmatch_path.exists():
             try:
-                df = pd.read_csv(idmatch_path)
+                df = read_csv_int64_source_id(idmatch_path)
                 if {"x", "y", "source_id"} <= set(df.columns):
+                    df["source_id"] = coerce_int64_source_id(df["source_id"])
                     self.idmatch_df = df
+                    self._idmatch_cache[filename] = df
                     try:
-                        sids = pd.to_numeric(df["source_id"], errors="coerce")
-                        n_total = int(len(sids))
+                        sids = df["source_id"].dropna().astype("int64")
+                        n_total = len(df)
                         n_gaia = int((sids > 0).sum())
                         n_local = int((sids < 0).sum())
                         self.log(f"IDMatch loaded: {idmatch_path} (total {n_total}, Gaia {n_gaia}, local {n_local})")
@@ -1829,16 +1957,15 @@ class MasterIdEditorWindow(StepWindowBase):
 
         self.log(f"IDMatch missing or invalid: {idmatch_path}")
         self.idmatch_df = pd.DataFrame(columns=["x", "y", "source_id"])
+        self._idmatch_cache[filename] = self.idmatch_df
 
     def display_image(self, full_redraw=False):
         if self.image_data is None:
             return
 
-        normalized = self.normalize_image()
-        if normalized is None:
+        stretched = self._get_stretched_display_cached()
+        if stretched is None:
             return
-
-        stretched = self.apply_stretch(normalized)
 
         if self._imshow_obj is not None and not full_redraw:
             self._imshow_obj.set_data(stretched)
@@ -1864,6 +1991,22 @@ class MasterIdEditorWindow(StepWindowBase):
             self.ax.set_xlim(xlim_current)
             self.ax.set_ylim(ylim_current)
 
+        # Pre-create scatter artists for fast overlay reuse
+        self._scat_detection_only = self.ax.scatter(
+            [], [], s=20, facecolors='none', edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+        self._scat_matched_no_gaia = self.ax.scatter(
+            [], [], s=26, facecolors='none', edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+        self._scat_matched_gaia = self.ax.scatter(
+            [], [], s=28, facecolors='none', edgecolors='#4CAF50', linewidths=1.1, alpha=0.85)
+        self._scat_comp = self.ax.scatter(
+            [], [], s=36, facecolors='none', edgecolors='#D32F2F', linewidths=1.5, alpha=0.9, marker='o')
+        self._scat_target = self.ax.scatter(
+            [], [], s=46, facecolors='none', edgecolors='#C62828', linewidths=1.8, alpha=0.95, marker='s')
+        self._scat_ref_only = self.ax.scatter(
+            [], [], s=18, facecolors='none', edgecolors='#FFD54F', linewidths=0.9, alpha=0.7)
+        self._scat_selected = self.ax.scatter(
+            [], [], s=70, facecolors='none', edgecolors='red', linewidths=1.8, alpha=0.9)
+
         self.canvas.draw_idle()
 
     def update_overlay(self):
@@ -1871,8 +2014,14 @@ class MasterIdEditorWindow(StepWindowBase):
             self.canvas.draw_idle()
             return
 
-        for coll in self.ax.collections[:]:
-            coll.remove()
+        # Use pre-created scatter artists if available, else fall back to remove+create
+        _have_artists = self._scat_matched_gaia is not None
+
+        if not _have_artists:
+            for coll in self.ax.collections[:]:
+                coll.remove()
+
+        # Always remove text artists (labels must be recreated each time)
         for txt in list(self.ax.texts):
             try:
                 txt.remove()
@@ -1881,7 +2030,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         x = self.idmatch_df["x"].to_numpy(float)
         y = self.idmatch_df["y"].to_numpy(float)
-        sid_vals = pd.to_numeric(self.idmatch_df["source_id"], errors="coerce")
+        sid_vals = coerce_int64_source_id(self.idmatch_df["source_id"])
         sids = sid_vals.fillna(-1).astype("int64").to_numpy()
 
         in_master = np.array([sid in self.master_ids for sid in sids])
@@ -1893,8 +2042,7 @@ class MasterIdEditorWindow(StepWindowBase):
         if self.current_filter in self.filter_catalogs:
             ref_cat = self.filter_catalogs[self.current_filter]
             if "source_id" in ref_cat.columns:
-                ref_sid = pd.to_numeric(ref_cat["source_id"], errors="coerce")
-                ref_sid = ref_sid.dropna().astype("int64")
+                ref_sid = coerce_int64_source_id(ref_cat["source_id"]).dropna().astype("int64")
                 ref_ids = set(ref_sid.tolist())
             g_col = None
             for col in ("gaia_G", "phot_g_mean_mag", "gaia_g"):
@@ -1903,7 +2051,7 @@ class MasterIdEditorWindow(StepWindowBase):
                     break
             if g_col is not None and "source_id" in ref_cat.columns:
                 g_vals = pd.to_numeric(ref_cat[g_col], errors="coerce")
-                sid_vals2 = pd.to_numeric(ref_cat["source_id"], errors="coerce")
+                sid_vals2 = coerce_int64_source_id(ref_cat["source_id"])
                 mask = g_vals.notna() & sid_vals2.notna()
                 gaia_ids = set(sid_vals2[mask].astype("int64").tolist())
 
@@ -1931,30 +2079,53 @@ class MasterIdEditorWindow(StepWindowBase):
             matched_no_gaia = is_matched & ~is_gaia_matched & ~is_comp & ~is_target
             detection_only = (~is_matched) & ~is_comp & ~is_target
 
-            if not show_selected_only:
-                if show_detection_only:
-                    # Detection only (unmatched) - orange
-                    self.ax.scatter(x[detection_only], y[detection_only], s=20, facecolors='none',
-                                    edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+            if _have_artists:
+                # Fast path: update pre-created scatter artists via set_offsets()
+                show_det = (not show_selected_only) and show_detection_only
+                self._scat_detection_only.set_offsets(
+                    self._safe_offsets(x[detection_only], y[detection_only]) if show_det
+                    else np.empty((0, 2)))
+                self._scat_detection_only.set_visible(show_det)
 
-                if show_matched_no_gaia:
-                    # Matched (no Gaia) - cyan
-                    self.ax.scatter(x[matched_no_gaia], y[matched_no_gaia], s=26, facecolors='none',
-                                    edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+                show_mng = (not show_selected_only) and show_matched_no_gaia
+                self._scat_matched_no_gaia.set_offsets(
+                    self._safe_offsets(x[matched_no_gaia], y[matched_no_gaia]) if show_mng
+                    else np.empty((0, 2)))
+                self._scat_matched_no_gaia.set_visible(show_mng)
 
-                if show_matched_gaia:
-                    # Matched + Gaia - green
-                    self.ax.scatter(x[matched_gaia], y[matched_gaia],
-                                    s=28, facecolors='none', edgecolors='#4CAF50', linewidths=1.1, alpha=0.85)
+                show_mg = (not show_selected_only) and show_matched_gaia
+                self._scat_matched_gaia.set_offsets(
+                    self._safe_offsets(x[matched_gaia], y[matched_gaia]) if show_mg
+                    else np.empty((0, 2)))
+                self._scat_matched_gaia.set_visible(show_mg)
 
-            # 비교성 (빨간 원)
-            if show_comp:
-                self.ax.scatter(x[is_comp], y[is_comp], s=36, facecolors='none',
-                                edgecolors='#D32F2F', linewidths=1.5, alpha=0.9, marker='o')
-            # 타겟 (빨간 사각형)
-            if show_target:
-                self.ax.scatter(x[is_target], y[is_target], s=46, facecolors='none',
-                                edgecolors='#C62828', linewidths=1.8, alpha=0.95, marker='s')
+                self._scat_comp.set_offsets(
+                    self._safe_offsets(x[is_comp], y[is_comp]) if show_comp
+                    else np.empty((0, 2)))
+                self._scat_comp.set_visible(show_comp)
+
+                self._scat_target.set_offsets(
+                    self._safe_offsets(x[is_target], y[is_target]) if show_target
+                    else np.empty((0, 2)))
+                self._scat_target.set_visible(show_target)
+            else:
+                # Slow fallback: create new scatter objects
+                if not show_selected_only:
+                    if show_detection_only:
+                        self.ax.scatter(x[detection_only], y[detection_only], s=20, facecolors='none',
+                                        edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+                    if show_matched_no_gaia:
+                        self.ax.scatter(x[matched_no_gaia], y[matched_no_gaia], s=26, facecolors='none',
+                                        edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+                    if show_matched_gaia:
+                        self.ax.scatter(x[matched_gaia], y[matched_gaia],
+                                        s=28, facecolors='none', edgecolors='#4CAF50', linewidths=1.1, alpha=0.85)
+                if show_comp:
+                    self.ax.scatter(x[is_comp], y[is_comp], s=36, facecolors='none',
+                                    edgecolors='#D32F2F', linewidths=1.5, alpha=0.9, marker='o')
+                if show_target:
+                    self.ax.scatter(x[is_target], y[is_target], s=46, facecolors='none',
+                                    edgecolors='#C62828', linewidths=1.8, alpha=0.95, marker='s')
 
             label_mask = np.isfinite(x) & np.isfinite(y) & (sids != -1)
             if show_selected_only:
@@ -1990,6 +2161,9 @@ class MasterIdEditorWindow(StepWindowBase):
                     )
 
         # Ref-only (missing in current frame) - yellow
+        x_ref_all = np.empty(0)
+        y_ref_all = np.empty(0)
+        ref_label_data = []
         if not show_selected_only and ref_ids and show_ref_only:
             matched_ids = set(int(s) for s in sids[sids != -1])
             missing_ids = sorted(ref_ids - matched_ids)
@@ -2003,44 +2177,56 @@ class MasterIdEditorWindow(StepWindowBase):
                     if mask.any():
                         w = self._get_wcs()
                         if w is not None:
-                            x_ref, y_ref = w.all_world2pix(
+                            x_ref_all, y_ref_all = w.all_world2pix(
                                 ra_vals[mask].to_numpy(float),
                                 dec_vals[mask].to_numpy(float),
                                 0,
                             )
-                            self.ax.scatter(
-                                x_ref, y_ref, s=18, facecolors="none",
-                                edgecolors="#FFD54F", linewidths=0.9, alpha=0.7
-                            )
-                            label_offset = 4.0
-                            label_style = dict(
-                                color="#FFD54F",
-                                fontsize=8,
-                                fontweight="bold",
-                                ha="right",
-                                va="bottom",
-                                alpha=0.98,
-                                clip_on=True,
-                                zorder=6,
-                                path_effects=[pe.withStroke(linewidth=1.4, foreground="#000000")],
-                            )
-                            for xi, yi, sid in zip(x_ref, y_ref, ref_sub.loc[mask, "source_id"].astype("int64")):
-                                if np.isfinite(xi) and np.isfinite(yi):
-                                    # Use stable_id (1, 2, 3...) instead of source_id
-                                    display_id = self.sid_to_id.get(int(sid), int(sid))
-                                    self.ax.text(
-                                        xi - label_offset,
-                                        yi + label_offset,
-                                        str(display_id),
-                                        **label_style,
-                                    )
+                            ref_label_data = list(zip(
+                                x_ref_all, y_ref_all,
+                                ref_sub.loc[mask, "source_id"].astype("int64")
+                            ))
+
+        if _have_artists:
+            self._scat_ref_only.set_offsets(
+                self._safe_offsets(x_ref_all, y_ref_all) if len(x_ref_all) else np.empty((0, 2)))
+            self._scat_ref_only.set_visible(len(x_ref_all) > 0)
+        elif len(x_ref_all):
+            self.ax.scatter(x_ref_all, y_ref_all, s=18, facecolors="none",
+                            edgecolors="#FFD54F", linewidths=0.9, alpha=0.7)
+
+        if ref_label_data:
+            label_offset = 4.0
+            label_style = dict(
+                color="#FFD54F", fontsize=8, fontweight="bold",
+                ha="right", va="bottom", alpha=0.98, clip_on=True, zorder=6,
+                path_effects=[pe.withStroke(linewidth=1.4, foreground="#000000")],
+            )
+            for xi, yi, sid in ref_label_data:
+                if np.isfinite(xi) and np.isfinite(yi):
+                    display_id = self.sid_to_id.get(int(sid), int(sid))
+                    self.ax.text(xi - label_offset, yi + label_offset, str(display_id), **label_style)
 
         # 선택된 소스 (현재 클릭한 것)
-        if self.selected_source_id is not None:
-            sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
-            if len(sel):
-                self.ax.scatter(sel["x"], sel["y"], s=70, facecolors='none',
-                                edgecolors='red', linewidths=1.8, alpha=0.9)
+        if _have_artists:
+            if self.selected_source_id is not None:
+                sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
+                if len(sel):
+                    self._scat_selected.set_offsets(
+                        self._safe_offsets(sel["x"].to_numpy(float), sel["y"].to_numpy(float)))
+                    self._scat_selected.set_visible(True)
+                else:
+                    self._scat_selected.set_offsets(np.empty((0, 2)))
+                    self._scat_selected.set_visible(False)
+            else:
+                self._scat_selected.set_offsets(np.empty((0, 2)))
+                self._scat_selected.set_visible(False)
+        else:
+            if self.selected_source_id is not None:
+                sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
+                if len(sel):
+                    self.ax.scatter(sel["x"], sel["y"], s=70, facecolors='none',
+                                    edgecolors='red', linewidths=1.8, alpha=0.9)
 
         self.canvas.draw_idle()
 
@@ -2693,15 +2879,15 @@ class MasterIdEditorWindow(StepWindowBase):
             if not path.exists():
                 continue
             try:
-                df = pd.read_csv(path, sep=sep)
+                df = read_csv_int64_source_id(path, sep=sep)
             except Exception:
                 continue
             if not {"source_id", "ID"} <= set(df.columns):
                 continue
-            sid_vals = pd.to_numeric(df["source_id"], errors="coerce")
-            id_vals = pd.to_numeric(df["ID"], errors="coerce")
+            sid_vals = coerce_int64_source_id(df["source_id"])
+            id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
             for sid_val, id_val in zip(sid_vals, id_vals):
-                if not (np.isfinite(sid_val) and np.isfinite(id_val)):
+                if pd.isna(sid_val) or pd.isna(id_val):
                     continue
                 sid_int = int(sid_val)
                 if sid_int not in source_to_id:
@@ -2957,9 +3143,14 @@ class MasterIdEditorWindow(StepWindowBase):
         if not self.file_list:
             return
         idx = self.file_combo.currentIndex()
-        idx = max(0, min(len(self.file_list) - 1, idx + delta))
-        if idx != self.file_combo.currentIndex():
-            self.file_combo.setCurrentIndex(idx)
+        if idx < 0:
+            return
+        new_idx = (idx + delta) % len(self.file_list)
+        if new_idx != idx:
+            self.file_combo.blockSignals(True)
+            self.file_combo.setCurrentIndex(new_idx)
+            self.file_combo.blockSignals(False)
+            self.load_and_display(quick_switch=True)
 
     def cycle_filter(self):
         if self.filter_combo.count() <= 1:
@@ -3025,7 +3216,9 @@ class MasterIdEditorWindow(StepWindowBase):
             self.canvas.draw_idle()
 
     def on_stretch_changed(self, index):
-        self._normalized_cache = None
+        self._norm_cache.clear()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
         self.reset_stretch_plot_values()
         self.display_image()
 
@@ -3208,12 +3401,17 @@ class MasterIdEditorWindow(StepWindowBase):
         if self.image_data is None:
             return None
 
+        stretch_idx = self.scale_combo.currentIndex()
+        cache_key = (self.current_filename, stretch_idx)
+        if cache_key in self._norm_cache:
+            return self._norm_cache[cache_key]
+
         finite = np.isfinite(self.image_data)
         if not finite.any():
-            return np.zeros_like(self.image_data)
+            return np.zeros_like(self.image_data, dtype=np.float32)
 
-        data = self.image_data.copy()
-        mean_val, median_val, std_val = sigma_clipped_stats(data[finite], sigma=3.0, maxiters=5)
+        data = self.image_data
+        _, median_val, std_val = sigma_clipped_stats(data[finite], sigma=3.0, maxiters=5)
         vmin = max(np.min(data[finite]), median_val - 2.8 * std_val)
         vmax = min(np.max(data[finite]), np.percentile(data[finite], 99.9))
 
@@ -3222,7 +3420,44 @@ class MasterIdEditorWindow(StepWindowBase):
             vmax = np.max(data[finite])
 
         normalized = (data - vmin) / (vmax - vmin + 1e-10)
-        return np.clip(normalized, 0, 1)
+        normalized = np.clip(normalized, 0, 1).astype(np.float32, copy=False)
+        if len(self._norm_cache) >= self._FITS_CACHE_SIZE:
+            del self._norm_cache[next(iter(self._norm_cache))]
+        self._norm_cache[cache_key] = normalized
+        return normalized
+
+    def _get_stretched_display_cached(self):
+        if self.image_data is None:
+            return None
+        stretch_idx = int(self.scale_combo.currentIndex())
+        intensity = int(self.stretch_slider.value())
+        black_point = int(self.black_slider.value())
+        cache_key = (self.current_filename, stretch_idx, intensity, black_point)
+        if cache_key in self._display_cache:
+            try:
+                self._display_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            self._display_cache_order.append(cache_key)
+            return self._display_cache[cache_key]
+
+        normalized = self.normalize_image()
+        if normalized is None:
+            return None
+        stretched = self.apply_stretch(normalized).astype(np.float32, copy=False)
+        while len(self._display_cache_order) >= self._FITS_CACHE_SIZE:
+            old = self._display_cache_order.pop(0)
+            self._display_cache.pop(old, None)
+        self._display_cache[cache_key] = stretched
+        self._display_cache_order.append(cache_key)
+        return stretched
+
+    def closeEvent(self, event):
+        try:
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def apply_stretch(self, data):
         stretch_idx = self.scale_combo.currentIndex()

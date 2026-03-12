@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.stats import SigmaClip
-from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats
+from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats, aperture_photometry
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
@@ -26,6 +27,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step2_cropped_dir,
+    step4_dir,
     step5_dir,
     step9_dir,
     legacy_step7_wcs_dir,
@@ -78,33 +80,99 @@ class ApertureWorker(QThread):
                 pass
         return float(getattr(self.params.P, "fwhm_pix_guess", 6.0))
 
-    def _to_float(self, val, default):
+    @staticmethod
+    def _to_float(val, default):
         try:
             if val is None:
                 return float(default)
-            return float(val)
+            out = float(val)
+            return out if np.isfinite(out) else float(default)
         except Exception:
             return float(default)
+
+    @staticmethod
+    def _to_int(val, default):
+        try:
+            if val is None:
+                return int(default)
+            return int(float(val))
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _build_scale_grid(start, stop, step):
+        start = float(start)
+        stop = float(stop)
+        step = float(step)
+        if step <= 0:
+            step = 0.25
+        if stop < start:
+            start, stop = stop, start
+        n = int(np.floor((stop - start) / step + 1e-9)) + 1
+        n = int(np.clip(n, 1, 200))
+        vals = [start + k * step for k in range(n)]
+        if (not vals) or (vals[-1] < stop - 1e-9):
+            vals.append(stop)
+        return [float(round(v, 6)) for v in vals]
 
     def run(self):
         try:
             P = self.params.P
             ps = self._to_float(getattr(P, "pixel_scale_arcsec", np.nan), np.nan)
+            output_dir = Path(self.output_dir) if self.output_dir is not None else step9_dir(self.result_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
 
             ap_scale = self._to_float(getattr(P, "phot_aperture_scale", 1.0), 1.0)
             ann_in_scale = self._to_float(getattr(P, "fitsky_annulus_scale", 4.0), 4.0)
             ann_out_scale = self._to_float(getattr(P, "fitsky_dannulus_scale", 2.0), 2.0)
             cbox_scale = self._to_float(getattr(P, "center_cbox_scale", 1.5), 1.5)
 
+            fwhm_px_min = self._to_float(getattr(P, "fwhm_px_min", 3.5), 3.5)
+            fwhm_px_max = self._to_float(getattr(P, "fwhm_px_max", 8.0), 8.0)
+
+            min_r_ap_px = self._to_float(getattr(P, "min_r_ap_px", 4.0), 4.0)
+            min_r_in_px = self._to_float(getattr(P, "min_r_in_px", 12.0), 12.0)
+            min_r_out_px = self._to_float(getattr(P, "min_r_out_px", 20.0), 20.0)
+            ann_gap = self._to_float(getattr(P, "annulus_min_gap_px", 6.0), 6.0)
+            ann_minw = self._to_float(getattr(P, "annulus_min_width_px", 12.0), 12.0)
+
             apcorr_apply = bool(getattr(P, "apcorr_apply", True))
-            apcorr_use_min_n = int(getattr(P, "apcorr_use_min_n", 20))
+            apcorr_use_min_n = self._to_int(getattr(P, "apcorr_use_min_n", 20), 20)
             apcorr_scatter_max = self._to_float(getattr(P, "apcorr_scatter_max", 0.05), 0.05)
             apcorr_small_scale = self._to_float(getattr(P, "apcorr_small_scale", 1.0), 1.0)
             apcorr_large_scale = self._to_float(getattr(P, "apcorr_large_scale", 3.0), 3.0)
             ann_sigma = self._to_float(getattr(P, "annulus_sigma_clip", 3.0), 3.0)
-            ann_maxiter = int(getattr(P, "fitsky_max_iter", 5))
+            ann_maxiter = self._to_int(getattr(P, "fitsky_max_iter", 5), 5)
+
+            apcorr_optimize_scales = bool(getattr(P, "apcorr_optimize_scales", True))
+            apcorr_small_scale_min = self._to_float(getattr(P, "apcorr_small_scale_min", apcorr_small_scale), apcorr_small_scale)
+            apcorr_small_scale_max = self._to_float(getattr(P, "apcorr_small_scale_max", apcorr_small_scale), apcorr_small_scale)
+            apcorr_large_scale_min = self._to_float(getattr(P, "apcorr_large_scale_min", apcorr_large_scale), apcorr_large_scale)
+            apcorr_large_scale_max = self._to_float(getattr(P, "apcorr_large_scale_max", apcorr_large_scale), apcorr_large_scale)
+            apcorr_scale_step = max(0.05, self._to_float(getattr(P, "apcorr_scale_step", 0.2), 0.2))
+            apcorr_min_gap_fwhm = max(0.2, self._to_float(getattr(P, "apcorr_min_gap_fwhm", 1.0), 1.0))
+            apcorr_max_pairs = max(1, self._to_int(getattr(P, "apcorr_max_pairs", 24), 24))
+            apcorr_max_sources = max(30, self._to_int(getattr(P, "apcorr_max_sources", 250), 250))
 
             phot_use_qc_pass_only = bool(getattr(P, "phot_use_qc_pass_only", False))
+
+            fixed_pair = (float(apcorr_small_scale), float(apcorr_large_scale))
+            if apcorr_optimize_scales:
+                small_grid = self._build_scale_grid(apcorr_small_scale_min, apcorr_small_scale_max, apcorr_scale_step)
+                large_grid = self._build_scale_grid(apcorr_large_scale_min, apcorr_large_scale_max, apcorr_scale_step)
+                apcorr_pairs = []
+                for s_sc in small_grid:
+                    for l_sc in large_grid:
+                        if l_sc + 1e-9 < (s_sc + apcorr_min_gap_fwhm):
+                            continue
+                        apcorr_pairs.append((float(s_sc), float(l_sc)))
+                if fixed_pair not in apcorr_pairs:
+                    apcorr_pairs.append(fixed_pair)
+                if len(apcorr_pairs) > apcorr_max_pairs:
+                    idx = np.linspace(0, len(apcorr_pairs) - 1, apcorr_max_pairs).astype(int)
+                    apcorr_pairs = [apcorr_pairs[i] for i in np.unique(idx)]
+            else:
+                apcorr_pairs = [fixed_pair]
 
             files = list(self.file_list)
             if phot_use_qc_pass_only:
@@ -123,6 +191,7 @@ class ApertureWorker(QThread):
 
             rows_ap = []
             rows_apcorr = []
+            rows_apcorr_candidates = []
             total = len(files)
 
             for i, fname in enumerate(files, 1):
@@ -130,11 +199,11 @@ class ApertureWorker(QThread):
                     break
 
                 fwhm_med = float(self._load_fwhm_from_meta(fname))
-                fwhm_used = float(fwhm_med)
+                fwhm_used = float(np.clip(fwhm_med, fwhm_px_min, fwhm_px_max))
 
-                r_ap = ap_scale * fwhm_used
-                r_in = max(ann_in_scale * fwhm_used, r_ap)
-                r_out = r_in + ann_out_scale * fwhm_used
+                r_ap = max(ap_scale * fwhm_used, min_r_ap_px)
+                r_in = max(ann_in_scale * fwhm_used, max(min_r_in_px, r_ap + ann_gap))
+                r_out = max(r_in + ann_out_scale * fwhm_used, r_in + ann_minw, min_r_out_px)
                 cbox_px = max(cbox_scale * fwhm_used, 5.0)
 
                 row = dict(
@@ -162,68 +231,219 @@ class ApertureWorker(QThread):
                     json.dumps(row, indent=2), encoding="utf-8"
                 )
 
-                apc_row = dict(file=fname, apcorr=np.nan, rel_scatter=np.nan, n_used=0, apply=False)
+                apc_row = dict(
+                    file=fname,
+                    apcorr=np.nan,
+                    rel_scatter=np.nan,
+                    n_used=0,
+                    apply=False,
+                    optimize_scales=bool(apcorr_optimize_scales),
+                    n_candidates=int(len(apcorr_pairs)),
+                )
                 if apcorr_apply:
                     det_csv = self.cache_dir / f"detect_{fname}.csv"
+                    if not det_csv.exists():
+                        det_alt = step4_dir(self.result_dir) / f"detect_{fname}.csv"
+                        if det_alt.exists():
+                            det_csv = det_alt
+                    if not det_csv.exists():
+                        det_alt = self.result_dir / f"detect_{fname}.csv"
+                        if det_alt.exists():
+                            det_csv = det_alt
                     if det_csv.exists():
                         try:
                             if self.use_cropped:
                                 img_path = step2_cropped_dir(self.result_dir) / fname
+                                if not img_path.exists():
+                                    img_path = (self.result_dir / "cropped" / fname)
                             else:
-                                img_path = self.params.get_file_path(fname)
+                                try:
+                                    img_path = self.params.get_file_path(fname)
+                                except Exception:
+                                    img_path = self.data_dir / fname
+                                if not Path(img_path).exists():
+                                    img_path = self.data_dir / fname
                             img = fits.getdata(img_path).astype(float)
-                            xy_all = pd.read_csv(det_csv)[["x", "y"]].to_numpy(float)
+                            det_df = pd.read_csv(det_csv)
+                            x_col = "x" if "x" in det_df.columns else ("xcenter" if "xcenter" in det_df.columns else None)
+                            y_col = "y" if "y" in det_df.columns else ("ycenter" if "ycenter" in det_df.columns else None)
+                            if x_col is None or y_col is None:
+                                raise ValueError(f"detect columns not found in {det_csv.name}")
+                            xy_all = det_df[[x_col, y_col]].to_numpy(float)
+                            if len(xy_all):
+                                finite_xy = np.isfinite(xy_all[:, 0]) & np.isfinite(xy_all[:, 1])
+                                xy_all = xy_all[finite_xy]
                             h, w = img.shape
                             if len(xy_all):
                                 vals = img[xy_all[:, 1].astype(int).clip(0, h - 1),
                                            xy_all[:, 0].astype(int).clip(0, w - 1)]
                                 order = np.argsort(vals)[::-1]
-                                xy_all = xy_all[order][:300]
+                                xy_all = xy_all[order][:apcorr_max_sources]
 
-                            corr = []
+                            if len(xy_all):
+                                max_large_scale = max((pair[1] for pair in apcorr_pairs), default=apcorr_large_scale)
+                                max_small_scale = max((pair[0] for pair in apcorr_pairs), default=apcorr_small_scale)
+                                max_large_r = max(
+                                    max_large_scale * fwhm_used,
+                                    (max_small_scale + apcorr_min_gap_fwhm) * fwhm_used,
+                                    r_ap + apcorr_min_gap_fwhm * fwhm_used,
+                                )
+                                edge_pad = int(np.ceil(max(max_large_r, r_out) + 2.0))
+                                edge_mask = (
+                                    (xy_all[:, 0] >= edge_pad)
+                                    & (xy_all[:, 0] <= (w - edge_pad - 1))
+                                    & (xy_all[:, 1] >= edge_pad)
+                                    & (xy_all[:, 1] <= (h - edge_pad - 1))
+                                )
+                                xy_all = xy_all[edge_mask]
+
                             sc = SigmaClip(ann_sigma, maxiters=ann_maxiter)
-                            r_small = max(apcorr_small_scale * fwhm_used, r_ap)
-                            r_large = max(apcorr_large_scale * fwhm_used, r_small + fwhm_used)
+                            bkg_med = np.array([], dtype=float)
+                            if len(xy_all):
+                                try:
+                                    an_all = CircularAnnulus(xy_all, r_in=r_in, r_out=r_out)
+                                    st_an = ApertureStats(img, an_all, sigma_clip=sc)
+                                    bkg_med = np.asarray(st_an.median, dtype=float)
+                                    if bkg_med.ndim == 0:
+                                        bkg_med = np.full(len(xy_all), float(bkg_med))
+                                except Exception:
+                                    bkg_med = np.array([], dtype=float)
+                            if len(bkg_med) != len(xy_all):
+                                bkg_med = np.array([], dtype=float)
 
-                            for (x, y) in xy_all:
-                                ap_s = CircularAperture((x, y), r=r_small)
-                                ap_l = CircularAperture((x, y), r=r_large)
-                                an = CircularAnnulus((x, y), r_in=r_in, r_out=r_out)
-                                st_s = ApertureStats(img, ap_s, sigma_clip=sc)
-                                st_l = ApertureStats(img, ap_l, sigma_clip=sc)
-                                st_an = ApertureStats(img, an, sigma_clip=sc)
-                                bkg_med = float(st_an.median)
-                                flux_s = float(st_s.sum - bkg_med * ap_s.area)
-                                flux_l = float(st_l.sum - bkg_med * ap_l.area)
-                                if flux_s > 0 and flux_l > 0:
-                                    corr.append(float(flux_l / flux_s))
-
-                            if len(corr) >= apcorr_use_min_n:
-                                medc = float(np.median(corr))
-                                mad = float(np.median(np.abs(np.array(corr) - medc)))
-                                rel_sc = 1.4826 * mad / medc if medc > 0 else np.nan
-                                apply_flag = bool(np.isfinite(rel_sc) and (rel_sc <= apcorr_scatter_max))
+                            if len(bkg_med):
+                                valid_bkg = np.isfinite(bkg_med)
+                                xy_use = xy_all[valid_bkg]
+                                bkg_use = bkg_med[valid_bkg]
                             else:
-                                medc, rel_sc, apply_flag = (np.nan, np.nan, False)
+                                xy_use = np.array([], dtype=float).reshape(0, 2)
+                                bkg_use = np.array([], dtype=float)
 
+                            cand_rows = []
+                            for pair_idx, (small_scale, large_scale) in enumerate(apcorr_pairs):
+                                r_small = max(small_scale * fwhm_used, r_ap)
+                                r_large = max(
+                                    large_scale * fwhm_used,
+                                    r_small + apcorr_min_gap_fwhm * fwhm_used,
+                                )
+
+                                medc = np.nan
+                                rel_sc = np.nan
+                                n_used = 0
+                                if len(xy_use):
+                                    ap_s = CircularAperture(xy_use, r=r_small)
+                                    ap_l = CircularAperture(xy_use, r=r_large)
+                                    sum_s = np.asarray(aperture_photometry(img, ap_s)["aperture_sum"], dtype=float)
+                                    sum_l = np.asarray(aperture_photometry(img, ap_l)["aperture_sum"], dtype=float)
+                                    flux_s = sum_s - (bkg_use * ap_s.area)
+                                    flux_l = sum_l - (bkg_use * ap_l.area)
+                                    valid = np.isfinite(flux_s) & np.isfinite(flux_l) & (flux_s > 0) & (flux_l > 0)
+                                    if np.any(valid):
+                                        corr = (flux_l[valid] / flux_s[valid]).astype(float)
+                                        corr = corr[np.isfinite(corr) & (corr > 0.6) & (corr < 3.0)]
+                                        if len(corr) >= 8:
+                                            c_med0 = float(np.nanmedian(corr))
+                                            c_mad0 = float(np.nanmedian(np.abs(corr - c_med0)))
+                                            c_sig0 = 1.4826 * c_mad0 if np.isfinite(c_mad0) else np.nan
+                                            if np.isfinite(c_sig0) and c_sig0 > 0:
+                                                keep = np.abs(corr - c_med0) <= (3.0 * c_sig0)
+                                                if int(np.sum(keep)) >= 5:
+                                                    corr = corr[keep]
+                                        n_used = int(len(corr))
+                                        medc = float(np.nanmedian(corr)) if n_used else np.nan
+                                        if n_used >= 5 and np.isfinite(medc) and medc > 0:
+                                            mad = float(np.nanmedian(np.abs(corr - medc)))
+                                            rel_sc = 1.4826 * mad / medc if np.isfinite(mad) else np.nan
+
+                                apply_flag = bool(
+                                    n_used >= apcorr_use_min_n
+                                    and np.isfinite(medc)
+                                    and (medc >= 0.8)
+                                    and (medc <= 2.0)
+                                    and np.isfinite(rel_sc)
+                                    and (rel_sc <= apcorr_scatter_max)
+                                )
+                                cand = dict(
+                                    file=fname,
+                                    pair_index=int(pair_idx),
+                                    small_scale=float(small_scale),
+                                    large_scale=float(large_scale),
+                                    fwhm_med=fwhm_med,
+                                    fwhm_used=fwhm_used,
+                                    r_small=float(r_small),
+                                    r_large=float(r_large),
+                                    n_used=n_used,
+                                    apcorr=medc,
+                                    rel_scatter=rel_sc,
+                                    apply=bool(apply_flag),
+                                )
+                                if np.isfinite(ps) and ps > 0:
+                                    cand.update(dict(
+                                        r_small_arcsec=float(r_small) * ps,
+                                        r_large_arcsec=float(r_large) * ps,
+                                    ))
+                                cand_rows.append(cand)
+
+                            best = None
+                            good = [c for c in cand_rows if np.isfinite(c.get("rel_scatter", np.nan))]
+                            enough_n = [c for c in good if int(c.get("n_used", 0)) >= apcorr_use_min_n]
+                            if enough_n:
+                                best = min(
+                                    enough_n,
+                                    key=lambda c: (
+                                        float(c["rel_scatter"]),
+                                        -int(c["n_used"]),
+                                        float(c["small_scale"]),
+                                    ),
+                                )
+                            elif good:
+                                best = min(
+                                    good,
+                                    key=lambda c: (
+                                        max(0, apcorr_use_min_n - int(c["n_used"])),
+                                        float(c["rel_scatter"]),
+                                        -int(c["n_used"]),
+                                    ),
+                                )
+                            elif cand_rows:
+                                best = max(cand_rows, key=lambda c: int(c.get("n_used", 0)))
+
+                            if best is not None:
+                                for cand in cand_rows:
+                                    row_c = dict(cand)
+                                    row_c["selected"] = bool(cand is best)
+                                    rows_apcorr_candidates.append(row_c)
+
+                                apc_row = dict(
+                                    file=fname,
+                                    fwhm_med=fwhm_med,
+                                    fwhm_used=fwhm_used,
+                                    small_scale_sel=float(best["small_scale"]),
+                                    large_scale_sel=float(best["large_scale"]),
+                                    r_small=float(best["r_small"]),
+                                    r_large=float(best["r_large"]),
+                                    n_used=int(best["n_used"]),
+                                    apcorr=float(best["apcorr"]) if np.isfinite(best["apcorr"]) else np.nan,
+                                    rel_scatter=float(best["rel_scatter"]) if np.isfinite(best["rel_scatter"]) else np.nan,
+                                    apply=bool(best["apply"]),
+                                    optimize_scales=bool(apcorr_optimize_scales),
+                                    n_candidates=int(len(cand_rows)),
+                                )
+                                if np.isfinite(ps) and ps > 0:
+                                    apc_row.update(dict(
+                                        r_small_arcsec=float(best["r_small"]) * ps,
+                                        r_large_arcsec=float(best["r_large"]) * ps,
+                                    ))
+                        except Exception:
                             apc_row = dict(
                                 file=fname,
-                                fwhm_med=fwhm_med,
-                                fwhm_used=fwhm_used,
-                                r_small=r_small,
-                                r_large=r_large,
-                                n_used=int(len(corr)),
-                                apcorr=medc,
-                                rel_scatter=rel_sc,
-                                apply=bool(apply_flag),
+                                apcorr=np.nan,
+                                rel_scatter=np.nan,
+                                n_used=0,
+                                apply=False,
+                                optimize_scales=bool(apcorr_optimize_scales),
+                                n_candidates=int(len(apcorr_pairs)),
                             )
-                            if np.isfinite(ps) and ps > 0:
-                                apc_row.update(dict(
-                                    r_small_arcsec=r_small * ps,
-                                    r_large_arcsec=r_large * ps,
-                                ))
-                        except Exception:
-                            apc_row = dict(file=fname, apcorr=np.nan, rel_scatter=np.nan, n_used=0, apply=False)
 
                 rows_apcorr.append(apc_row)
                 (self.cache_dir / f"apcorr_{fname}.json").write_text(
@@ -233,16 +453,17 @@ class ApertureWorker(QThread):
                 self.file_done.emit(fname, row)
                 self.progress.emit(i, total, fname)
 
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(rows_ap).to_csv(self.output_dir / "aperture_by_frame.csv", index=False)
-            pd.DataFrame(rows_apcorr).to_csv(self.output_dir / "apcorr_summary.csv", index=False)
+            pd.DataFrame(rows_ap).to_csv(output_dir / "aperture_by_frame.csv", index=False)
+            pd.DataFrame(rows_apcorr).to_csv(output_dir / "apcorr_summary.csv", index=False)
+            if rows_apcorr_candidates:
+                pd.DataFrame(rows_apcorr_candidates).to_csv(output_dir / "apcorr_candidates.csv", index=False)
 
             self.finished.emit({
                 "total": len(rows_ap),
             })
         except Exception as e:
-            self.last_error = str(e)
-            self.error.emit("WORKER", str(e))
+            error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            self.error.emit("WORKER", error_msg)
             self.finished.emit({})
 
 
@@ -601,6 +822,15 @@ class AperturePhotometryWindow(StepWindowBase):
             "apcorr_large_scale": getattr(self.params.P, "apcorr_large_scale", 3.0),
             "apcorr_use_min_n": getattr(self.params.P, "apcorr_use_min_n", 20),
             "apcorr_scatter_max": getattr(self.params.P, "apcorr_scatter_max", 0.05),
+            "apcorr_optimize_scales": getattr(self.params.P, "apcorr_optimize_scales", True),
+            "apcorr_small_scale_min": getattr(self.params.P, "apcorr_small_scale_min", 0.8),
+            "apcorr_small_scale_max": getattr(self.params.P, "apcorr_small_scale_max", 1.4),
+            "apcorr_large_scale_min": getattr(self.params.P, "apcorr_large_scale_min", 2.4),
+            "apcorr_large_scale_max": getattr(self.params.P, "apcorr_large_scale_max", 4.0),
+            "apcorr_scale_step": getattr(self.params.P, "apcorr_scale_step", 0.2),
+            "apcorr_min_gap_fwhm": getattr(self.params.P, "apcorr_min_gap_fwhm", 1.0),
+            "apcorr_max_pairs": getattr(self.params.P, "apcorr_max_pairs", 24),
+            "apcorr_max_sources": getattr(self.params.P, "apcorr_max_sources", 250),
             "annulus_sigma_clip": getattr(self.params.P, "annulus_sigma_clip", 3.0),
             "fitsky_max_iter": getattr(self.params.P, "fitsky_max_iter", 5),
             "phot_use_qc_pass_only": getattr(self.params.P, "phot_use_qc_pass_only", False),

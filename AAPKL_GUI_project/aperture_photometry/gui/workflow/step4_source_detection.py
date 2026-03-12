@@ -175,6 +175,8 @@ class DetectionWorker(QThread):
 
                     # Stage 2: Background
                     self.worker_status.emit(worker_id, short_name, "Background", 25)
+                    if self._stop_requested:
+                        return filename, None
 
                     def refine_centroid(img, x, y, seed_fwhm_px):
                         h, w = img.shape
@@ -274,6 +276,8 @@ class DetectionWorker(QThread):
                         centers = 0.5 * (edges[:-1] + edges[1:])
                         prof = np.full_like(centers, np.nan, dtype=float)
                         for i in range(len(centers)):
+                            if self._stop_requested:
+                                return np.nan, sky_med, sky_std
                             a = (rr >= edges[i]) & (rr < edges[i + 1])
                             if np.any(a):
                                 vv = val[a]
@@ -306,6 +310,8 @@ class DetectionWorker(QThread):
                         out = []
 
                         for s in (peak_scales or [0.9, 1.3]):
+                            if self._stop_requested:
+                                return []
                             sig = max(0.7, (s * seed_fwhm_px) / 2.355)
                             fim_local = gaussian_filter(det_safe - med, sig, mode="nearest")
                             _, mF, stdF = sigma_clipped_stats(fim_local, sigma=3.0, maxiters=5)
@@ -332,6 +338,8 @@ class DetectionWorker(QThread):
                         keep = np.ones(len(pts), bool)
                         tree = KDTree(pts)
                         for i in range(len(pts)):
+                            if self._stop_requested:
+                                return []
                             if not keep[i]:
                                 continue
                             j = tree.query_ball_point(pts[i], r=peak_min_sep)
@@ -347,13 +355,21 @@ class DetectionWorker(QThread):
                         return [tuple(xy) for xy in pts]
 
                     # Background estimation (Jupyter-style downsample median)
+                    if self._stop_requested:
+                        return filename, None
                     data_filled = np.where(np.isfinite(data), data, 0.0)
                     if bkg2d_enable:
+                        if self._stop_requested:
+                            return filename, None
                         ds = max(1, int(getattr(P, 'bkg2d_downsample', 4)))
                         k = max(3, int(round(bkg2d_box / ds)))
                         small = data_filled[::ds, ::ds]
                         bkg_small = median_filter(small, size=k, mode="nearest")
+                        if self._stop_requested:
+                            return filename, None
                         bkg = np.repeat(np.repeat(bkg_small, ds, axis=0), ds, axis=1)[:data.shape[0], :data.shape[1]]
+                        if self._stop_requested:
+                            return filename, None
                         data_sub = data - bkg
                     else:
                         data_sub = data.copy()
@@ -367,6 +383,8 @@ class DetectionWorker(QThread):
                     fwhm_seed = float(getattr(P, 'fwhm_seed_px', getattr(P, 'fwhm_pix_guess', 6.0) or 6.0))
                     sig = max(0.8, fwhm_seed / 2.355)
                     fim = gaussian_filter(work - bkg_median, sig, mode="nearest")
+                    if self._stop_requested:
+                        return filename, None
 
                     # Threshold (median + nsig * std)
                     _, mF, stdF = sigma_clipped_stats(fim, sigma=3.0, maxiters=5)
@@ -386,6 +404,8 @@ class DetectionWorker(QThread):
                             fim, threshold=threshold,
                             npixels=max(3, minarea_pix), connectivity=8
                         )
+                    if self._stop_requested:
+                        return filename, None
 
                     n_sources = 0
                     positions = []
@@ -572,6 +592,8 @@ class DetectionWorker(QThread):
                             )
 
                             for x, y in positions:
+                                if self._stop_requested:
+                                    return filename, None
                                 ix, iy = int(round(x)), int(round(y))
                                 x0 = max(0, ix - cutout_half)
                                 x1 = min(nx, ix + cutout_half + 1)
@@ -667,6 +689,8 @@ class DetectionWorker(QThread):
                             n_use = min(int(fwhm_qc_max), int(fwhm_measure_max), len(pts))
                             fwhm_values = []
                             for (x, y) in pts[:n_use]:
+                                if self._stop_requested:
+                                    return filename, None
                                 rc = refine_centroid(data, x, y, fwhm_seed)
                                 if rc is None:
                                     continue
@@ -705,6 +729,8 @@ class DetectionWorker(QThread):
 
                     # Stage 6: Saving
                     self.worker_status.emit(worker_id, short_name, "Saving", 90)
+                    if self._stop_requested:
+                        return filename, None
 
                     # Save to cache
                     cache_file = self.cache_dir / f"detect_{filename}.json"
@@ -736,6 +762,8 @@ class DetectionWorker(QThread):
                         source_records = []
                         peak_set = {(float(px), float(py)) for px, py in peak_positions}
                         for idx, (x, y) in enumerate(positions):
+                            if self._stop_requested:
+                                return filename, None
                             record = {
                                 'id': idx + 1,
                                 'x': x,

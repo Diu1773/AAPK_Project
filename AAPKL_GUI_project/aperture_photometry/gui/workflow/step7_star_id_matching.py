@@ -27,7 +27,7 @@ import astropy.units as u
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QFormLayout, QProgressBar,
-    QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QDoubleSpinBox, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QWidget, QDialog, QDialogButtonBox, QTabWidget, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -44,10 +44,21 @@ from ...utils.step_paths import (
     step7_dir,
     legacy_step5_refbuild_dir,
     legacy_step7_refbuild_dir,
-    legacy_step6_idmatch_dir,
 )
-from ...utils.common_helpers import safe_float as _safe_float
-from ...utils.qc_utils import filter_files_by_qc
+from ...utils.qc_utils import filter_files_by_qc, filter_files_by_wcs_qc
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+
+
+def _safe_float(x, default=np.nan):
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -281,6 +292,11 @@ class IdMatchWorker(QThread):
         two_pass_enable: bool = True,
         tight_radius_arcsec: float = 1.0,
         loose_radius_arcsec: float = 3.0,
+        min_correction_pairs: int = 3,
+        min_affine_pairs: int = 6,
+        adaptive_retry_threshold: float = 0.5,
+        fwhm_adaptive_floor: bool = True,
+        geom_correction_enable: bool = True,
     ):
         super().__init__()
         self.file_list = list(file_list)
@@ -300,6 +316,11 @@ class IdMatchWorker(QThread):
         self.two_pass_enable = bool(two_pass_enable)
         self.tight_radius_arcsec = float(tight_radius_arcsec)
         self.loose_radius_arcsec = float(loose_radius_arcsec)
+        self.min_correction_pairs = max(2, int(min_correction_pairs))
+        self.min_affine_pairs = max(3, int(min_affine_pairs))
+        self.adaptive_retry_threshold = max(0.0, float(adaptive_retry_threshold))
+        self.fwhm_adaptive_floor = bool(fwhm_adaptive_floor)
+        self.geom_correction_enable = bool(geom_correction_enable)
         self._stop_requested = False
         self._log_file = None
         self._ref_cache: Dict[str, Tuple[np.ndarray, SkyCoord]] = {}
@@ -426,11 +447,11 @@ class IdMatchWorker(QThread):
             raise FileNotFoundError(
                 f"Reference catalog not found for filter '{self.ref_filter}'"
             )
-        df = pd.read_csv(ref_path, sep="\t")
+        df = read_csv_int64_source_id(ref_path, sep="\t")
         if not {"source_id", "ra_deg", "dec_deg"} <= set(df.columns):
             raise RuntimeError(f"Invalid ref catalog (missing ra/dec): {ref_path}")
         df = df.copy()
-        df["source_id"] = pd.to_numeric(df["source_id"], errors="coerce")
+        df["source_id"] = coerce_int64_source_id(df["source_id"])
         df["ra_deg"] = pd.to_numeric(df["ra_deg"], errors="coerce")
         df["dec_deg"] = pd.to_numeric(df["dec_deg"], errors="coerce")
         df = df.dropna(subset=["source_id", "ra_deg", "dec_deg"]).copy()
@@ -646,7 +667,12 @@ class IdMatchWorker(QThread):
                     tight_r = self.tight_radius_arcsec
                     loose_r = self.loose_radius_arcsec
 
-                    # Pass 1: Tight radius (high confidence)
+                    # A: FWHM-adaptive floor — radii scale with PSF size
+                    if self.fwhm_adaptive_floor:
+                        tight_r = max(tight_r, match_r * 0.4)
+                        loose_r = max(loose_r, match_r)
+
+                    # Pass 1: Tight radius (high-confidence seed matches)
                     ok_tight = sep_arcsec <= tight_r
                     best_det = {}
                     best_sep = {}
@@ -661,29 +687,96 @@ class IdMatchWorker(QThread):
                             best_det[ref_i] = det_i
                             best_confidence[ref_i] = "high"
 
-                    # Track matched detections and refs
+                    # B+D: Geometric correction (affine or shift) from pass-1 pairs,
+                    # then reproject unmatched detections for pass 2.
+                    n_high = len(best_det)
+                    idx_p2 = idx
+                    sep_arcsec_p2 = sep_arcsec
+                    if self.geom_correction_enable and n_high >= self.min_correction_pairs and wcs_ok:
+                        try:
+                            ref_idx_h = np.array(list(best_det.keys()), dtype=int)
+                            det_idx_h = np.array(list(best_det.values()), dtype=int)
+                            rx, ry = wcs.all_world2pix(
+                                ref_sky[ref_idx_h].ra.deg,
+                                ref_sky[ref_idx_h].dec.deg, 0,
+                            )
+                            src_h = det_xy[det_idx_h]
+                            dst_h = np.column_stack([rx, ry])
+                            if n_high >= self.min_affine_pairs:
+                                mat = _estimate_affine(src_h, dst_h)
+                                corrected_xy = _apply_transform(det_xy, mat)
+                                self._log(
+                                    f"[IDMATCH] {fname}: affine correction ({n_high} pairs)"
+                                )
+                            else:
+                                shift = np.median(dst_h - src_h, axis=0)
+                                corrected_xy = det_xy + shift
+                                self._log(
+                                    f"[IDMATCH] {fname}: shift correction "
+                                    f"dx={shift[0]:.2f} dy={shift[1]:.2f} ({n_high} pairs)"
+                                )
+                            ra_c, dec_c = wcs.all_pix2world(
+                                corrected_xy[:, 0], corrected_xy[:, 1], 0
+                            )
+                            det_sky_c = SkyCoord(
+                                ra_c * u.deg, dec_c * u.deg, frame="icrs"
+                            )
+                            idx_p2, sep2d_c, _ = det_sky_c.match_to_catalog_sky(ref_sky)
+                            sep_arcsec_p2 = sep2d_c.arcsec
+                        except Exception as _ce:
+                            self._log(
+                                f"[IDMATCH] {fname}: correction failed ({_ce}), using raw coords"
+                            )
+
+                    # Track matched detections and refs from pass 1
                     matched_det_set = set(best_det.values())
                     matched_ref_set = set(best_det.keys())
 
-                    # Pass 2: Loose radius for unmatched detections
-                    ok_loose = (sep_arcsec <= loose_r) & (sep_arcsec > tight_r)
-                    for det_i, ref_i in enumerate(idx):
+                    # Pass 2: Loose radius on (corrected) coords for unmatched detections
+                    for det_i, ref_i_raw in enumerate(idx_p2):
                         if det_i in matched_det_set:
-                            continue  # Already matched in pass 1
-                        if not ok_loose[det_i]:
                             continue
-                        ref_i = int(ref_i)
+                        ref_i = int(ref_i_raw)
                         if ref_i in matched_ref_set:
-                            continue  # Ref already claimed in pass 1
-                        sep_val = float(sep_arcsec[det_i])
+                            continue
+                        sep_val = float(sep_arcsec_p2[det_i])
+                        if sep_val > loose_r:
+                            continue
                         if ref_i not in best_sep or sep_val < best_sep[ref_i]:
                             best_sep[ref_i] = sep_val
                             best_det[ref_i] = det_i
                             best_confidence[ref_i] = "low"
 
-                    # Use loose radius for reporting
                     match_r = loose_r
                     ok = sep_arcsec <= loose_r
+
+                    # C: Adaptive retry — if rate is still low, try with 2× loose_r
+                    if self.adaptive_retry_threshold > 0:
+                        rate_now = float(len(best_det) / n_det) if n_det > 0 else 0.0
+                        if rate_now < self.adaptive_retry_threshold:
+                            retry_r = loose_r * 2.0
+                            matched_det_set2 = set(best_det.values())
+                            matched_ref_set2 = set(best_det.keys())
+                            for det_i, ref_i_raw in enumerate(idx_p2):
+                                if det_i in matched_det_set2:
+                                    continue
+                                ref_i = int(ref_i_raw)
+                                if ref_i in matched_ref_set2:
+                                    continue
+                                sep_val = float(sep_arcsec_p2[det_i])
+                                if sep_val > retry_r:
+                                    continue
+                                if ref_i not in best_sep or sep_val < best_sep[ref_i]:
+                                    best_sep[ref_i] = sep_val
+                                    best_det[ref_i] = det_i
+                                    best_confidence[ref_i] = "retry"
+                            match_r = retry_r
+                            ok = sep_arcsec <= retry_r
+                            self._log(
+                                f"[IDMATCH] {fname}: adaptive retry "
+                                f"rate={rate_now:.3f} retry_r={retry_r:.2f}\" "
+                                f"n_after={len(best_det)}"
+                            )
                 else:
                     # Single-pass matching (original behavior)
                     ok = sep_arcsec <= match_r
@@ -727,12 +820,14 @@ class IdMatchWorker(QThread):
                         dx_rms = np.nan
                         dy_rms = np.nan
 
-                source_id = np.full(n_det, np.nan)
+                # Use Python list to store source_ids — avoids float64 precision loss
+                # for 19-digit Gaia source_ids when assigning int to np.float64 array
+                source_id = [None] * n_det
                 sep_out = np.full(n_det, np.nan)
                 confidence_out = np.array([""] * n_det, dtype=object)
                 for ref_i, det_i in best_det.items():
                     sid = int(ref_ids[ref_i])
-                    source_id[det_i] = sid
+                    source_id[det_i] = sid  # Python int — no precision loss
                     sep_out[det_i] = best_sep[ref_i]
                     confidence_out[det_i] = best_confidence.get(ref_i, "")
                     global_i = id_to_index.get(sid)
@@ -744,13 +839,17 @@ class IdMatchWorker(QThread):
                     sum_x2[global_i] += det_xy[det_i, 0] ** 2
                     sum_y2[global_i] += det_xy[det_i, 1] ** 2
 
+                # Convert to pandas Int64 (nullable integer): writes exact integers to CSV
+                source_id_col = pd.array(
+                    [v if v is not None else pd.NA for v in source_id], dtype="Int64")
+
                 df_out = pd.DataFrame({
                     "det_idx": np.arange(n_det, dtype=int),
                     "x": det_xy[:, 0],
                     "y": det_xy[:, 1],
                     "ra_deg": ra,
                     "dec_deg": dec,
-                    "source_id": source_id,
+                    "source_id": source_id_col,
                     "sep_arcsec": sep_out,
                     "match_confidence": confidence_out,
                     "file": fname,
@@ -760,6 +859,10 @@ class IdMatchWorker(QThread):
             out_sub = out_dir / date_key if date_key else out_dir
             out_sub.mkdir(parents=True, exist_ok=True)
             df_out.to_csv(out_sub / f"idmatch_{fname}.csv", index=False)
+            # AAPKC compat: also write to cache/idmatch/ for downstream steps
+            cache_idmatch = self.cache_dir / "idmatch"
+            cache_idmatch.mkdir(parents=True, exist_ok=True)
+            df_out.to_csv(cache_idmatch / f"idmatch_{fname}.csv", index=False)
 
             n_match = int(np.isfinite(df_out["source_id"]).sum())
             match_rate = float(n_match / n_det) if n_det > 0 else 0.0
@@ -856,6 +959,44 @@ class IdMatchWorker(QThread):
         except Exception:
             pass
 
+        # AAPKC compat: frame_sourceid_to_ID.tsv for step9/step10
+        try:
+            sid2id = master_df[["source_id", "ID"]].copy()
+            sid2id["source_id"] = coerce_int64_source_id(sid2id["source_id"])
+            sid2id["ID"] = pd.to_numeric(sid2id["ID"], errors="coerce").astype("Int64")
+            sid2id = sid2id.dropna().drop_duplicates("source_id")
+            sid2id_map = sid2id.set_index("source_id")["ID"]
+            frame_map_rows = []
+            cache_idmatch = self.cache_dir / "idmatch"
+            for fname in self.file_list:
+                csv_path = cache_idmatch / f"idmatch_{fname}.csv"
+                if not csv_path.exists():
+                    continue
+                try:
+                    df_fm = read_csv_int64_source_id(csv_path)
+                except Exception:
+                    continue
+                if "source_id" not in df_fm.columns or "x" not in df_fm.columns:
+                    continue
+                df_fm = df_fm.copy()
+                df_fm["source_id"] = coerce_int64_source_id(df_fm["source_id"])
+                df_fm = df_fm[df_fm["source_id"].notna()].copy()
+                df_fm["ID"] = df_fm["source_id"].map(sid2id_map)
+                df_fm["file"] = fname
+                cols = ["file", "source_id", "ID", "x", "y"]
+                if "sep_arcsec" in df_fm.columns:
+                    cols.append("sep_arcsec")
+                frame_map_rows.append(df_fm[cols])
+            if frame_map_rows:
+                frame_map_df = pd.concat(frame_map_rows, ignore_index=True)
+                frame_map_df.to_csv(
+                    out_dir / "frame_sourceid_to_ID.tsv",
+                    sep="\t", index=False, na_rep="NaN", encoding="utf-8-sig"
+                )
+                self._log(f"[IDMATCH] frame_sourceid_to_ID.tsv: {len(frame_map_df)} rows")
+        except Exception as e:
+            self._log(f"[IDMATCH] frame_sourceid_to_ID.tsv generation failed: {e}")
+
         # Compute summary statistics
         miss_ref_count = int(np.sum(match_count == 0))
         matched_ref_count = int(np.sum(match_count > 0))
@@ -900,6 +1041,11 @@ class IdMatchWorker(QThread):
                 "two_pass_enable": self.two_pass_enable,
                 "tight_radius_arcsec": self.tight_radius_arcsec,
                 "loose_radius_arcsec": self.loose_radius_arcsec,
+                "min_correction_pairs": self.min_correction_pairs,
+                "min_affine_pairs": self.min_affine_pairs,
+                "adaptive_retry_threshold": self.adaptive_retry_threshold,
+                "fwhm_adaptive_floor": self.fwhm_adaptive_floor,
+                "geom_correction_enable": self.geom_correction_enable,
                 "match_r_fwhm": self.match_r_fwhm,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1037,25 +1183,95 @@ class StarIdMatchingWindow(StepWindowBase):
         log_layout.addWidget(self.log_text)
 
     def open_parameters_dialog(self):
+        idmatch_cfg = getattr(self.params.P, "idmatch", None)
+
+        _MISSING = object()
+
+        def _cfg(key, default):
+            # Try schema sub-object first, then flat P.idmatch_<key>, then default
+            if idmatch_cfg is not None:
+                v = getattr(idmatch_cfg, key, _MISSING)
+                if v is not _MISSING:
+                    return v
+            flat_key = f"idmatch_{key}"
+            v = getattr(self.params.P, flat_key, _MISSING)
+            return default if v is _MISSING else v
+
         dialog = QDialog(self)
         dialog.setWindowTitle("ID Match Parameters")
-        dialog.resize(460, 240)
+        dialog.resize(480, 460)
 
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         layout.addLayout(form)
 
+        # --- Basic ---
         arcsec_spin = QDoubleSpinBox()
         arcsec_spin.setRange(0.0, 30.0)
         arcsec_spin.setDecimals(2)
         arcsec_spin.setValue(float(getattr(self.params.P, "idmatch_tol_arcsec", 2.0) or 0.0))
+        arcsec_spin.setToolTip("Global sky match radius in arcsec. 0 = auto from FWHM.")
         form.addRow("Sky match radius (arcsec, 0=auto):", arcsec_spin)
 
         match_r_spin = QDoubleSpinBox()
         match_r_spin.setRange(0.1, 5.0)
         match_r_spin.setDecimals(2)
         match_r_spin.setValue(float(getattr(self.params.P, "idmatch_match_r_fwhm", 0.8)))
-        form.addRow("Fallback radius (FWHM x):", match_r_spin)
+        match_r_spin.setToolTip("FWHM multiplier for auto match radius.")
+        form.addRow("Fallback radius (FWHM ×):", match_r_spin)
+
+        form.addRow(QLabel("── Two-pass matching ──────────────────"))
+
+        two_pass_chk = QCheckBox("Enable two-pass matching")
+        two_pass_chk.setChecked(bool(_cfg("two_pass_enable", True)))
+        form.addRow("", two_pass_chk)
+
+        tight_spin = QDoubleSpinBox()
+        tight_spin.setRange(0.1, 20.0)
+        tight_spin.setDecimals(2)
+        tight_spin.setValue(float(_cfg("tight_radius_arcsec", 1.0)))
+        tight_spin.setToolTip("Pass 1 radius (high-confidence seeds). Floored by FWHM × 0.4 if adaptive floor is on.")
+        form.addRow("Tight radius (arcsec):", tight_spin)
+
+        loose_spin = QDoubleSpinBox()
+        loose_spin.setRange(0.1, 30.0)
+        loose_spin.setDecimals(2)
+        loose_spin.setValue(float(_cfg("loose_radius_arcsec", 3.0)))
+        loose_spin.setToolTip("Pass 2 radius. Floored by FWHM-based match radius if adaptive floor is on.")
+        form.addRow("Loose radius (arcsec):", loose_spin)
+
+        retry_spin = QDoubleSpinBox()
+        retry_spin.setRange(0.0, 1.0)
+        retry_spin.setDecimals(2)
+        retry_spin.setSingleStep(0.05)
+        retry_spin.setValue(float(_cfg("adaptive_retry_threshold", 0.5)))
+        retry_spin.setToolTip("If match_rate < threshold after pass 2, retry with 2× loose radius. Set 0 to disable.")
+        form.addRow("Adaptive retry threshold (0=off):", retry_spin)
+
+        form.addRow(QLabel("── Geometric correction ───────────────"))
+
+        fwhm_floor_chk = QCheckBox("FWHM-adaptive radius floor")
+        fwhm_floor_chk.setChecked(bool(_cfg("fwhm_adaptive_floor", True)))
+        fwhm_floor_chk.setToolTip("Floor tight/loose radii to FWHM-based size so they scale with the PSF.")
+        form.addRow("", fwhm_floor_chk)
+
+        geom_chk = QCheckBox("Geometric correction (affine/shift)")
+        geom_chk.setChecked(bool(_cfg("geom_correction_enable", True)))
+        geom_chk.setToolTip("Use pass-1 seed pairs to correct WCS distortion before pass 2.")
+        form.addRow("", geom_chk)
+
+        min_corr_spin = QSpinBox()
+        min_corr_spin.setRange(2, 50)
+        min_corr_spin.setValue(int(_cfg("min_correction_pairs", 3)))
+        min_corr_spin.setToolTip("Minimum pass-1 pairs required to apply shift/affine correction.")
+        form.addRow("Min correction pairs:", min_corr_spin)
+
+        min_affine_spin = QSpinBox()
+        min_affine_spin.setRange(3, 100)
+        min_affine_spin.setValue(int(_cfg("min_affine_pairs", 6)))
+        min_affine_spin.setToolTip("Minimum pass-1 pairs to use full affine. Below this: global shift only.")
+        form.addRow("Min affine pairs:", min_affine_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1065,8 +1281,27 @@ class StarIdMatchingWindow(StepWindowBase):
         if dialog.exec_() == QDialog.Accepted:
             self.params.P.idmatch_tol_arcsec = arcsec_spin.value()
             self.params.P.idmatch_match_r_fwhm = match_r_spin.value()
+            # Always save to flat P attributes (persisted by save_toml via TOML_KEY_MAP)
+            self.params.P.idmatch_two_pass_enable = two_pass_chk.isChecked()
+            self.params.P.idmatch_tight_radius_arcsec = tight_spin.value()
+            self.params.P.idmatch_loose_radius_arcsec = loose_spin.value()
+            self.params.P.idmatch_adaptive_retry_threshold = retry_spin.value()
+            self.params.P.idmatch_fwhm_adaptive_floor = fwhm_floor_chk.isChecked()
+            self.params.P.idmatch_geom_correction_enable = geom_chk.isChecked()
+            self.params.P.idmatch_min_correction_pairs = min_corr_spin.value()
+            self.params.P.idmatch_min_affine_pairs = min_affine_spin.value()
+            # Also mirror to schema sub-object if present
+            if idmatch_cfg is not None:
+                setattr(idmatch_cfg, "two_pass_enable", two_pass_chk.isChecked())
+                setattr(idmatch_cfg, "tight_radius_arcsec", tight_spin.value())
+                setattr(idmatch_cfg, "loose_radius_arcsec", loose_spin.value())
+                setattr(idmatch_cfg, "adaptive_retry_threshold", retry_spin.value())
+                setattr(idmatch_cfg, "fwhm_adaptive_floor", fwhm_floor_chk.isChecked())
+                setattr(idmatch_cfg, "geom_correction_enable", geom_chk.isChecked())
+                setattr(idmatch_cfg, "min_correction_pairs", min_corr_spin.value())
+                setattr(idmatch_cfg, "min_affine_pairs", min_affine_spin.value())
             self.persist_params()
-            QMessageBox.information(dialog, "Success", "Parameters saved!")
+            QMessageBox.information(dialog, "Saved", "Parameters saved.")
 
     def run_idmatch(self):
         if self.worker and self.worker.isRunning():
@@ -1116,6 +1351,86 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Warning", "No frames after QC filter.")
             return
 
+        use_wcs_qc_gate = bool(
+            getattr(
+                idmatch_cfg,
+                "use_wcs_qc_gate",
+                getattr(self.params.P, "idmatch_use_wcs_qc_gate", True),
+            )
+        )
+        wcs_qc_min_rate = float(
+            getattr(
+                idmatch_cfg,
+                "wcs_qc_min_match_rate",
+                getattr(self.params.P, "idmatch_wcs_qc_min_match_rate", 0.20),
+            )
+        )
+        wcs_qc_min_n = int(
+            getattr(
+                idmatch_cfg,
+                "wcs_qc_min_match_n",
+                getattr(self.params.P, "idmatch_wcs_qc_min_match_n", 20),
+            )
+        )
+        wcs_qc_max_rms = float(
+            getattr(
+                idmatch_cfg,
+                "wcs_qc_max_rms_px",
+                getattr(self.params.P, "idmatch_wcs_qc_max_rms_px", 2.5),
+            )
+        )
+        wcs_qc_min_inlier = float(
+            getattr(
+                idmatch_cfg,
+                "wcs_qc_min_inlier_rate",
+                getattr(self.params.P, "idmatch_wcs_qc_min_inlier_rate", 0.50),
+            )
+        )
+        wcs_qc_max_p99 = float(
+            getattr(
+                idmatch_cfg,
+                "wcs_qc_max_p99_px",
+                getattr(self.params.P, "idmatch_wcs_qc_max_p99_px", 5.0),
+            )
+        )
+        files_before_wcs_qc = list(files)
+        files, wcs_qc_info = filter_files_by_wcs_qc(
+            Path(self.params.P.result_dir),
+            files,
+            require_qc=use_wcs_qc_gate,
+            require_wcs_ok=True,
+            min_match_rate=wcs_qc_min_rate,
+            min_match_n=wcs_qc_min_n,
+            max_rms_px=wcs_qc_max_rms,
+            min_inlier_rate=wcs_qc_min_inlier,
+            max_p99_px=wcs_qc_max_p99,
+        )
+        if use_wcs_qc_gate:
+            if wcs_qc_info.get("applied"):
+                checks = ", ".join(str(x) for x in (wcs_qc_info.get("checks") or []))
+                self.log(
+                    f"[WCS-QC] Frame filter: {wcs_qc_info['kept']}/{wcs_qc_info['total']} kept"
+                    + (f" ({checks})" if checks else ".")
+                )
+            elif wcs_qc_info.get("path") is None:
+                self.log("[WCS-QC] frame_wcs_qc.csv not found; using all frames.")
+            else:
+                self.log(f"[WCS-QC] frame_wcs_qc.csv ignored ({wcs_qc_info['reason']}); using all frames.")
+        if not files:
+            if use_wcs_qc_gate and files_before_wcs_qc:
+                self.log(
+                    "[WCS-QC] No frames passed gate; fallback to pre-WCS-QC frame list for this run."
+                )
+                self.log(
+                    f"[WCS-QC] Tune thresholds if needed: min_match_rate={wcs_qc_min_rate:.3f}, "
+                    f"min_match_n={wcs_qc_min_n}, max_rms_px={wcs_qc_max_rms:.3f}, "
+                    f"min_inlier_rate={wcs_qc_min_inlier:.3f}, max_p99_px={wcs_qc_max_p99:.3f}"
+                )
+                files = files_before_wcs_qc
+            else:
+                QMessageBox.warning(self, "Warning", "No frames after WCS QC filter.")
+                return
+
         cache_dir = Path(self.params.P.cache_dir)
         step4_out = step4_dir(self.params.P.result_dir)
         available = [
@@ -1131,10 +1446,25 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Warning", "No frames with detection cache. Run Source Detection first.")
             return
 
-        # Get two-pass matching parameters from config
-        two_pass_enable = bool(getattr(idmatch_cfg, "two_pass_enable", True)) if idmatch_cfg else True
-        tight_radius_arcsec = float(getattr(idmatch_cfg, "tight_radius_arcsec", 1.0)) if idmatch_cfg else 1.0
-        loose_radius_arcsec = float(getattr(idmatch_cfg, "loose_radius_arcsec", 3.0)) if idmatch_cfg else 3.0
+        # Get two-pass matching parameters: flat P attrs (TOML-persisted) take priority over schema sub-object
+        _MISSING2 = object()
+
+        def _p(key, default):
+            flat_val = getattr(self.params.P, f"idmatch_{key}", _MISSING2)
+            if flat_val is not _MISSING2:
+                return flat_val
+            if idmatch_cfg is not None:
+                return getattr(idmatch_cfg, key, default)
+            return default
+
+        two_pass_enable = bool(_p("two_pass_enable", True))
+        tight_radius_arcsec = float(_p("tight_radius_arcsec", 1.0))
+        loose_radius_arcsec = float(_p("loose_radius_arcsec", 3.0))
+        min_correction_pairs = int(_p("min_correction_pairs", 3))
+        min_affine_pairs = int(_p("min_affine_pairs", 6))
+        adaptive_retry_threshold = float(_p("adaptive_retry_threshold", 0.5))
+        fwhm_adaptive_floor = bool(_p("fwhm_adaptive_floor", True))
+        geom_correction_enable = bool(_p("geom_correction_enable", True))
 
         self.worker = IdMatchWorker(
             file_list=files,
@@ -1154,6 +1484,11 @@ class StarIdMatchingWindow(StepWindowBase):
             two_pass_enable=two_pass_enable,
             tight_radius_arcsec=tight_radius_arcsec,
             loose_radius_arcsec=loose_radius_arcsec,
+            min_correction_pairs=min_correction_pairs,
+            min_affine_pairs=min_affine_pairs,
+            adaptive_retry_threshold=adaptive_retry_threshold,
+            fwhm_adaptive_floor=fwhm_adaptive_floor,
+            geom_correction_enable=geom_correction_enable,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.log)

@@ -45,6 +45,7 @@ from ...utils.step_paths import (
     legacy_step7_wcs_dir,
 )
 from ...utils.common_helpers import safe_float as _safe_float
+from ...utils.io_utils import coerce_int64_source_id
 from ...utils.qc_utils import filter_files_by_qc
 
 
@@ -375,7 +376,7 @@ class RefBuildWorker(QThread):
         gaia_idx = idx[ok]
 
         if "source_id" in gaia_df.columns:
-            gaia_sid = pd.to_numeric(gaia_df["source_id"], errors="coerce").astype("Int64")
+            gaia_sid = coerce_int64_source_id(gaia_df["source_id"])
             out.loc[match_idx, "gaia_source_id"] = pd.array(
                 gaia_sid.iloc[np.asarray(gaia_idx, dtype=int)].tolist(),
                 dtype="Int64",
@@ -413,7 +414,7 @@ class RefBuildWorker(QThread):
         This ensures consistent source_id across all frames for Gaia-matched sources.
         """
         out = df.copy()
-        old_ids = pd.to_numeric(out.get("source_id"), errors="coerce")
+        old_ids = coerce_int64_source_id(out["source_id"]) if "source_id" in out.columns else None
 
         # Check if gaia_source_id column exists
         if "gaia_source_id" not in out.columns:
@@ -422,14 +423,14 @@ class RefBuildWorker(QThread):
 
         # Filter by magnitude limit if gaia_G is available
         n_trimmed = 0
-        gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
+        gaia_sid = coerce_int64_source_id(out["gaia_source_id"])
         if "gaia_G" in out.columns and gaia_mag_limit > 0:
             gaia_g = pd.to_numeric(out["gaia_G"], errors="coerce")
             too_faint = gaia_g > gaia_mag_limit
             n_trimmed = int((too_faint & gaia_sid.notna() & (gaia_sid > 0)).sum())
             # Clear Gaia ID for sources fainter than limit
             out.loc[too_faint, "gaia_source_id"] = pd.NA
-            gaia_sid = pd.to_numeric(out["gaia_source_id"], errors="coerce").astype("Int64")
+            gaia_sid = coerce_int64_source_id(out["gaia_source_id"])
 
         # Identify sources with valid Gaia source_id
         has_gaia = gaia_sid.notna() & (gaia_sid > 0)
@@ -455,13 +456,14 @@ class RefBuildWorker(QThread):
         sid_map = {}
         id_map = {}
         if old_ids is not None:
-            old_vals = pd.to_numeric(old_ids, errors="coerce").to_numpy(dtype=float)
-            new_vals = pd.to_numeric(out["source_id"], errors="coerce").to_numpy(dtype=float)
-            id_vals = pd.to_numeric(out["ID"], errors="coerce").to_numpy(dtype=float)
-            for o, n, i in zip(old_vals, new_vals, id_vals):
-                if np.isfinite(o):
-                    sid_map[int(o)] = int(n) if np.isfinite(n) else int(o)
-                    id_map[int(o)] = int(i) if np.isfinite(i) else int(o)
+            new_vals = coerce_int64_source_id(out["source_id"])
+            id_vals = pd.to_numeric(out["ID"], errors="coerce").astype("Int64")
+            for o, n, i in zip(old_ids, new_vals, id_vals):
+                if pd.isna(o):
+                    continue
+                old_i = int(o)
+                sid_map[old_i] = int(n) if pd.notna(n) else old_i
+                id_map[old_i] = int(i) if pd.notna(i) else old_i
 
         n_gaia = int(has_gaia.sum())
         n_local = len(out) - n_gaia
@@ -508,14 +510,15 @@ class RefBuildWorker(QThread):
         new["source_id"] = np.nan
         new["ID"] = np.nan
 
-        base_ids = pd.to_numeric(base.loc[base_mask, "source_id"], errors="coerce").to_numpy()
+        base_ids = coerce_int64_source_id(base.loc[base_mask, "source_id"]).to_numpy(dtype=np.int64, na_value=0)
         match_idx = np.where(new_mask)[0]
         ok_idx = match_idx[ok]
         if len(ok_idx):
             new.loc[ok_idx, "source_id"] = base_ids[idx[ok]]
             new.loc[ok_idx, "ID"] = base_ids[idx[ok]]
 
-        next_id = int(pd.to_numeric(base["source_id"], errors="coerce").max() or 0) + 1
+        base_sid = coerce_int64_source_id(base["source_id"]).dropna()
+        next_id = int(base_sid.max() if not base_sid.empty else 0) + 1
         new_rows = []
         for i in match_idx[~ok]:
             sid = next_id
@@ -527,7 +530,7 @@ class RefBuildWorker(QThread):
         if new_rows:
             base = pd.concat([base] + new_rows, ignore_index=True)
 
-        new["source_id"] = pd.to_numeric(new["source_id"], errors="coerce").astype("Int64")
+        new["source_id"] = coerce_int64_source_id(new["source_id"])
         new["ID"] = pd.to_numeric(new["ID"], errors="coerce").astype("Int64")
         return base, new
 
@@ -542,11 +545,15 @@ class RefBuildWorker(QThread):
 
     def _compute_match_stats(self, det_xy: np.ndarray, wcs: WCS, gaia_sky: SkyCoord) -> dict:
         n_det = len(det_xy)
+        n_cat = int(len(gaia_sky)) if gaia_sky is not None else 0
         if n_det == 0:
             return dict(
                 n_det=0,
+                n_catalog_in_fov=n_cat,
                 n_match=0,
                 match_rate=0.0,
+                match_rate_cat=0.0,
+                match_rate_eff=0.0,
                 sep_med_arcsec=np.nan,
                 sep_p90_arcsec=np.nan,
                 dup_rate=np.nan,
@@ -558,8 +565,11 @@ class RefBuildWorker(QThread):
         except Exception:
             return dict(
                 n_det=n_det,
+                n_catalog_in_fov=n_cat,
                 n_match=0,
                 match_rate=0.0,
+                match_rate_cat=0.0,
+                match_rate_eff=0.0,
                 sep_med_arcsec=np.nan,
                 sep_p90_arcsec=np.nan,
                 dup_rate=np.nan,
@@ -573,8 +583,11 @@ class RefBuildWorker(QThread):
         if n_match == 0:
             return dict(
                 n_det=n_det,
+                n_catalog_in_fov=n_cat,
                 n_match=0,
                 match_rate=0.0,
+                match_rate_cat=0.0,
+                match_rate_eff=0.0,
                 sep_med_arcsec=np.nan,
                 sep_p90_arcsec=np.nan,
                 dup_rate=np.nan,
@@ -595,8 +608,11 @@ class RefBuildWorker(QThread):
 
         return dict(
             n_det=n_det,
+            n_catalog_in_fov=n_cat,
             n_match=n_match,
             match_rate=float(n_match / max(n_det, 1)),
+            match_rate_cat=float(n_match / max(n_cat, 1)),
+            match_rate_eff=float(max(n_match / max(n_det, 1), n_match / max(n_cat, 1))),
             sep_med_arcsec=sep_med,
             sep_p90_arcsec=sep_p90,
             dup_rate=dup_rate,
@@ -688,6 +704,15 @@ class RefBuildWorker(QThread):
         # Apply WCS match quality filters when available
         if "match_rate" in cand.columns:
             cand["match_rate"] = pd.to_numeric(cand["match_rate"], errors="coerce")
+        if "match_rate_cat" in cand.columns:
+            cand["match_rate_cat"] = pd.to_numeric(cand["match_rate_cat"], errors="coerce")
+        if "match_rate_eff" in cand.columns:
+            cand["match_rate_eff"] = pd.to_numeric(cand["match_rate_eff"], errors="coerce")
+        rate_cols = [c for c in ("match_rate", "match_rate_cat", "match_rate_eff") if c in cand.columns]
+        if rate_cols:
+            cand["match_rate_eff"] = pd.concat(
+                [cand[c] for c in rate_cols], axis=1
+            ).max(axis=1)
         if "n_match" in cand.columns:
             cand["n_match"] = pd.to_numeric(cand["n_match"], errors="coerce")
         if "sep_med_arcsec" in cand.columns:
@@ -700,9 +725,9 @@ class RefBuildWorker(QThread):
         cand_wcs = cand.copy()
         if "wcs_ok" in cand_wcs.columns:
             cand_wcs = cand_wcs[cand_wcs["wcs_ok"] == True]
-        if "match_rate" in cand_wcs.columns and self.wcs_min_match_rate > 0:
-            if cand_wcs["match_rate"].notna().any():
-                cand_wcs = cand_wcs[cand_wcs["match_rate"] >= self.wcs_min_match_rate]
+        if "match_rate_eff" in cand_wcs.columns and self.wcs_min_match_rate > 0:
+            if cand_wcs["match_rate_eff"].notna().any():
+                cand_wcs = cand_wcs[cand_wcs["match_rate_eff"] >= self.wcs_min_match_rate]
         if "n_match" in cand_wcs.columns and self.wcs_min_match_n > 0:
             if cand_wcs["n_match"].notna().any():
                 cand_wcs = cand_wcs[cand_wcs["n_match"] >= self.wcs_min_match_n]
@@ -744,8 +769,8 @@ class RefBuildWorker(QThread):
 
         sort_cols = []
         sort_asc = []
-        if "match_rate" in cand.columns:
-            sort_cols.append("match_rate")
+        if "match_rate_eff" in cand.columns:
+            sort_cols.append("match_rate_eff")
             sort_asc.append(False)
         if "sep_med_arcsec" in cand.columns:
             sort_cols.append("sep_med_arcsec")
@@ -762,11 +787,13 @@ class RefBuildWorker(QThread):
             top = cand.head(5)
             for _, row in top.iterrows():
                 self._log(
-                    "[REF][QC] cand {file} f={flt} mr={mr} sep={sep} fwhm={fwhm} "
+                    "[REF][QC] cand {file} f={flt} mr_eff={mre} mr_det={mr} mr_cat={mrc} sep={sep} fwhm={fwhm} "
                     "shape={shape} sat={sat} n={n} wcs_ok={wcs} match_n={mn}".format(
                         file=row.get("file", ""),
                         flt=row.get("filter", ""),
+                        mre=_safe_float(row.get("match_rate_eff"), np.nan),
                         mr=_safe_float(row.get("match_rate"), np.nan),
+                        mrc=_safe_float(row.get("match_rate_cat"), np.nan),
                         sep=_safe_float(row.get("sep_med_arcsec"), np.nan),
                         fwhm=_safe_float(row.get("fwhm_px"), np.nan),
                         shape=_safe_float(row.get("shape_metric"), np.nan),
@@ -959,6 +986,8 @@ class RefBuildWorker(QThread):
                     dict(
                         n_match=0,
                         match_rate=np.nan,
+                        match_rate_cat=np.nan,
+                        match_rate_eff=np.nan,
                         sep_med_arcsec=np.nan,
                         sep_p90_arcsec=np.nan,
                         dup_rate=np.nan,
@@ -966,6 +995,15 @@ class RefBuildWorker(QThread):
                 )
             else:
                 row.update(self._compute_match_stats(det_xy, wcs, gaia_sky))
+
+            mr_candidates = [
+                _safe_float(row.get("match_rate"), np.nan),
+                _safe_float(row.get("match_rate_cat"), np.nan),
+                _safe_float(row.get("match_rate_eff"), np.nan),
+            ]
+            mr_candidates = [v for v in mr_candidates if np.isfinite(v)]
+            if mr_candidates:
+                row["match_rate_eff"] = float(max(mr_candidates))
 
             stats_rows.append(row)
 
@@ -983,6 +1021,12 @@ class RefBuildWorker(QThread):
             if "match_rate" in metrics.columns and metrics["match_rate"].notna().any():
                 mr = metrics["match_rate"].median()
                 self._log(f"[REF][QC] match_rate median={mr:.3f}")
+            if "match_rate_cat" in metrics.columns and metrics["match_rate_cat"].notna().any():
+                mrc = metrics["match_rate_cat"].median()
+                self._log(f"[REF][QC] match_rate_cat median={mrc:.3f}")
+            if "match_rate_eff" in metrics.columns and metrics["match_rate_eff"].notna().any():
+                mre = metrics["match_rate_eff"].median()
+                self._log(f"[REF][QC] match_rate_eff median={mre:.3f}")
             if "sep_med_arcsec" in metrics.columns and metrics["sep_med_arcsec"].notna().any():
                 sm = metrics["sep_med_arcsec"].median()
                 self._log(f"[REF][QC] sep_med_arcsec median={sm:.3f}")
@@ -1041,13 +1085,14 @@ class RefBuildWorker(QThread):
             if self.ref_per_date and sid_map:
                 for date_key in ref_catalogs_by_date:
                     df_date = ref_catalogs_by_date[date_key].copy()
-                    old_sid = pd.to_numeric(df_date.get("source_id"), errors="coerce")
+                    old_sid = coerce_int64_source_id(df_date["source_id"]) if "source_id" in df_date.columns else None
                     if old_sid is not None:
-                        mapped_sid = old_sid.map(sid_map)
-                        mapped_id = old_sid.map(id_map)
+                        mapped_sid = old_sid.map(sid_map).astype("Int64")
+                        mapped_id = old_sid.map(id_map).astype("Int64")
                         # Fallback to original IDs if mapping missing
-                        df_date["source_id"] = mapped_sid.where(mapped_sid.notna(), old_sid)
-                        df_date["ID"] = mapped_id.where(mapped_id.notna(), old_sid)
+                        df_date["source_id"] = mapped_sid.where(mapped_sid.notna(), old_sid).astype("Int64")
+                        fallback_id = coerce_int64_source_id(df_date["ID"]) if "ID" in df_date.columns else old_sid
+                        df_date["ID"] = mapped_id.where(mapped_id.notna(), fallback_id).astype("Int64")
                     ref_catalogs_by_date[date_key] = df_date
 
         if "phot_g_mean_mag" in master_df.columns:
@@ -1621,7 +1666,10 @@ class RefBuildWindow(StepWindowBase):
             "file",
             "filter",
             "wcs_ok",
+            "match_rate_eff",
             "match_rate",
+            "match_rate_cat",
+            "n_match",
             "sep_med_arcsec",
             "sep_p90_arcsec",
             "dup_rate",

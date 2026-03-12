@@ -48,6 +48,7 @@ from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
 from ...utils.step_paths import step1_dir, step8_dir, step9_dir, step10_dir, step11_dir, legacy_step11_zeropoint_dir
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.qc_utils import load_frame_excludes
 
 
@@ -88,6 +89,48 @@ def _load_headers_table(result_dir: Path) -> pd.DataFrame:
         return pd.read_csv(headers_path)
     except Exception:
         return pd.DataFrame()
+
+
+def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> dict[int, int]:
+    """Load source_id -> final ID map from Step 8 outputs."""
+    step8_out = step8_dir(result_dir)
+    if not step8_out.exists():
+        return {}
+    key = _normalize_filter_key(flt or "")
+    candidates: list[tuple[Path, str]] = []
+    if key:
+        candidates.extend(
+            [
+                (step8_out / f"master_catalog_{key}.tsv", "\t"),
+                (step8_out / f"id_mapping_{key}.csv", ","),
+            ]
+        )
+    candidates.extend(
+        [(p, "\t") for p in sorted(step8_out.glob("master_catalog_*.tsv"))]
+    )
+    candidates.extend(
+        [(p, ",") for p in sorted(step8_out.glob("id_mapping_*.csv"))]
+    )
+
+    mapping: dict[int, int] = {}
+    for path, sep in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = read_csv_int64_source_id(path, sep=sep)
+        except Exception:
+            continue
+        if not {"source_id", "ID"} <= set(df.columns):
+            continue
+        sid_vals = coerce_int64_source_id(df["source_id"])
+        id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+        for sid_val, id_val in zip(sid_vals, id_vals):
+            if pd.isna(sid_val) or pd.isna(id_val):
+                continue
+            sid_int = int(sid_val)
+            if sid_int not in mapping:
+                mapping[sid_int] = int(id_val)
+    return mapping
 
 
 class DetrendNightMergeWindow(StepWindowBase):
@@ -717,13 +760,25 @@ class DetrendNightMergeWindow(StepWindowBase):
         # 2) Step 8 per-filter selection_{filter}.json
         s8 = step8_dir(rd)
         if s8.exists():
-            for sp in s8.glob("selection_*.json"):
+            for sp in sorted(s8.glob("selection_*.json")):
                 try:
                     data = json.loads(sp.read_text(encoding="utf-8"))
                     tid = data.get("target_id")
+                    cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
+                    flt = sp.stem.replace("selection_", "")
+                    sid_map = _load_step8_source_to_id_map(rd, flt)
+                    target_sid = data.get("target_source_id")
+                    comp_sids = [int(x) for x in data.get("comparison_source_ids", []) if x is not None]
+                    if tid is None and target_sid is not None and int(target_sid) in sid_map:
+                        tid = int(sid_map[int(target_sid)])
+                    if not cids and comp_sids:
+                        cids = sorted({
+                            int(sid_map[int(sid)])
+                            for sid in comp_sids
+                            if int(sid) in sid_map
+                        })
                     if tid is not None:
                         self.target_edit.setText(str(int(tid)))
-                        cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
                         self.comp_active_ids = cids
                         self.comp_candidate_ids = cids
                         self._update_id_info_label()
@@ -1097,6 +1152,39 @@ class DetrendNightMergeWindow(StepWindowBase):
         self._update_id_info_label()
 
     def _load_comp_selection(self) -> None:
+        def _load_from_step8() -> bool:
+            rd = Path(self.params.P.result_dir)
+            s8 = step8_dir(rd)
+            if not s8.exists():
+                return False
+            for sp in sorted(s8.glob("selection_*.json")):
+                try:
+                    data = json.loads(sp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                flt = sp.stem.replace("selection_", "")
+                sid_map = _load_step8_source_to_id_map(rd, flt)
+                cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
+                comp_sids = [int(x) for x in data.get("comparison_source_ids", []) if x is not None]
+                if not cids and comp_sids:
+                    cids = sorted({
+                        int(sid_map[int(sid)])
+                        for sid in comp_sids
+                        if int(sid) in sid_map
+                    })
+                if not cids:
+                    continue
+                tid = data.get("target_id")
+                target_sid = data.get("target_source_id")
+                if tid is None and target_sid is not None and int(target_sid) in sid_map:
+                    tid = int(sid_map[int(target_sid)])
+                if tid is not None and not self.target_edit.text().strip():
+                    self.target_edit.setText(str(int(tid)))
+                self.comp_active_ids = cids
+                self.comp_candidate_ids = cids
+                return True
+            return False
+
         if not self.datasets:
             return
         base_dir = step10_dir(self.params.P.result_dir)
@@ -1104,11 +1192,17 @@ class DetrendNightMergeWindow(StepWindowBase):
         if not sel_path.exists() and self.datasets:
             sel_path = step10_dir(self.datasets[0][1]) / "comp_selection.json"
         if not sel_path.exists():
+            if _load_from_step8():
+                self._update_comp_label()
             return
         try:
             data = json.loads(sel_path.read_text(encoding="utf-8"))
             self.comp_active_ids = [int(x) for x in data.get("comp_active_ids", []) if str(x).strip()]
             self.comp_candidate_ids = [int(x) for x in data.get("comp_candidate_ids", []) if str(x).strip()]
+            if not self.comp_active_ids and self.comp_candidate_ids:
+                self.comp_active_ids = list(self.comp_candidate_ids)
+            if not self.comp_active_ids and not self.comp_candidate_ids:
+                _load_from_step8()
             self._update_comp_label()
         except Exception:
             return
