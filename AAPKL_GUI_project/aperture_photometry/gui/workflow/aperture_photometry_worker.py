@@ -131,10 +131,7 @@ class ApertureWorker(QThread):
             fwhm_px_max = self._to_float(getattr(P, "fwhm_px_max", 8.0), 8.0)
 
             min_r_ap_px = self._to_float(getattr(P, "min_r_ap_px", 4.0), 4.0)
-            min_r_in_px = self._to_float(getattr(P, "min_r_in_px", 12.0), 12.0)
-            min_r_out_px = self._to_float(getattr(P, "min_r_out_px", 20.0), 20.0)
             ann_gap = self._to_float(getattr(P, "annulus_min_gap_px", 6.0), 6.0)
-            ann_minw = self._to_float(getattr(P, "annulus_min_width_px", 12.0), 12.0)
 
             apcorr_apply = bool(getattr(P, "apcorr_apply", True))
             apcorr_use_min_n = self._to_int(getattr(P, "apcorr_use_min_n", 20), 20)
@@ -202,8 +199,8 @@ class ApertureWorker(QThread):
                 fwhm_used = float(np.clip(fwhm_med, fwhm_px_min, fwhm_px_max))
 
                 r_ap = max(ap_scale * fwhm_used, min_r_ap_px)
-                r_in = max(ann_in_scale * fwhm_used, max(min_r_in_px, r_ap + ann_gap))
-                r_out = max(r_in + ann_out_scale * fwhm_used, r_in + ann_minw, min_r_out_px)
+                r_in = max(ann_in_scale * fwhm_used, r_ap + ann_gap)
+                r_out = r_in + ann_out_scale * fwhm_used
                 cbox_px = max(cbox_scale * fwhm_used, 5.0)
 
                 row = dict(

@@ -339,10 +339,7 @@ class Step5ApertureWorker(QThread):
             fwhm_px_min = _to_float(getattr(P, "fwhm_px_min", 3.5), 3.5)
             fwhm_px_max = _to_float(getattr(P, "fwhm_px_max", 8.0), 8.0)
             min_r_ap_px = _to_float(getattr(P, "min_r_ap_px", 4.0), 4.0)
-            min_r_in_px = _to_float(getattr(P, "min_r_in_px", 12.0), 12.0)
-            min_r_out_px = _to_float(getattr(P, "min_r_out_px", 20.0), 20.0)
             ann_gap = _to_float(getattr(P, "annulus_min_gap_px", 6.0), 6.0)
-            ann_minw = _to_float(getattr(P, "annulus_min_width_px", 12.0), 12.0)
             apcorr_apply = bool(getattr(P, "apcorr_apply", True))
             apcorr_use_min_n = _to_int(getattr(P, "apcorr_use_min_n", 20), 20)
             apcorr_scatter_max = _to_float(getattr(P, "apcorr_scatter_max", 0.05), 0.05)
@@ -378,8 +375,8 @@ class Step5ApertureWorker(QThread):
                 scales_used = np.array(gc_scales)[unique_idx]
 
                 r_large_ref = max(gc_large_ref_scale * fwhm_used, radii_px[-1] if len(radii_px) else min_r_ap_px)
-                r_in = max(ann_in_scale * fwhm_used, max(min_r_in_px, r_large_ref + ann_gap))
-                r_out = max(r_in + ann_out_scale * fwhm_used, r_in + ann_minw, min_r_out_px)
+                r_in = max(ann_in_scale * fwhm_used, r_large_ref + ann_gap)
+                r_out = r_in + ann_out_scale * fwhm_used
                 r_ap_default = max(ap_scale * fwhm_used, min_r_ap_px)
 
                 apc_row = dict(
@@ -557,8 +554,8 @@ class Step5ApertureWorker(QThread):
                             self.log.emit(f"[Apcorr] {fname}: {exc}")
 
                 r_ap_out = float(apc_row.get("r_optimal", r_ap_default))
-                r_in_out = max(ann_in_scale * fwhm_used, max(min_r_in_px, r_ap_out + ann_gap))
-                r_out_out = max(r_in_out + ann_out_scale * fwhm_used, r_in_out + ann_minw, min_r_out_px)
+                r_in_out = max(ann_in_scale * fwhm_used, r_ap_out + ann_gap)
+                r_out_out = r_in_out + ann_out_scale * fwhm_used
                 rows_ap.append(dict(file=fname, fwhm_px=fwhm_used, r_ap=r_ap_out,
                                     r_in=r_in_out, r_out=r_out_out))
                 rows_apcorr.append(apc_row)
@@ -701,10 +698,9 @@ class Step5PhotWorker(QThread):
                     ann_in_scale = _to_float(getattr(P, "fitsky_annulus_scale", 4.0), 4.0)
                     ann_out_scale = _to_float(getattr(P, "fitsky_dannulus_scale", 2.0), 2.0)
                     ann_gap = _to_float(getattr(P, "annulus_min_gap_px", 6.0), 6.0)
-                    ann_minw = _to_float(getattr(P, "annulus_min_width_px", 12.0), 12.0)
                     r_ap = max(ap_scale * fwhm_used, 4.0)
                     r_in = max(ann_in_scale * fwhm_used, r_ap + ann_gap)
-                    r_out = max(r_in + ann_out_scale * fwhm_used, r_in + ann_minw)
+                    r_out = r_in + ann_out_scale * fwhm_used
                 else:
                     r_ap = float(ap_row["r_ap"].values[0])
                     r_in = float(ap_row["r_in"].values[0])
@@ -912,6 +908,7 @@ class AperturePhotometryWindow(StepWindowBase):
             project_state=project_state,
             main_window=main_window,
         )
+        self.btn_complete.hide()
         self.setup_step_ui()
         self.restore_state()
 
@@ -1598,9 +1595,51 @@ class AperturePhotometryWindow(StepWindowBase):
 
     # ── Validation / State ────────────────────────────────────────────────────
 
+    def update_navigation_buttons(self):
+        self._sync_completion_from_outputs()
+        super().update_navigation_buttons()
+        self.btn_complete.hide()
+
+    def _csv_has_rows(self, path: Path, required_columns=()) -> bool:
+        if not path.exists():
+            return False
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            return False
+        if df.empty:
+            return False
+        return set(required_columns) <= set(df.columns)
+
+    def _sync_completion_from_outputs(self):
+        is_complete = self.validate_step()
+        was_complete = self.project_state.is_step_completed(self.step_index)
+        self.completed = is_complete
+        if is_complete == was_complete:
+            return
+
+        if is_complete:
+            self.project_state.mark_step_completed(self.step_index)
+            if hasattr(self.main_window, "update_step_buttons"):
+                self.main_window.update_step_buttons()
+            if hasattr(self.main_window, "append_log"):
+                self.main_window.append_log(
+                    f"✓ Step {self.step_index + 1} completed: {self.step_name}"
+                )
+            return
+
+        self.project_state.mark_step_incomplete(self.step_index)
+        if hasattr(self.main_window, "update_step_buttons"):
+            self.main_window.update_step_buttons()
+
     def validate_step(self) -> bool:
-        idx_path = step5_aperture_dir(self.params.P.result_dir) / "photometry_index.csv"
-        return idx_path.exists()
+        base = step5_aperture_dir(self.params.P.result_dir)
+        apcorr_sum_path = base / "apcorr_summary.csv"
+        idx_path = base / "photometry_index.csv"
+        return (
+            self._csv_has_rows(apcorr_sum_path, required_columns=("file",))
+            and self._csv_has_rows(idx_path, required_columns=("file",))
+        )
 
     def save_state(self):
         state = {
