@@ -401,6 +401,9 @@ class CropSelectorWindow(StepWindowBase):
                 original_path = self.params.get_file_path(filename)
                 cropped_path = cropped_dir / filename
 
+                if self._is_crop_cache_valid(original_path, cropped_path):
+                    return filename  # reuse existing cropped file
+
                 with fits.open(original_path, memmap=False) as hdul:
                     data = None
                     header = None
@@ -504,6 +507,36 @@ class CropSelectorWindow(StepWindowBase):
                 self, "Crop Error",
                 f"Failed to crop images:\n{str(e)}"
             )
+
+    def _is_crop_cache_valid(self, original_path: Path, cropped_path: Path) -> bool:
+        """Return True if existing cropped file can be reused for current crop rectangle."""
+        if not cropped_path.exists():
+            return False
+        try:
+            src_stat = original_path.stat()
+            dst_stat = cropped_path.stat()
+            if int(dst_stat.st_mtime_ns) < int(src_stat.st_mtime_ns):
+                return False
+
+            header = fits.getheader(cropped_path, ext=0)
+            if int(header.get("CROP_X0", -1)) != int(self.crop_x0):
+                return False
+            if int(header.get("CROP_Y0", -1)) != int(self.crop_y0):
+                return False
+            if int(header.get("CROP_X1", -1)) != int(self.crop_x1):
+                return False
+            if int(header.get("CROP_Y1", -1)) != int(self.crop_y1):
+                return False
+
+            expected_w = int(self.crop_x1 - self.crop_x0)
+            expected_h = int(self.crop_y1 - self.crop_y0)
+            if int(header.get("NAXIS1", -1)) != expected_w:
+                return False
+            if int(header.get("NAXIS2", -1)) != expected_h:
+                return False
+            return True
+        except Exception:
+            return False
 
     def has_completed_step4_or_later(self) -> bool:
         """Return True if Step 4+ has already been completed."""

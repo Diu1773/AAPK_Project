@@ -18,6 +18,7 @@ from typing import Optional
 import copy
 import shutil
 import json
+from collections import OrderedDict
 import numpy as np
 import pandas as pd
 import time
@@ -39,6 +40,86 @@ from ...utils.step_paths import (
     step5_dir,
     legacy_step7_wcs_dir,
 )
+from ...utils.cache_utils import norm_path_key
+
+_DETECT_MODE_PRESETS = {
+    "normal": {
+        "detect_sigma": 3.2,
+        "minarea_pix": 3,
+        "deblend_enable": True,
+        "deblend_nthresh": 64,
+        "deblend_cont": 0.004,
+        "deblend_max_labels": 4000,
+        "deblend_label_hard_max": 7000,
+        "dao_refine_enable": True,
+        "peak_pass_enable": False,
+        "peak_nsigma": 3.4,
+        "peak_max_add": 500,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",   # faster than linear (photutils>=1.0.1)
+    },
+    "crowded": {
+        "detect_sigma": 3.0,
+        "minarea_pix": 2,
+        "deblend_enable": True,
+        "deblend_nthresh": 96,
+        "deblend_cont": 0.0015,
+        "deblend_max_labels": 6000,
+        "deblend_label_hard_max": 10000,
+        "dao_refine_enable": True,
+        "peak_pass_enable": False,
+        "peak_nsigma": 3.8,
+        "peak_max_add": 300,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",
+    },
+    "faint": {
+        "detect_sigma": 2.6,
+        "minarea_pix": 2,
+        "deblend_enable": True,
+        "deblend_nthresh": 48,
+        "deblend_cont": 0.0060,
+        "deblend_max_labels": 5000,
+        "deblend_label_hard_max": 9000,
+        "dao_refine_enable": False,
+        "peak_pass_enable": False,
+        "peak_nsigma": 2.8,
+        "peak_max_add": 1200,
+        "fwhm_qc_max_sources": 20,
+        "bkg2d_downsample": 8,
+        "deblend_mode": "exponential",
+    },
+}
+
+
+def _normalize_detect_mode(value) -> str:
+    s = str(value or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "standard": "normal",
+        "dense": "crowded",
+        "cluster": "crowded",
+        "dim": "faint",
+        "deep": "faint",
+        "custom": "custom",
+    }
+    s = aliases.get(s, s)
+    if s in _DETECT_MODE_PRESETS:
+        return s
+    if s == "custom":
+        return s
+    return "normal"
+
+
+def _get_detect_mode_preset(mode: str) -> dict:
+    mode_key = _normalize_detect_mode(mode)
+    return dict(_DETECT_MODE_PRESETS.get(mode_key, _DETECT_MODE_PRESETS["normal"]))
+
+
+def _get_detect_mode_from_params(params_obj) -> str:
+    return _normalize_detect_mode(getattr(params_obj, "detect_mode", "normal"))
 
 
 class DetectionWorker(QThread):
@@ -95,6 +176,7 @@ class DetectionWorker(QThread):
             deblend_cont = float(getattr(P, 'deblend_cont', 0.004))
             deblend_max_labels = int(getattr(P, 'deblend_max_labels', 4000))
             deblend_label_hard_max = int(getattr(P, 'deblend_label_hard_max', 7000))
+            deblend_mode = str(getattr(P, 'deblend_mode', 'exponential')).strip().lower()
             bkg2d_enable = getattr(P, 'bkg2d_in_detect', True)
             bkg2d_box = int(getattr(P, 'bkg2d_box', 64))
             dao_refine_enable = getattr(P, 'dao_refine_enable', False)
@@ -104,7 +186,7 @@ class DetectionWorker(QThread):
             dao_round_lo = float(getattr(P, 'dao_round_lo', -0.5))
             dao_round_hi = float(getattr(P, 'dao_round_hi', 0.5))
             dao_match_tol = float(getattr(P, 'dao_match_tol_px', 2.0))
-            peak_enable = bool(getattr(P, 'peak_pass_enable', True))
+            peak_enable = bool(getattr(P, 'peak_pass_enable', False))
             peak_nsigma = float(getattr(P, 'peak_nsigma', 3.2))
             peak_scales = getattr(P, 'peak_kernel_scales', "0.9,1.3")
             peak_min_sep = float(getattr(P, 'peak_min_sep_px', 4.0))
@@ -154,6 +236,19 @@ class DetectionWorker(QThread):
                         file_path = cropped_dir / filename
                     else:
                         file_path = self.params.get_file_path(filename)
+                    source_sig = {
+                        "cache_schema": 3,  # v3: added det_uid column
+                        "source_path": str(Path(file_path)).replace("\\", "/").lower(),
+                        "source_use_cropped": bool(self.use_cropped),
+                        "source_size": None,
+                        "source_mtime_ns": None,
+                    }
+                    try:
+                        st = Path(file_path).stat()
+                        source_sig["source_size"] = int(st.st_size)
+                        source_sig["source_mtime_ns"] = int(st.st_mtime_ns)
+                    except Exception:
+                        pass
 
                     # Load FITS
                     with fits.open(file_path) as hdul:
@@ -434,20 +529,27 @@ class DetectionWorker(QThread):
                                 if self._stop_requested:
                                     return filename, None
                                 try:
+                                    # mode='exponential' (photutils>=1.0.1) is ~2x faster
+                                    # than 'linear'; falls back gracefully on older versions
                                     segm = deblend_sources(
                                         fim, segm,
                                         npixels=minarea_pix,
                                         nlevels=nlevels,
                                         contrast=cont,
+                                        mode=deblend_mode,
                                         progress_bar=False
                                     )
                                 except TypeError:
-                                    segm = deblend_sources(
-                                        fim, segm,
-                                        npixels=minarea_pix,
-                                        nlevels=nlevels,
-                                        contrast=cont
-                                    )
+                                    # older photutils: no mode/progress_bar kwarg
+                                    try:
+                                        segm = deblend_sources(
+                                            fim, segm,
+                                            npixels=minarea_pix,
+                                            nlevels=nlevels,
+                                            contrast=cont
+                                        )
+                                    except Exception:
+                                        pass  # Keep original segmentation
                                 except Exception:
                                     pass  # Keep original segmentation
                             else:
@@ -725,6 +827,7 @@ class DetectionWorker(QThread):
                         'median_elongation': median_elongation,
                         'median_roundness': median_roundness,
                         'sat_star_count': sat_star_count,
+                        **source_sig,
                     }
 
                     # Stage 6: Saving
@@ -749,6 +852,7 @@ class DetectionWorker(QThread):
                         'median_elongation': median_elongation,
                         'median_roundness': median_roundness,
                         'sat_star_count': sat_star_count,
+                        **source_sig,
                     }
                     with open(cache_file, 'w') as f:
                         json.dump(payload, f)
@@ -765,6 +869,7 @@ class DetectionWorker(QThread):
                             if self._stop_requested:
                                 return filename, None
                             record = {
+                                'det_uid': idx,       # 0-indexed, per-frame detection key
                                 'id': idx + 1,
                                 'x': x,
                                 'y': y,
@@ -1102,6 +1207,13 @@ class QCInspectionPanel(QWidget):
         return meta
 
     def _load_detect_meta(self, fname: str) -> dict:
+        if hasattr(self.parent_window, "_pick_detection_cache"):
+            try:
+                payload, _, _, _ = self.parent_window._pick_detection_cache(fname, previous=False)
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                pass
         cache_dir = self.params.P.cache_dir
         step4_out = step4_dir(self.params.P.result_dir)
         cache_file = cache_dir / f"detect_{fname}.json"
@@ -1715,6 +1827,8 @@ class SourceDetectionWindow(StepWindowBase):
         self.ax = None
         self._imshow_obj = None
         self._normalized_cache = None
+        self._fits_cache: OrderedDict = OrderedDict()  # filename -> (image_data, header), LRU order
+        self._FITS_CACHE_SIZE = max(3, int(getattr(params.P, "step4_fits_cache_size", 6)))
 
         # Zoom/pan state
         self.xlim_original = None
@@ -1761,6 +1875,7 @@ class SourceDetectionWindow(StepWindowBase):
 
         # Load filter sigma map from parameters
         self.load_filter_sigma_map()
+        self.params.P.detect_mode = _get_detect_mode_from_params(self.params.P)
 
         # Restore state
         self.restore_state()
@@ -1776,7 +1891,7 @@ class SourceDetectionWindow(StepWindowBase):
                 filt = key.replace('detect_sigma_', '')
                 try:
                     self.filter_sigma_map[filt] = float(val)
-                except:
+                except Exception:
                     pass
 
         # Also check legacy uppercase patterns
@@ -1786,6 +1901,172 @@ class SourceDetectionWindow(StepWindowBase):
             self.filter_sigma_map['r'] = float(P.detect_sigma_r)
         if hasattr(P, 'detect_sigma_i') and P.detect_sigma_i:
             self.filter_sigma_map['i'] = float(P.detect_sigma_i)
+
+    # === Detection Mode Preset System ===
+
+    def _selected_detect_mode(self) -> str:
+        combo = getattr(self, "param_detect_mode", None)
+        if combo is None:
+            return _get_detect_mode_from_params(self.params.P)
+        idx = combo.currentIndex()
+        data = combo.itemData(idx)
+        return _normalize_detect_mode(data if data not in (None, "") else combo.currentText())
+
+    def _apply_detect_mode_preset_to_dialog(self, mode: str) -> bool:
+        mode_key = _normalize_detect_mode(mode)
+        if mode_key == "custom":
+            return False
+        preset = _get_detect_mode_preset(mode_key)
+        if hasattr(self, "param_detect_sigma"):
+            self.param_detect_sigma.setValue(float(preset["detect_sigma"]))
+        if hasattr(self, "param_minarea"):
+            self.param_minarea.setValue(int(preset["minarea_pix"]))
+        if hasattr(self, "param_deblend"):
+            self.param_deblend.setChecked(bool(preset["deblend_enable"]))
+        if hasattr(self, "param_deblend_nthresh"):
+            self.param_deblend_nthresh.setValue(int(preset["deblend_nthresh"]))
+        if hasattr(self, "param_deblend_cont"):
+            self.param_deblend_cont.setValue(float(preset["deblend_cont"]))
+        if hasattr(self, "param_deblend_max_labels"):
+            self.param_deblend_max_labels.setValue(int(preset["deblend_max_labels"]))
+        if hasattr(self, "param_deblend_label_hard_max"):
+            self.param_deblend_label_hard_max.setValue(int(preset["deblend_label_hard_max"]))
+        if hasattr(self, "param_dao_enable"):
+            self.param_dao_enable.setChecked(bool(preset["dao_refine_enable"]))
+        if hasattr(self, "param_peak_enable"):
+            self.param_peak_enable.setChecked(bool(preset["peak_pass_enable"]))
+        if hasattr(self, "param_peak_nsigma"):
+            self.param_peak_nsigma.setValue(float(preset["peak_nsigma"]))
+        if hasattr(self, "param_peak_max_add"):
+            self.param_peak_max_add.setValue(int(preset["peak_max_add"]))
+        return True
+
+    def _update_detect_mode_ui_state(self):
+        mode_key = self._selected_detect_mode()
+        if hasattr(self, "param_detect_mode_apply"):
+            self.param_detect_mode_apply.setEnabled(mode_key != "custom")
+
+    def _on_apply_detect_mode_clicked(self):
+        mode_key = self._selected_detect_mode()
+        self._apply_detect_mode_preset_to_dialog(mode_key)
+        self._update_detect_mode_ui_state()
+
+    # === Detection Cache Validation ===
+
+    def _resolve_source_path_for_file(self, filename: str) -> Optional[Path]:
+        if self.use_cropped:
+            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+            cand = cropped_dir / filename
+            if cand.exists():
+                return cand
+            legacy_cropped = self.params.P.result_dir / "cropped"
+            cand = legacy_cropped / filename
+            if cand.exists():
+                return cand
+        try:
+            cand = Path(self.params.get_file_path(filename))
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+        return None
+
+    def _source_signature_for_file(self, filename: str) -> Optional[dict]:
+        src_path = self._resolve_source_path_for_file(filename)
+        if src_path is None or not src_path.exists():
+            return None
+        try:
+            st = src_path.stat()
+        except Exception:
+            return None
+        return {
+            "source_path": norm_path_key(src_path),
+            "source_use_cropped": bool(self.use_cropped),
+            "source_size": int(st.st_size),
+            "source_mtime_ns": int(st.st_mtime_ns),
+        }
+
+    def _is_detection_cache_compatible(self, filename: str, payload: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        sig = self._source_signature_for_file(filename)
+        if sig is None:
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            # v2: minimum supported schema (no det_uid — fallback allowed)
+            return False
+        # v3 adds det_uid column; v2 caches are still read but det_uid derived from row index
+        if bool(payload.get("source_use_cropped", None)) != bool(sig["source_use_cropped"]):
+            return False
+        if norm_path_key(payload.get("source_path")) != sig["source_path"]:
+            return False
+        try:
+            if int(payload.get("source_mtime_ns")) != int(sig["source_mtime_ns"]):
+                # Step5+ can update FITS headers in place, changing mtime only.
+                # For detection cache reuse, accept when path/crop/size still match.
+                try:
+                    saved_size = int(payload.get("source_size"))
+                    curr_size = int(sig["source_size"])
+                except Exception:
+                    return False
+                if saved_size <= 0 or curr_size <= 0:
+                    return False
+                if saved_size != curr_size:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def _pick_detection_cache(self, filename: str, previous: bool = False):
+        cache_dir = self.params.P.cache_dir
+        step4_out = step4_dir(self.params.P.result_dir)
+        if previous:
+            prefix = "detect_prev_"
+            peak_prefix = "detect_prev_peak_"
+            candidates = [cache_dir / f"{prefix}{filename}.json"]
+        else:
+            prefix = "detect_"
+            peak_prefix = "detect_peak_"
+            candidates = [cache_dir / f"{prefix}{filename}.json", step4_out / f"{prefix}{filename}.json"]
+            candidates = [p for p in candidates if p.exists()]
+            candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for meta_path in candidates:
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._is_detection_cache_compatible(filename, payload, meta_path):
+                continue
+            base_dir = meta_path.parent
+            pos_path = base_dir / f"{prefix}{filename}.csv"
+            peak_path = base_dir / f"{peak_prefix}{filename}.csv"
+            return payload, pos_path, peak_path, meta_path
+        return None, None, None, None
+
+    # === FITS Cache ===
+
+    def _load_fits_cached(self, filename: str):
+        if filename in self._fits_cache:
+            self._fits_cache.move_to_end(filename)
+            return self._fits_cache[filename]
+
+        file_path = self._resolve_fits_path(filename, self.use_cropped)
+        if file_path is None:
+            raise FileNotFoundError(f"FITS not found: {filename}")
+        with fits.open(file_path, memmap=False) as hdul:
+            data = np.asarray(hdul[0].data, dtype=np.float32)
+            header = hdul[0].header.copy()
+
+        self._fits_cache[filename] = (data, header)
+        while len(self._fits_cache) > self._FITS_CACHE_SIZE:
+            self._fits_cache.popitem(last=False)
+        return self._fits_cache[filename]
 
     def scan_filters_from_files(self):
         """Scan FITS files to detect which filters are actually present"""
@@ -1810,7 +2091,7 @@ class SourceDetectionWindow(StepWindowBase):
                     filt = hdul[0].header.get('FILTER', '').strip()
                     if filt:
                         filters_found.add(filt)
-            except:
+            except Exception:
                 pass
 
         return sorted(filters_found)
@@ -2075,6 +2356,7 @@ class SourceDetectionWindow(StepWindowBase):
         self.file_list = list(files)
         self.file_combo.clear()
         self.file_combo.addItems(files)
+        self._fits_cache.clear()
         self.load_cached_results()
         self.load_previous_cached_results()
 
@@ -2086,7 +2368,7 @@ class SourceDetectionWindow(StepWindowBase):
         idx = self.file_combo.findText(filename)
         if idx >= 0:
             self.file_combo.setCurrentIndex(idx)
-            self.load_and_display()
+            self.load_and_display(quick_switch=True)
         if hasattr(self, "tabs"):
             self.tabs.setCurrentIndex(0)
 
@@ -2098,29 +2380,22 @@ class SourceDetectionWindow(StepWindowBase):
             return
 
         results = {}
+        skipped_incompatible = 0
         for filename in self.file_list:
-            cache_file = cache_dir / f"detect_{filename}.json"
-            if not cache_file.exists():
-                alt = step4_out / f"detect_{filename}.json"
-                if alt.exists():
-                    cache_file = alt
-            pos_file = cache_dir / f"detect_{filename}.csv"
-            if not pos_file.exists():
-                alt = step4_out / f"detect_{filename}.csv"
-                if alt.exists():
-                    pos_file = alt
-            peak_file = cache_dir / f"detect_peak_{filename}.csv"
-            if not peak_file.exists():
-                alt = step4_out / f"detect_peak_{filename}.csv"
-                if alt.exists():
-                    peak_file = alt
-            if not cache_file.exists():
+            data, pos_file, peak_file, cache_file = self._pick_detection_cache(filename, previous=False)
+            if data is None:
+                # meta exists but all incompatible/legacy -> count for log
+                maybe_meta = [
+                    cache_dir / f"detect_{filename}.json",
+                    step4_out / f"detect_{filename}.json",
+                ]
+                if any(p.exists() for p in maybe_meta):
+                    skipped_incompatible += 1
                 continue
             try:
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
                 positions = []
                 peak_positions = []
-                if pos_file.exists():
+                if pos_file is not None and pos_file.exists():
                     try:
                         df_pos = pd.read_csv(pos_file)
                         if 'x' in df_pos.columns and 'y' in df_pos.columns:
@@ -2133,7 +2408,7 @@ class SourceDetectionWindow(StepWindowBase):
                                 positions = [(row[0], row[1]) for row in pos_data]
                     except Exception:
                         positions = []
-                if peak_file.exists():
+                if peak_file is not None and peak_file.exists():
                     try:
                         peak_positions = np.loadtxt(peak_file, delimiter=',', skiprows=1).tolist()
                         if peak_positions and isinstance(peak_positions[0], float):
@@ -2164,8 +2439,12 @@ class SourceDetectionWindow(StepWindowBase):
             self.update_summary_from_results()
             self.btn_undo.setEnabled(self.previous_detection_results is not None)
             self.log(f"Loaded cached results: {len(results)} files")
+            if skipped_incompatible > 0:
+                self.log(f"Skipped incompatible detection cache: {skipped_incompatible} files")
             self.update_navigation_buttons()
             self._refresh_qc_panel()
+        elif skipped_incompatible > 0:
+            self.log(f"Ignored legacy/incompatible detection cache: {skipped_incompatible} files")
 
     def load_previous_cached_results(self):
         """Load previous detection results for undo"""
@@ -2174,17 +2453,17 @@ class SourceDetectionWindow(StepWindowBase):
             return
 
         results = {}
+        skipped_incompatible = 0
         for filename in self.file_list:
-            cache_file = cache_dir / f"detect_prev_{filename}.json"
-            pos_file = cache_dir / f"detect_prev_{filename}.csv"
-            peak_file = cache_dir / f"detect_prev_peak_{filename}.csv"
-            if not cache_file.exists():
+            data, pos_file, peak_file, cache_file = self._pick_detection_cache(filename, previous=True)
+            if data is None:
+                if (cache_dir / f"detect_prev_{filename}.json").exists():
+                    skipped_incompatible += 1
                 continue
             try:
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
                 positions = []
                 peak_positions = []
-                if pos_file.exists():
+                if pos_file is not None and pos_file.exists():
                     try:
                         df_pos = pd.read_csv(pos_file)
                         if 'x' in df_pos.columns and 'y' in df_pos.columns:
@@ -2197,7 +2476,7 @@ class SourceDetectionWindow(StepWindowBase):
                                 positions = [(row[0], row[1]) for row in pos_data]
                     except Exception:
                         positions = []
-                if peak_file.exists():
+                if peak_file is not None and peak_file.exists():
                     try:
                         peak_positions = np.loadtxt(peak_file, delimiter=',', skiprows=1).tolist()
                         if peak_positions and isinstance(peak_positions[0], float):
@@ -2226,6 +2505,8 @@ class SourceDetectionWindow(StepWindowBase):
             self.previous_detection_results = results
             self.btn_undo.setEnabled(True)
             self.log(f"Loaded previous cached results: {len(results)} files")
+        elif skipped_incompatible > 0:
+            self.log(f"Ignored incompatible previous cache: {skipped_incompatible} files")
 
     def backup_current_cache(self):
         """Backup current cache to previous cache for undo"""
@@ -2348,30 +2629,48 @@ class SourceDetectionWindow(StepWindowBase):
         """Handle file selection change"""
         pass
 
-    def load_and_display(self):
+    def _resolve_fits_path(self, fname: str, use_cropped: bool) -> Optional[Path]:
+        """Resolve display FITS path for Step4 viewer."""
+        if use_cropped:
+            cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+            cand = cropped_dir / fname
+            if cand.exists():
+                return cand
+            legacy = self.params.P.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        try:
+            cand = Path(self.params.get_file_path(fname))
+            if cand.exists():
+                return cand
+        except Exception:
+            pass
+        cand = self.params.P.data_dir / fname
+        if cand.exists():
+            return cand
+        return None
+
+    def load_and_display(self, quick_switch=False):
         """Load and display selected image"""
         filename = self.file_combo.currentText()
         if not filename:
             return
 
         try:
-            if self.use_cropped:
-                file_path = step2_cropped_dir(self.params.P.result_dir) / filename
-            else:
-                file_path = self.params.get_file_path(filename)
-
-            with fits.open(file_path) as hdul:
-                self.image_data = hdul[0].data.astype(float)
-                self.header = hdul[0].header
+            new_data, new_header = self._load_fits_cached(filename)
+            shape_changed = (self.image_data is None or new_data.shape != self.image_data.shape)
+            self.image_data = new_data
+            self.header = new_header
 
             self.current_filename = filename
-            self._normalized_cache = None
-            self._imshow_obj = None
-            self.xlim_original = None
-            self.ylim_original = None
+            if (not quick_switch) or shape_changed:
+                self._normalized_cache = None
+                self._imshow_obj = None
+                self.xlim_original = None
+                self.ylim_original = None
 
             self.reset_stretch_plot_values()
-            self.display_image(full_redraw=True)
+            self.display_image(full_redraw=(self._imshow_obj is None))
             self.update_overlay()
 
         except Exception as e:
@@ -3024,6 +3323,7 @@ class SourceDetectionWindow(StepWindowBase):
         self.progress_label.setText(f"0/{len(pending_files)} | Starting...")
 
         # Start
+        self._detect_start_time = time.monotonic()
         self.log("Starting worker thread...")
         self.detection_worker.start()
         self.log("Worker thread started")
@@ -3044,7 +3344,15 @@ class SourceDetectionWindow(StepWindowBase):
     def on_progress(self, current, total, filename, active_workers):
         """Handle progress update"""
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{current}/{total} | Active: {active_workers} | {filename}")
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_detect_start_time"):
+            elapsed = time.monotonic() - self._detect_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.progress_label.setText(f"{current}/{total}{eta_str} | W:{active_workers} | {filename}")
 
     def on_worker_status(self, worker_id, filename, status, progress):
         """Update worker status panel"""
@@ -3075,6 +3383,10 @@ class SourceDetectionWindow(StepWindowBase):
     def on_file_done(self, filename, result):
         """Handle single file completion"""
         self.detection_results[filename] = result
+
+        # Periodic state save every 20 frames (protects against overnight crash)
+        if len(self.detection_results) % 20 == 0:
+            self.save_state()
 
         # Add to table - with detection method in FWHM column
         row = self.results_table.rowCount()
@@ -3153,10 +3465,16 @@ class SourceDetectionWindow(StepWindowBase):
             self.save_state()
         else:
             self.summary_label.setText("Detection stopped or failed")
+            if self.detection_results:
+                self.save_state()
 
         if self.detection_results:
             self.update_navigation_buttons()
             self._refresh_qc_panel()
+            # Auto-switch to QC tab after detection completes
+            if not (summary and summary.get('stopped')):
+                if hasattr(self, "tabs"):
+                    self.tabs.setCurrentIndex(1)
 
         if not summary or not summary.get('stopped'):
             self.progress_label.setText("Done")
@@ -3289,6 +3607,26 @@ class SourceDetectionWindow(StepWindowBase):
         layout.addWidget(info)
 
         form = QFormLayout()
+
+        # Detection mode presets
+        self.param_detect_mode = QComboBox()
+        self.param_detect_mode.addItem("Normal (기본)", "normal")
+        self.param_detect_mode.addItem("Crowded (혼잡장)", "crowded")
+        self.param_detect_mode.addItem("Faint (희미한 장)", "faint")
+        self.param_detect_mode.addItem("Custom (수동)", "custom")
+        current_mode = _get_detect_mode_from_params(self.params.P)
+        for i in range(self.param_detect_mode.count()):
+            if _normalize_detect_mode(self.param_detect_mode.itemData(i)) == current_mode:
+                self.param_detect_mode.setCurrentIndex(i)
+                break
+        mode_row = QWidget()
+        mode_row_layout = QHBoxLayout(mode_row)
+        mode_row_layout.setContentsMargins(0, 0, 0, 0)
+        mode_row_layout.setSpacing(8)
+        mode_row_layout.addWidget(self.param_detect_mode, 1)
+        self.param_detect_mode_apply = QPushButton("Apply Preset")
+        mode_row_layout.addWidget(self.param_detect_mode_apply)
+        form.addRow("Detection Mode:", mode_row)
 
         # Detection engine
         self.param_engine = QComboBox()
@@ -3456,12 +3794,41 @@ class SourceDetectionWindow(StepWindowBase):
 
         layout.addWidget(dao_group)
 
-        # Peak assist parameters
-        peak_group = QGroupBox("Peak Assist (segm supplement)")
-        peak_layout = QFormLayout(peak_group)
+        # Peak assist parameters (collapsible)
+        peak_group = QGroupBox("▶ Peak Assist (segm supplement)")
+        peak_group.setCheckable(False)
+        peak_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        peak_group_vbox = QVBoxLayout(peak_group)
+        peak_group_vbox.setContentsMargins(4, 4, 4, 4)
+        peak_group_vbox.setSpacing(2)
+
+        # Toggle button inside the group title area
+        peak_toggle_btn = QPushButton("▶ 펼치기")
+        peak_toggle_btn.setCheckable(True)
+        peak_toggle_btn.setChecked(False)
+        peak_toggle_btn.setStyleSheet(
+            "QPushButton { border: none; text-align: left; color: #555; font-size: 8pt; padding: 0px; }"
+            "QPushButton:checked { color: #1565C0; }"
+        )
+        peak_group_vbox.addWidget(peak_toggle_btn)
+
+        # Container that gets hidden/shown
+        peak_container = QWidget()
+        peak_layout = QFormLayout(peak_container)
+        peak_layout.setContentsMargins(0, 0, 0, 0)
+        peak_layout.setSpacing(4)
+        peak_container.setVisible(False)
+        peak_group_vbox.addWidget(peak_container)
+
+        peak_toggle_btn.toggled.connect(
+            lambda checked: (
+                peak_toggle_btn.setText("▼ 접기" if checked else "▶ 펼치기"),
+                peak_container.setVisible(checked),
+            )
+        )
 
         self.param_peak_enable = QCheckBox("Enable")
-        self.param_peak_enable.setChecked(getattr(self.params.P, 'peak_pass_enable', True))
+        self.param_peak_enable.setChecked(getattr(self.params.P, 'peak_pass_enable', False))
         peak_layout.addRow("Peak assist:", self.param_peak_enable)
 
         self.param_peak_nsigma = QDoubleSpinBox()
@@ -3504,6 +3871,11 @@ class SourceDetectionWindow(StepWindowBase):
 
         layout.addWidget(peak_group)
 
+        # Connect detect mode signals
+        self.param_detect_mode.currentIndexChanged.connect(self._update_detect_mode_ui_state)
+        self.param_detect_mode_apply.clicked.connect(self._on_apply_detect_mode_clicked)
+        self._update_detect_mode_ui_state()
+
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: self.save_parameters(dialog))
@@ -3535,6 +3907,10 @@ class SourceDetectionWindow(StepWindowBase):
 
     def save_parameters(self, dialog):
         """Save detection parameters"""
+        selected_mode = self._selected_detect_mode()
+        if selected_mode != "custom":
+            self._apply_detect_mode_preset_to_dialog(selected_mode)
+        self.params.P.detect_mode = selected_mode
         self.params.P.detect_engine = self.param_engine.currentText().strip().lower()
         self.params.P.detect_sigma = self.param_detect_sigma.value()
         self.params.P.minarea_pix = self.param_minarea.value()
@@ -3584,6 +3960,7 @@ class SourceDetectionWindow(StepWindowBase):
             "n_files": len(self.detection_results),
             "use_cropped": self.use_cropped,
             "filter_sigma_map": self.filter_sigma_map,
+            "detect_mode": _get_detect_mode_from_params(self.params.P),
             "detect_engine": getattr(self.params.P, "detect_engine", "dao"),
             "detect_sigma": self.params.P.detect_sigma,
             "minarea_pix": self.params.P.minarea_pix,
@@ -3622,6 +3999,7 @@ class SourceDetectionWindow(StepWindowBase):
             if 'filter_sigma_map' in state_data:
                 self.filter_sigma_map = state_data['filter_sigma_map']
             for key in [
+                "detect_mode",
                 "detect_engine",
                 "detect_sigma",
                 "minarea_pix",

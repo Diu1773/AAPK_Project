@@ -220,7 +220,7 @@ class MainWindowWorkflow(QMainWindow):
             "Reference Build",
             "Star ID Matching",
             "Target/Comparison Selection",
-            "Forced Photometry",
+            "Aperture Photometry",
             "Light Curve Builder",
             "Detrend & Night Merge",
             "Period Analysis",
@@ -429,6 +429,14 @@ class MainWindowWorkflow(QMainWindow):
         action_airmass = QAction("Airmass Header Debug", self)
         action_airmass.triggered.connect(self.open_airmass_debug_tool)
         tools_menu.addAction(action_airmass)
+
+        tools_menu.addSeparator()
+
+        # Multi-Night Light Curve Merger
+        action_merger = QAction("Multi-Night Light Curve Merger", self)
+        action_merger.setShortcut("Ctrl+M")
+        action_merger.triggered.connect(self.open_multi_night_merger)
+        tools_menu.addAction(action_merger)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -855,7 +863,7 @@ class MainWindowWorkflow(QMainWindow):
             QMessageBox.warning(
                 self, "No Data",
                 "Photometry data not found.\n"
-                "Please complete the Forced Photometry step first."
+                "Please complete the Aperture Photometry step first."
             )
             return
 
@@ -926,6 +934,22 @@ class MainWindowWorkflow(QMainWindow):
         self.airmass_debug_window.raise_()
         self.airmass_debug_window.activateWindow()
         self.append_log("Opened Airmass Header Debug Tool")
+
+    def open_multi_night_merger(self):
+        """Open Multi-Night Light Curve Merger (hides main window)."""
+        from .workflow.multi_night_merger_window import MultiNightMergerWindow
+
+        self.merger_window = MultiNightMergerWindow(
+            self.params,
+            self.project_state,
+            main_window=self,
+        )
+        self.merger_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.hide()
+        self.merger_window.show()
+        self.merger_window.raise_()
+        self.merger_window.activateWindow()
+        self.append_log("Opened Multi-Night Light Curve Merger")
 
     def _update_parameter_file(self, updates: dict):
         """

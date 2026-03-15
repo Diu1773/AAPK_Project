@@ -35,7 +35,7 @@ def solve_global_ensemble(
     gauge: str = "meanZ0",
     per_filter: bool = True,
     robust: bool = True,
-    rms_clip_pct: float = 20.0,
+    rms_clip_pct: float = 10.0,
     rms_clip_threshold: float | None = None,
     frame_sigma: float = 3.0,
     interp_missing: bool = False,

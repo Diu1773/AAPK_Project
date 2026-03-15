@@ -393,3 +393,79 @@ def compute_airmass_from_header(
         "ra_deg": ra_deg,
         "dec_deg": dec_deg,
     }
+
+
+def compute_bjd_tdb(
+    jd_utc: float,
+    ra_deg: float,
+    dec_deg: float,
+    site_lat_deg: float,
+    site_lon_deg: float,
+    site_alt_m: float = 0.0,
+) -> float:
+    """Convert JD_UTC to BJD_TDB (Barycentric Julian Date in TDB scale).
+
+    Parameters
+    ----------
+    jd_utc : float
+        Julian Date in UTC scale (from DATE-OBS).
+    ra_deg, dec_deg : float
+        Target coordinates (ICRS, degrees).
+    site_lat_deg, site_lon_deg : float
+        Observatory geodetic coordinates (degrees).
+    site_alt_m : float
+        Observatory altitude above sea level (metres, default 0).
+
+    Returns
+    -------
+    float
+        BJD_TDB, or NaN if conversion fails.
+    """
+    try:
+        if not (np.isfinite(jd_utc) and np.isfinite(ra_deg) and np.isfinite(dec_deg)):
+            return np.nan
+        location = EarthLocation(
+            lat=float(site_lat_deg) * u.deg,
+            lon=float(site_lon_deg) * u.deg,
+            height=float(site_alt_m) * u.m,
+        )
+        t = Time(float(jd_utc), format="jd", scale="utc", location=location)
+        sky = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+        ltt = t.light_travel_time(sky, "barycentric")
+        return float((t.tdb + ltt).jd)
+    except Exception:
+        return np.nan
+
+
+def compute_bjd_tdb_array(
+    jd_utc_arr: np.ndarray,
+    ra_deg: float,
+    dec_deg: float,
+    site_lat_deg: float,
+    site_lon_deg: float,
+    site_alt_m: float = 0.0,
+) -> np.ndarray:
+    """Vectorised version of compute_bjd_tdb for an array of JD_UTC values.
+
+    Returns a float64 array; invalid/missing entries become NaN.
+    """
+    jd_arr = np.asarray(jd_utc_arr, dtype=float)
+    out = np.full_like(jd_arr, np.nan)
+    valid = np.isfinite(jd_arr)
+    if not np.any(valid):
+        return out
+    if not (np.isfinite(ra_deg) and np.isfinite(dec_deg)):
+        return out
+    try:
+        location = EarthLocation(
+            lat=float(site_lat_deg) * u.deg,
+            lon=float(site_lon_deg) * u.deg,
+            height=float(site_alt_m) * u.m,
+        )
+        t = Time(jd_arr[valid], format="jd", scale="utc", location=location)
+        sky = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+        ltt = t.light_travel_time(sky, "barycentric")
+        out[valid] = (t.tdb + ltt).jd
+    except Exception:
+        pass
+    return out

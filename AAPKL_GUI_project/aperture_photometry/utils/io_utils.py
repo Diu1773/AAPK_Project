@@ -5,6 +5,7 @@ Extracted from AAPKI_GUI.ipynb Cell 0
 
 from __future__ import annotations
 from pathlib import Path
+import json
 import time
 from collections import deque
 from typing import Union
@@ -49,6 +50,15 @@ def coerce_int64_source_id(series: pd.Series) -> pd.Series:
     return pd.Series(parsed, index=series.index, dtype="Int64")
 
 
+# Alias for compatibility with AAPKC code that uses parse_int64_series
+def parse_int64_series(series: pd.Series) -> pd.Series:
+    """Convert a series to pandas nullable Int64 without float precision loss.
+
+    Alias for coerce_int64_source_id for cross-project compatibility.
+    """
+    return coerce_int64_source_id(series)
+
+
 def read_csv_int64_source_id(path: Union[str, Path], sep: str = ",", **kwargs) -> pd.DataFrame:
     """Read a CSV/TSV file preserving 19-digit Gaia source_id precision.
 
@@ -60,6 +70,35 @@ def read_csv_int64_source_id(path: Union[str, Path], sep: str = ",", **kwargs) -
     if "source_id" in df.columns:
         df["source_id"] = coerce_int64_source_id(df["source_id"])
     return df
+
+
+def load_night_assignments(result_dir: Path) -> dict[str, int]:
+    """Load filename → night_id from step1/night_assignments.json."""
+    from .step_paths import step1_dir
+    na_path = step1_dir(result_dir) / "night_assignments.json"
+    if not na_path.exists():
+        na_path = result_dir / "night_assignments.json"
+    if not na_path.exists():
+        return {}
+    try:
+        data = json.loads(na_path.read_text(encoding="utf-8"))
+        return {k: int(v) for k, v in data.get("night_assignments", {}).items()}
+    except Exception:
+        return {}
+
+
+def load_headers_table(result_dir: Path) -> pd.DataFrame:
+    """Read headers.csv from step1 dir (fallback: result_dir)."""
+    from .step_paths import step1_dir
+    headers_path = step1_dir(result_dir) / "headers.csv"
+    if not headers_path.exists():
+        headers_path = result_dir / "headers.csv"
+    if not headers_path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(headers_path)
+    except Exception:
+        return pd.DataFrame()
 
 
 class TailLogger:

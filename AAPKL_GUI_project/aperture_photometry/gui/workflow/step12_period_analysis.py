@@ -47,7 +47,6 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import step8_dir, step10_dir, step11_dir, step12_period_dir
-from ...utils.common_helpers import safe_float as _safe_float
 
 
 class PeriodAnalysisWorker(QThread):
@@ -1203,6 +1202,10 @@ class PeriodAnalysisWindow(StepWindowBase):
             "min_period": self.min_period_spin.value(),
             "max_period": self.max_period_spin.value(),
             "samples_per_peak": self.samples_spin.value(),
+            "pdm_bins": self.pdm_bins_spin.value(),
+            "use_ls": self.chk_ls.isChecked(),
+            "use_pdm": self.chk_pdm.isChecked(),
+            "use_bls": self.chk_bls.isChecked(),
         }
         self.project_state.store_step_data("period_analysis", state)
 
@@ -1216,3 +1219,11 @@ class PeriodAnalysisWindow(StepWindowBase):
             self.max_period_spin.setValue(float(state["max_period"]))
         if "samples_per_peak" in state:
             self.samples_spin.setValue(int(state["samples_per_peak"]))
+        if "pdm_bins" in state:
+            self.pdm_bins_spin.setValue(int(state["pdm_bins"]))
+        if "use_ls" in state:
+            self.chk_ls.setChecked(bool(state["use_ls"]))
+        if "use_pdm" in state:
+            self.chk_pdm.setChecked(bool(state["use_pdm"]))
+        if "use_bls" in state:
+            self.chk_bls.setChecked(bool(state["use_bls"]))

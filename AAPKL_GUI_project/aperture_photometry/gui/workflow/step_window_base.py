@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QMessageBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QFont
 
 
@@ -225,13 +225,55 @@ class StepWindowBase(QMainWindow):
         """
         return False
 
-    def persist_params(self):
+    def persist_params(self) -> bool:
         """Persist current parameters to TOML, if supported."""
         if hasattr(self.params, "save_toml"):
             try:
-                self.params.save_toml()
+                return bool(self.params.save_toml())
+            except Exception:
+                return False
+        return False
+
+    def _iter_qthreads(self):
+        """Yield unique QThread instances attached to this window."""
+        seen = set()
+        for name, value in vars(self).items():
+            if not isinstance(value, QThread):
+                continue
+            ident = id(value)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            yield name, value
+
+    def _cleanup_running_threads(self, timeout_ms: int = 5000) -> bool:
+        """Request stop for running worker threads and release finished ones."""
+        all_stopped = True
+
+        for name, thread in self._iter_qthreads():
+            if thread.isRunning():
+                stop_fn = getattr(thread, "stop", None)
+                if callable(stop_fn):
+                    try:
+                        stop_fn()
+                    except Exception:
+                        pass
+                thread.quit()
+                if not thread.wait(int(timeout_ms)):
+                    all_stopped = False
+                    continue
+
+            try:
+                thread.deleteLater()
             except Exception:
                 pass
+
+            try:
+                setattr(self, name, None)
+            except Exception:
+                pass
+
+        return all_stopped
 
     def mark_complete(self):
         """Mark this step as complete"""
@@ -298,6 +340,15 @@ class StepWindowBase(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close"""
+        if not self._cleanup_running_threads(timeout_ms=5000):
+            QMessageBox.warning(
+                self,
+                "Background Task Running",
+                "A background worker is still stopping. Please wait a few seconds and close again."
+            )
+            event.ignore()
+            return
+
         # Auto-save state when closing
         if self.validate_step():
             self.save_state()

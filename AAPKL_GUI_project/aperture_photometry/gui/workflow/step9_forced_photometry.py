@@ -1,5 +1,5 @@
 """
-Step 9: Forced Photometry (per-frame ID-matched XY)
+Step 9: Aperture Photometry (per-frame ID-matched XY positions)
 Ported from AAPKI_GUI.ipynb Cell 12 (GUI adaptation).
 
 Features:
@@ -52,7 +52,7 @@ from ...utils.step_paths import (
 from ...utils.constants import get_parallel_workers
 from ...utils.header_cache import HeaderCache
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key
-from ...utils.qc_utils import filter_files_by_qc
+from ...utils.qc_utils import filter_files_by_qc, filter_files_by_wcs_qc
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.photometry_utils import (
     circle_mask as _circle_mask,
@@ -162,16 +162,17 @@ def _get_exptime_fallback(fits_path: Path, default=1.0, header_cache: HeaderCach
 
 
 class ForcedPhotometryWorker(QThread):
-    """Worker thread for forced photometry with parallel processing."""
+    """Worker thread for aperture photometry with parallel processing."""
     progress = pyqtSignal(int, int, str)
     frame_done = pyqtSignal(str, dict)  # filename, result_dict
     finished = pyqtSignal(dict)
     error = pyqtSignal(str, str)
     log = pyqtSignal(str)
 
-    def __init__(self, file_list, params, data_dir, result_dir, cache_dir, use_cropped=False):
+    def __init__(self, file_list, params, data_dir, result_dir, cache_dir, use_cropped=False, night_assignments=None):
         super().__init__()
         self.file_list = list(file_list)
+        self.night_assignments: dict = dict(night_assignments) if night_assignments else {}
         self.params = params
         self.data_dir = Path(data_dir)
         self.result_dir = Path(result_dir)
@@ -339,36 +340,11 @@ class ForcedPhotometryWorker(QThread):
                 if legacy_apcorr_cand.exists():
                     apcorr_cand_path = legacy_apcorr_cand
 
-            need_aperture_build = (not ap_path.exists())
-            need_apcorr_build = (
-                ap_mode in ("apcorr", "auto")
-                and ((not apcorr_path.exists()) or (not apcorr_cand_path.exists()))
-            )
-
-            if need_aperture_build or need_apcorr_build:
-                reason = []
-                if need_aperture_build:
-                    reason.append("aperture_by_frame.csv missing")
-                if need_apcorr_build:
-                    reason.append("apcorr summary/candidates missing")
-                self._log(
-                    f"[INFO] {' + '.join(reason)}. Computing apertures/apcorr for {len(self.file_list)} frames..."
-                )
-                self._log("[INFO] This may take a while. Please wait...")
-                self.progress.emit(0, len(self.file_list), "Computing apertures...")
-                ap_worker = ApertureWorker(
-                    self.file_list,
-                    self.params,
-                    self.data_dir,
-                    self.result_dir,
-                    self.cache_dir,
-                    self.use_cropped,
-                    output_dir=output_dir,  # Save directly to step9 output dir
-                )
-                ap_worker.run()
-                self._log("[INFO] Aperture computation complete.")
-            if not (output_dir / "aperture_by_frame.csv").exists() and not ap_path.exists():
-                raise RuntimeError("aperture_by_frame.csv not found (auto-build failed)")
+            if not ap_path.exists():
+                self._log("[WARN] aperture_by_frame.csv not found. Run Apcorr first.")
+                self.error.emit("MISSING_APCORR", "aperture_by_frame.csv not found. Run Apcorr first.")
+                self.finished.emit({})
+                return
 
             # Re-resolve to prefer newly generated Step9 outputs.
             ap_path = output_dir / "aperture_by_frame.csv" if (output_dir / "aperture_by_frame.csv").exists() else ap_path
@@ -844,6 +820,7 @@ class ForcedPhotometryWorker(QThread):
                                 self._log(f"[ERROR] {fname}: {dbg_row.get('error')}")
 
                         if idx_row:
+                            idx_row.setdefault("night_id", self.night_assignments.get(fname, 0))
                             index_rows.append(idx_row)
                         if dbg_row:
                             debug_frames.append(dbg_row)
@@ -872,7 +849,7 @@ class ForcedPhotometryWorker(QThread):
                 pd.DataFrame(_fail_rows_all).to_csv(fail_csv, sep="\t", index=False, encoding="utf-8-sig")
 
             idx_path = output_dir / "photometry_index.csv"
-            index_cols = ["file", "filter", "n", "n_goodmag", "n_fail", "targets", "path"]
+            index_cols = ["file", "filter", "night_id", "n", "n_goodmag", "n_fail", "targets", "path"]
             pd.DataFrame(index_rows, columns=index_cols).to_csv(idx_path, index=False)
 
             try:
@@ -900,11 +877,12 @@ class ForcedPhotometryWorker(QThread):
 
 
 class ForcedPhotometryWindow(StepWindowBase):
-    """Step 9: Forced Photometry"""
+    """Step 9: Aperture Photometry"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
         self.worker = None
+        self.apcorr_worker = None
         self.file_list = []
         self.use_cropped = False
         self.log_window = None
@@ -913,7 +891,7 @@ class ForcedPhotometryWindow(StepWindowBase):
 
         super().__init__(
             step_index=8,
-            step_name="Forced Photometry",
+            step_name="Aperture Photometry",
             params=params,
             project_state=project_state,
             main_window=main_window
@@ -923,11 +901,11 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.restore_state()
 
     def setup_step_ui(self):
-        # Tab widget: Photometry | Aperture Overlay
+        # Tab widget: Apcorr QC | Photometry | Aperture Overlay
         self.step_tabs = QTabWidget()
         self.content_layout.addWidget(self.step_tabs, stretch=1)
 
-        # --- Tab 1: Photometry ---
+        # --- Tab 1: Photometry (added after Apcorr QC below) ---
         phot_tab = QWidget()
         phot_layout = QVBoxLayout(phot_tab)
 
@@ -990,7 +968,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         table_layout.addWidget(self.frame_table)
         phot_layout.addWidget(table_group)
 
-        self.step_tabs.addTab(phot_tab, "Photometry")
+        # phot_tab is inserted via insertTab(1, ...) after Apcorr QC is built
 
         # --- Tab 2: Aperture Overlay (embedded) ---
         self._overlay_obj = ApertureOverlayWindow(
@@ -1009,17 +987,44 @@ class ForcedPhotometryWindow(StepWindowBase):
         apcorr_tab = QWidget()
         apcorr_layout = QVBoxLayout(apcorr_tab)
 
-        apcorr_head = QHBoxLayout()
-        self.apcorr_status_label = QLabel("Apcorr QC: not loaded")
-        apcorr_head.addWidget(self.apcorr_status_label)
-        apcorr_head.addStretch()
-        self.btn_apcorr_refresh = QPushButton("Refresh")
-        self.btn_apcorr_refresh.setStyleSheet(
-            "QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 6px 12px; }"
+        apcorr_note = QLabel(
+            "Growth curve analysis: run Apcorr first to find the optimal aperture per frame, "
+            "then run Photometry."
         )
+        apcorr_note.setStyleSheet("QLabel { background-color: #FFF8E1; padding: 8px; border-radius: 4px; }")
+        apcorr_note.setWordWrap(True)
+        apcorr_layout.addWidget(apcorr_note)
+
+        apcorr_ctrl = QHBoxLayout()
+        self.btn_apcorr_params = QPushButton("Parameters")
+        self.btn_apcorr_params.setStyleSheet("QPushButton { background-color: #795548; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_apcorr_params.clicked.connect(self.open_parameters_dialog)
+        apcorr_ctrl.addWidget(self.btn_apcorr_params)
+        apcorr_ctrl.addStretch()
+        self.btn_run_apcorr = QPushButton("Run Apcorr")
+        self.btn_run_apcorr.setStyleSheet("QPushButton { background-color: #2E7D32; color: white; font-weight: bold; padding: 8px 20px; }")
+        self.btn_run_apcorr.clicked.connect(self.run_apcorr)
+        apcorr_ctrl.addWidget(self.btn_run_apcorr)
+        self.btn_stop_apcorr = QPushButton("Stop")
+        self.btn_stop_apcorr.setStyleSheet("QPushButton { background-color: #c62828; color: white; font-weight: bold; padding: 8px 15px; }")
+        self.btn_stop_apcorr.clicked.connect(self.stop_apcorr)
+        self.btn_stop_apcorr.setEnabled(False)
+        apcorr_ctrl.addWidget(self.btn_stop_apcorr)
+        self.btn_apcorr_refresh = QPushButton("Refresh")
+        self.btn_apcorr_refresh.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 12px; }")
         self.btn_apcorr_refresh.clicked.connect(self.refresh_apcorr_qc)
-        apcorr_head.addWidget(self.btn_apcorr_refresh)
-        apcorr_layout.addLayout(apcorr_head)
+        apcorr_ctrl.addWidget(self.btn_apcorr_refresh)
+        apcorr_layout.addLayout(apcorr_ctrl)
+
+        apcorr_prog_row = QHBoxLayout()
+        self.apcorr_progress_bar = QProgressBar()
+        self.apcorr_progress_bar.setMinimum(0)
+        self.apcorr_progress_bar.setValue(0)
+        apcorr_prog_row.addWidget(self.apcorr_progress_bar)
+        self.apcorr_status_label = QLabel("Ready")
+        self.apcorr_status_label.setMinimumWidth(300)
+        apcorr_prog_row.addWidget(self.apcorr_status_label)
+        apcorr_layout.addLayout(apcorr_prog_row)
 
         self.apcorr_splitter = QSplitter(Qt.Horizontal)
 
@@ -1057,7 +1062,24 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_splitter.setStretchFactor(1, 2)
         apcorr_layout.addWidget(self.apcorr_splitter, stretch=1)
 
-        self.step_tabs.addTab(apcorr_tab, "Apcorr QC")
+        apcorr_sum_group = QGroupBox("Apcorr Summary")
+        apcorr_sum_layout = QVBoxLayout(apcorr_sum_group)
+        self.apcorr_sum_table = QTableWidget()
+        self.apcorr_sum_table.setColumnCount(8)
+        self.apcorr_sum_table.setHorizontalHeaderLabels(
+            ["Frame", "FWHM(px)", "r_small(px)", "r_large(px)", "Apcorr", "rel_scatter", "n_used", "apply"]
+        )
+        self.apcorr_sum_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 8):
+            self.apcorr_sum_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.apcorr_sum_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        apcorr_sum_layout.addWidget(self.apcorr_sum_table)
+        apcorr_layout.addWidget(apcorr_sum_group)
+
+        # Final tab order: Apcorr QC (0), Photometry (1), Aperture Overlay (2)
+        self.step_tabs.insertTab(0, apcorr_tab, "Apcorr QC")
+        self.step_tabs.insertTab(1, phot_tab, "Photometry")
+        self.step_tabs.setCurrentIndex(0)
 
         # --- Log window (shared, floating) ---
         self.log_window = QWidget(self, Qt.Window)
@@ -1150,6 +1172,11 @@ class ForcedPhotometryWindow(StepWindowBase):
                 self.log("[QC] frame_quality.csv not found; using all frames.")
             else:
                 self.log(f"[QC] frame_quality.csv ignored ({qc_info['reason']}); using all frames.")
+        files, wcs_info = filter_files_by_wcs_qc(Path(self.params.P.result_dir), files)
+        if wcs_info.get("applied"):
+            self.log(f"[WCS QC] {wcs_info['kept']}/{wcs_info['total']} frames passed WCS QC.")
+        elif wcs_info.get("path") is None:
+            self.log("[WCS QC] frame_wcs_qc.csv not found; using all frames.")
         self.file_list = list(files)
 
     def open_parameters_dialog(self):
@@ -1239,6 +1266,68 @@ class ForcedPhotometryWindow(StepWindowBase):
         QMessageBox.information(dialog, "Success", "Parameters saved!")
         dialog.accept()
 
+    # ------------------------------------------------------------------
+    # Apcorr run / stop
+    # ------------------------------------------------------------------
+
+    def run_apcorr(self):
+        self._restore_file_context()
+        self.populate_file_list()
+        if not self.file_list:
+            QMessageBox.warning(self, "Apcorr", "No files found.")
+            return
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            return
+        output_dir = step9_dir(Path(self.params.P.result_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = output_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = Path(self.params.P.data_dir)
+        self.apcorr_worker = ApertureWorker(
+            self.file_list,
+            self.params,
+            data_dir,
+            Path(self.params.P.result_dir),
+            cache_dir,
+            self.use_cropped,
+            output_dir=output_dir,
+        )
+        self.apcorr_worker.progress.connect(self._on_apcorr_progress)
+        self.apcorr_worker.finished.connect(self._on_apcorr_finished)
+        self.apcorr_worker.error.connect(self._on_apcorr_error)
+        self.btn_run_apcorr.setEnabled(False)
+        self.btn_stop_apcorr.setEnabled(True)
+        self.btn_run.setEnabled(False)
+        self.apcorr_progress_bar.setValue(0)
+        self.apcorr_progress_bar.setMaximum(len(self.file_list))
+        self.apcorr_status_label.setText("Running Apcorr...")
+        self.apcorr_worker.start()
+
+    def stop_apcorr(self):
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            self.apcorr_worker.stop()
+            self.apcorr_status_label.setText("Stopping...")
+
+    def _on_apcorr_progress(self, current: int, total: int, msg: str):
+        self.apcorr_progress_bar.setMaximum(max(total, 1))
+        self.apcorr_progress_bar.setValue(current)
+        self.apcorr_status_label.setText(msg)
+
+    def _on_apcorr_finished(self, result: dict):
+        self.btn_run_apcorr.setEnabled(True)
+        self.btn_stop_apcorr.setEnabled(False)
+        self.btn_run.setEnabled(True)
+        n = result.get("n_files", 0)
+        self.apcorr_status_label.setText(f"Apcorr complete: {n} frames")
+        self.refresh_apcorr_qc()
+
+    def _on_apcorr_error(self, kind: str, msg: str):
+        self.btn_run_apcorr.setEnabled(True)
+        self.btn_stop_apcorr.setEnabled(False)
+        self.btn_run.setEnabled(True)
+        self.apcorr_status_label.setText(f"Apcorr error: {msg[:80]}")
+        self.log(f"[APCORR ERROR] {kind}: {msg}")
+
     def run_photometry(self):
         self._restore_file_context()
         self.populate_file_list()
@@ -1260,13 +1349,15 @@ class ForcedPhotometryWindow(StepWindowBase):
         if hasattr(self, "frame_table"):
             self.frame_table.setRowCount(0)
 
+        night_assignments = getattr(self.file_manager, "night_assignments", {}) if self.file_manager else {}
         self.worker = ForcedPhotometryWorker(
             self.file_list,
             self.params,
             self.params.P.data_dir,
             self.params.P.result_dir,
             self.params.P.cache_dir,
-            self.use_cropped
+            self.use_cropped,
+            night_assignments=night_assignments,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.frame_done.connect(self.on_frame_done)
@@ -1519,6 +1610,34 @@ class ForcedPhotometryWindow(StepWindowBase):
             self.apcorr_ax.set_axis_off()
             self.apcorr_canvas.draw_idle()
 
+        # Populate summary table
+        self._refresh_apcorr_sum_table(df_sum)
+
+    def _refresh_apcorr_sum_table(self, df_sum: pd.DataFrame):
+        if not hasattr(self, "apcorr_sum_table"):
+            return
+        self.apcorr_sum_table.setRowCount(0)
+        if df_sum.empty:
+            return
+        for _, row in df_sum.iterrows():
+            r = self.apcorr_sum_table.rowCount()
+            self.apcorr_sum_table.insertRow(r)
+            def _f(v, fmt=".3f"):
+                try:
+                    fv = float(v)
+                    return f"{fv:{fmt}}" if np.isfinite(fv) else "—"
+                except Exception:
+                    return str(v) if v is not None else "—"
+            self.apcorr_sum_table.setItem(r, 0, QTableWidgetItem(str(row.get("file", ""))))
+            self.apcorr_sum_table.setItem(r, 1, QTableWidgetItem(_f(row.get("fwhm_med", row.get("fwhm_used", np.nan)), ".2f")))
+            self.apcorr_sum_table.setItem(r, 2, QTableWidgetItem(_f(row.get("r_small", row.get("r_ap", np.nan)), ".2f")))
+            self.apcorr_sum_table.setItem(r, 3, QTableWidgetItem(_f(row.get("r_large", np.nan), ".2f")))
+            self.apcorr_sum_table.setItem(r, 4, QTableWidgetItem(_f(row.get("apcorr", np.nan), ".4f")))
+            self.apcorr_sum_table.setItem(r, 5, QTableWidgetItem(_f(row.get("rel_scatter", row.get("rel_sc", np.nan)), ".4f")))
+            self.apcorr_sum_table.setItem(r, 6, QTableWidgetItem(str(int(row["n_used"])) if pd.notna(row.get("n_used")) else "—"))
+            apply_val = self._to_bool_value(row.get("apply", False))
+            self.apcorr_sum_table.setItem(r, 7, QTableWidgetItem("✓" if apply_val else "✗"))
+
     def _on_apcorr_file_changed(self, filename: str):
         if not filename:
             return
@@ -1607,6 +1726,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_canvas.draw_idle()
 
     def closeEvent(self, event):
+        if self.apcorr_worker and self.apcorr_worker.isRunning():
+            self.stop_apcorr()
+            self.apcorr_worker.wait(3000)
         if self.worker and self.worker.isRunning():
             self.stop_photometry()
             self.worker.wait(5000)

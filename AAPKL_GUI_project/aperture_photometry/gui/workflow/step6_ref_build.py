@@ -40,6 +40,7 @@ from ...utils.step_paths import (
     step2_cropped_dir,
     step4_dir,
     crop_is_active,
+    crop_rect_path,
     legacy_step5_refbuild_dir,
     legacy_step7_refbuild_dir,
     legacy_step7_wcs_dir,
@@ -47,49 +48,18 @@ from ...utils.step_paths import (
 from ...utils.common_helpers import safe_float as _safe_float
 from ...utils.io_utils import coerce_int64_source_id
 from ...utils.qc_utils import filter_files_by_qc
+from ...utils.cache_utils import (
+    norm_path_key,
+    build_file_signature,
+    file_signature_matches,
+    file_signature_matches_relaxed,
+    astap_wcs_candidates,
+    parse_astap_wcs_file,
+)
 
 
 _FILTER_RE = re.compile(r"[-_]([ugrizbvUGRIZBV])[-_.]", re.IGNORECASE)
 _DATE_RE = re.compile(r"(20\d{6})")
-
-
-def _astap_wcs_candidates(fits_path: Path) -> List[Path]:
-    return [
-        fits_path.with_suffix(".wcs"),
-        Path(str(fits_path) + ".wcs"),
-        fits_path.parent / (fits_path.stem + ".wcs"),
-        fits_path.parent / (fits_path.name + ".wcs"),
-    ]
-
-
-def _parse_astap_wcs_file(wcs_path: Path) -> dict:
-    d: Dict[str, object] = {}
-    try:
-        lines = wcs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return d
-    for ln in lines:
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        if "/" in s:
-            s = s.split("/", 1)[0].strip()
-        if "=" not in s:
-            continue
-        key, val = [t.strip() for t in s.split("=", 1)]
-        if not key:
-            continue
-        if val.startswith("'") and val.endswith("'"):
-            d[key] = val.strip("'")
-            continue
-        try:
-            if "." in val or "E" in val.upper():
-                d[key] = float(val)
-            else:
-                d[key] = int(val)
-        except Exception:
-            d[key] = val
-    return d
 
 
 def _get_filter_from_filename(filename: str) -> Optional[str]:
@@ -209,6 +179,11 @@ class RefBuildWorker(QThread):
         self._stop_requested = False
         # Cache for WCS headers (path -> fits.Header)
         self._wcs_header_cache: Dict[str, fits.Header] = {}
+        self._wcs_summary_by_file: Optional[Dict[str, dict]] = None
+        self._meta_missing_files: set = set()
+        self._meta_incompatible_files: set = set()
+        self._detcsv_missing_files: set = set()
+        self._detcsv_incompatible_files: set = set()
 
     def stop(self):
         self._stop_requested = True
@@ -216,42 +191,192 @@ class RefBuildWorker(QThread):
     def _log(self, msg: str):
         self.log.emit(msg)
 
-    def _load_meta(self, fname: str) -> Optional[dict]:
-        meta_path = self.cache_dir / f"detect_{fname}.json"
-        if not meta_path.exists():
-            fallback = step4_dir(self.result_dir) / f"detect_{fname}.json"
-            if fallback.exists():
-                meta_path = fallback
-            else:
-                return None
-        try:
-            return json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-    def _resolve_detect_csv(self, fname: str) -> Optional[Path]:
-        cand = self.cache_dir / f"detect_{fname}.csv"
-        if cand.exists():
-            return cand
-        fallback = step4_dir(self.result_dir) / f"detect_{fname}.csv"
-        if fallback.exists():
-            return fallback
-        return None
-
     def _resolve_fits_path(self, fname: str) -> Optional[Path]:
-        step5_out = step5_dir(self.result_dir)
-        cand = step5_out / fname
-        if cand.exists():
-            return cand
         cropped_dir = step2_cropped_dir(self.result_dir)
         if crop_is_active(self.result_dir):
             cand = cropped_dir / fname
             if cand.exists():
                 return cand
+            legacy = self.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        # Prefer original/source path first. Step5 summary signatures are based on
+        # the true source frame, and stale copies can remain under step5_wcs/.
+        try:
+            orig = Path(self.params.get_file_path(fname))
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        step5_out = step5_dir(self.result_dir)
+        cand = step5_out / fname
+        if cand.exists():
+            return cand
         try:
             return Path(self.params.get_file_path(fname))
         except Exception:
             return None
+
+    def _current_file_signature(self, fname: str) -> Optional[dict]:
+        path = self._resolve_fits_path(fname)
+        if path is None or not path.exists():
+            return None
+        return build_file_signature(path, use_cropped=bool(crop_is_active(self.result_dir)))
+
+    def _detect_meta_compatible(self, fname: str, payload: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return self._legacy_detect_cache_allowed(meta_path)
+        sig_now = self._current_file_signature(fname)
+        if sig_now is None:
+            return False
+        if file_signature_matches(payload, sig_now):
+            payload["__compat_relaxed_mtime"] = False
+            payload["__compat_relaxed_size"] = False
+            return True
+        if not file_signature_matches_relaxed(payload, sig_now):
+            return False
+        payload["__compat_relaxed_mtime"] = True
+        payload["__compat_relaxed_size"] = True
+        return True
+
+    def _legacy_detect_cache_allowed(self, marker_path: Path) -> bool:
+        try:
+            marker_mtime = int(marker_path.stat().st_mtime_ns)
+        except Exception:
+            return False
+        if crop_is_active(self.result_dir):
+            rect_path = crop_rect_path(self.result_dir)
+            if rect_path.exists():
+                try:
+                    rect_mtime = int(rect_path.stat().st_mtime_ns)
+                    if marker_mtime < rect_mtime:
+                        return False
+                except Exception:
+                    return False
+        return True
+
+    def _wcs_row_compatible(self, fname: str, row: dict) -> bool:
+        sig_now = self._current_file_signature(fname)
+        if sig_now is None:
+            return False
+        if not isinstance(row, dict):
+            return False
+        src_path_val = row.get("source_path")
+        src_path_txt = str(src_path_val).strip().lower() if src_path_val is not None else ""
+        if src_path_txt not in ("", "nan", "none", "null"):
+            if file_signature_matches(row, sig_now):
+                row["__compat_relaxed_mtime"] = False
+                row["__compat_relaxed_size"] = False
+                return True
+            if not file_signature_matches_relaxed(row, sig_now):
+                return False
+            row["__compat_relaxed_mtime"] = True
+            row["__compat_relaxed_size"] = True
+            return True
+
+        # Legacy path: accept by path match only (no signature fields available).
+        fits_path = norm_path_key(row.get("fits_path", ""))
+        if not fits_path:
+            return False
+        if fits_path != norm_path_key(sig_now.get("source_path", "")):
+            return False
+        row["__compat_relaxed_mtime"] = True
+        return True
+
+    def _load_meta(self, fname: str) -> Optional[dict]:
+        candidates = [
+            self.cache_dir / f"detect_{fname}.json",
+            step4_dir(self.result_dir) / f"detect_{fname}.json",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        if not candidates:
+            self._meta_missing_files.add(str(fname))
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for meta_path in candidates:
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if self._detect_meta_compatible(fname, payload, meta_path):
+                return payload
+        self._meta_incompatible_files.add(str(fname))
+        return None
+
+    def _resolve_detect_csv(self, fname: str) -> Optional[Path]:
+        candidates = [
+            self.cache_dir / f"detect_{fname}.csv",
+            step4_dir(self.result_dir) / f"detect_{fname}.csv",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        if not candidates:
+            self._detcsv_missing_files.add(str(fname))
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for cand in candidates:
+            meta_path = cand.with_suffix(".json")
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if self._detect_meta_compatible(fname, payload, meta_path):
+                    return cand
+        self._detcsv_incompatible_files.add(str(fname))
+        return None
+
+    def _load_wcs_summary_map(self) -> Dict[str, dict]:
+        if self._wcs_summary_by_file is not None:
+            return self._wcs_summary_by_file
+
+        mapping: Dict[str, dict] = {}
+        candidates = [
+            step5_dir(self.result_dir) / "wcs_solve_summary.csv",
+            legacy_step7_wcs_dir(self.result_dir) / "wcs_solve_summary.csv",
+            self.result_dir / "wcs_solve_summary.csv",
+        ]
+        existing = [p for p in candidates if p.exists()]
+        existing.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for path in existing:
+            try:
+                st = path.stat()
+                rec_mtime_ns = int(st.st_mtime_ns)
+            except Exception:
+                rec_mtime_ns = 0
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            key_col = None
+            if "file" in df.columns:
+                key_col = "file"
+            elif "fname" in df.columns:
+                key_col = "fname"
+            if key_col is None:
+                continue
+            for rec in df.to_dict(orient="records"):
+                key = str(rec.get(key_col, "")).strip()
+                if key:
+                    rec["__record_mtime_ns"] = rec_mtime_ns
+                    mapping[key] = rec
+            break
+
+        self._wcs_summary_by_file = mapping
+        return mapping
+
+    def _load_wcs_summary_row(self, fname: str) -> dict:
+        row = self._load_wcs_summary_map().get(str(fname), {})
+        if not row:
+            return {}
+        if not self._wcs_row_compatible(fname, row):
+            return {}
+        return row
 
     def _load_wcs_for_frame(self, fname: str) -> Optional[WCS]:
         fits_path = self._resolve_fits_path(fname)
@@ -278,10 +403,10 @@ class RefBuildWorker(QThread):
                 if w.has_celestial:
                     return w
                 # fallback: ASTAP .wcs sidecar
-                for wcs_path in _astap_wcs_candidates(path):
+                for wcs_path in astap_wcs_candidates(path):
                     if not wcs_path.exists():
                         continue
-                    wcs_dict = _parse_astap_wcs_file(wcs_path)
+                    wcs_dict = parse_astap_wcs_file(wcs_path)
                     if not wcs_dict:
                         continue
                     hdr2 = fits.Header()

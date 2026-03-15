@@ -41,6 +41,9 @@ from PyQt5.QtWidgets import (
     QSlider,
     QColorDialog,
     QTabWidget,
+    QFileDialog,
+    QListWidget,
+    QListWidgetItem,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence, QColor
@@ -48,7 +51,12 @@ from PyQt5.QtWidgets import QShortcut, QStyle, QStyleOptionSlider
 
 from .step_window_base import StepWindowBase
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
-from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+from ...utils.io_utils import (
+    read_csv_int64_source_id,
+    coerce_int64_source_id,
+    load_night_assignments as _load_night_assignments_util,
+    load_headers_table as _load_headers_table_util,
+)
 
 
 class ClickableSlider(QSlider):
@@ -85,7 +93,7 @@ class ClickableSlider(QSlider):
                 event.accept()
                 return
         super().mousePressEvent(event)
-from ...utils.astro_utils import compute_airmass_from_header
+from ...utils.astro_utils import compute_airmass_from_header, compute_bjd_tdb_array
 from ...utils.step_paths import (
     step1_dir,
     step2_cropped_dir,
@@ -174,15 +182,7 @@ def _date_from_dateobs(date_obs: str | None) -> str:
 
 
 def _load_headers_table(result_dir: Path) -> pd.DataFrame:
-    headers_path = step1_dir(result_dir) / "headers.csv"
-    if not headers_path.exists():
-        headers_path = result_dir / "headers.csv"
-    if not headers_path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(headers_path)
-    except Exception:
-        return pd.DataFrame()
+    return _load_headers_table_util(result_dir)
 
 
 def _load_headers_map(result_dir: Path) -> dict:
@@ -192,6 +192,11 @@ def _load_headers_map(result_dir: Path) -> dict:
     if "Filename" in df.columns and "DATE-OBS" in df.columns:
         return dict(zip(df["Filename"].astype(str), df["DATE-OBS"].astype(str)))
     return {}
+
+
+def _load_night_assignments(result_dir: Path) -> dict[str, int]:
+    """Load filename -> night_id mapping from step1 night_assignments.json."""
+    return _load_night_assignments_util(result_dir)
 
 
 def _parse_color_index(expr: str | None) -> tuple[str, str] | None:
@@ -821,6 +826,33 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
     return filter_selections
 
 
+def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
+    """Look up target RA/Dec from master_catalog.tsv.
+
+    Returns (ra_deg, dec_deg), or (nan, nan) if not found.
+    """
+    step8_out = step8_dir(result_dir)
+    candidates = list(step8_out.glob("master_catalog_*.tsv")) if step8_out.exists() else []
+    candidates += [step8_out / "master_catalog.tsv"] if step8_out.exists() else []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = read_csv_int64_source_id(path, sep="\t")
+            if "ID" not in df.columns:
+                continue
+            row = df[pd.to_numeric(df["ID"], errors="coerce") == int(target_id)]
+            if row.empty:
+                continue
+            ra = float(pd.to_numeric(row["ra_deg"].values[0], errors="coerce")) if "ra_deg" in df.columns else np.nan
+            dec = float(pd.to_numeric(row["dec_deg"].values[0], errors="coerce")) if "dec_deg" in df.columns else np.nan
+            if np.isfinite(ra) and np.isfinite(dec):
+                return ra, dec
+        except Exception:
+            continue
+    return np.nan, np.nan
+
+
 # 필터별 일관된 색상 매핑
 FILTER_COLORS = {
     "g": "#2ca02c",   # 녹색
@@ -935,9 +967,41 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.id_info_label.setWordWrap(True)
         self.content_layout.addWidget(self.id_info_label)
 
-        # Fix dataset to current result_dir (single entry)
+        # Fix base dataset to current result_dir
         rd = Path(self.params.P.result_dir)
         self.datasets = [(rd.name, rd)]
+
+        # ----- 추가 데이터셋 패널 -----
+        ds_group = QGroupBox("추가 데이터셋")
+        ds_group.setCheckable(True)
+        ds_group.setChecked(False)
+        ds_group.setStyleSheet("QGroupBox { font-size: 8pt; } QGroupBox::title { color: #555; }")
+        ds_vbox = QVBoxLayout(ds_group)
+        ds_vbox.setContentsMargins(4, 4, 4, 4)
+        ds_vbox.setSpacing(2)
+
+        self.ds_list_widget = QListWidget()
+        self.ds_list_widget.setMaximumHeight(72)
+        self.ds_list_widget.setStyleSheet("QListWidget { font-size: 8pt; }")
+        self.ds_list_widget.addItem(f"[현재] {rd.name}")
+        self.ds_list_widget.item(0).setFlags(Qt.ItemIsEnabled)
+        ds_vbox.addWidget(self.ds_list_widget)
+
+        ds_btn_row = QHBoxLayout()
+        ds_btn_row.setSpacing(4)
+        btn_ds_add = QPushButton("폴더 추가")
+        btn_ds_add.setMaximumHeight(22)
+        btn_ds_add.setStyleSheet("font-size: 8pt;")
+        btn_ds_add.clicked.connect(self._on_add_dataset)
+        btn_ds_remove = QPushButton("제거")
+        btn_ds_remove.setMaximumHeight(22)
+        btn_ds_remove.setStyleSheet("font-size: 8pt;")
+        btn_ds_remove.clicked.connect(self._on_remove_dataset)
+        ds_btn_row.addWidget(btn_ds_add)
+        ds_btn_row.addWidget(btn_ds_remove)
+        ds_btn_row.addStretch()
+        ds_vbox.addLayout(ds_btn_row)
+        self.content_layout.addWidget(ds_group)
 
         self.tab_widget = QTabWidget()
         self.light_tab = QWidget()
@@ -1988,9 +2052,24 @@ class LightCurveBuilderWindow(StepWindowBase):
                     header_filter_map = dict(zip(headers_df["Filename"].astype(str), headers_df[col].astype(str)))
                     break
 
+        # Night assignment map: filename -> night_id
+        # Prefer in-index column, fall back to file_manager or disk JSON
+        night_id_map: dict[str, int] = {}
+        if "night_id" in idx.columns:
+            for fn, nid in zip(idx["file"].astype(str), pd.to_numeric(idx["night_id"], errors="coerce")):
+                if not pd.isna(nid):
+                    night_id_map[fn] = int(nid)
+        if not night_id_map:
+            fm = getattr(self, "file_manager", None)
+            if fm is not None:
+                night_id_map = dict(getattr(fm, "night_assignments", {}))
+        if not night_id_map:
+            night_id_map = _load_night_assignments(result_dir)
+
         # Use instance-level header cache (self._header_cache)
         times = []
         dates = []
+        night_ids = []
         filters = []
         airmasses = []
         mags = []
@@ -2041,6 +2120,7 @@ class LightCurveBuilderWindow(StepWindowBase):
 
             times.append(jd)
             dates.append(_date_from_dateobs(date_obs) if date_obs else _extract_date_from_path(result_dir, fname))
+            night_ids.append(night_id_map.get(fname, 0))
             filt_key = _normalize_filter_key(filt_val)
             filters.append(filt_key)
             airmasses.append(am if np.isfinite(am) else np.nan)
@@ -2132,17 +2212,27 @@ class LightCurveBuilderWindow(StepWindowBase):
         t0 = np.nanmedian(tarr)
         rel_time_hr = (tarr - t0) * 24.0
 
+        # BJD_TDB 계산
+        bjd_arr = self._compute_bjd_array(tarr, result_dir, target_id)
+
         if verbose:
             total = len(files)
             self.log(f"[DEBUG] Ensemble series (Target={target_id}) frames={total}")
             self.log(f"[DEBUG] Target found: {n_target_found}/{total}")
             self.log(f"[DEBUG] Comp ensemble available: {n_comp_found}/{total}")
+            if np.any(np.isfinite(bjd_arr)):
+                delta = np.nanmedian(bjd_arr - tarr) * 86400
+                self.log(f"[BJD] BJD_TDB computed, median correction {delta:+.1f}s")
+            else:
+                self.log("[BJD] BJD_TDB not computed (missing site coords or target RA/Dec)")
 
         return pd.DataFrame({
             "file": files,
             "filter": filters,
             "date": dates,
+            "night_id": night_ids,
             "JD": tarr,
+            "BJD_TDB": bjd_arr,
             "rel_time_hr": rel_time_hr,
             "mag": np.array(mags, float),
             "mag_err": np.array(mag_errs, float),
@@ -2198,21 +2288,37 @@ class LightCurveBuilderWindow(StepWindowBase):
                     header_filter_map = dict(zip(headers_df["Filename"].astype(str), headers_df[col].astype(str)))
                     break
 
+        # Night assignment map for this series
+        diff_night_id_map: dict[str, int] = {}
+        if "night_id" in idx.columns:
+            for fn, nid in zip(idx["file"].astype(str), pd.to_numeric(idx["night_id"], errors="coerce")):
+                if not pd.isna(nid):
+                    diff_night_id_map[fn] = int(nid)
+        if not diff_night_id_map:
+            fm = getattr(self, "file_manager", None)
+            if fm is not None:
+                diff_night_id_map = dict(getattr(fm, "night_assignments", {}))
+        if not diff_night_id_map:
+            diff_night_id_map = _load_night_assignments(result_dir)
+
         times = []
         diffs = []
         filters = []
         airmasses = []
+        diff_night_ids = []
 
         # headers.csv에서 airmass 컬럼 확인 (FITS 안 읽기 위해)
         header_airmass_map = {}
         if not headers_df.empty and "Filename" in headers_df.columns:
             for col in ("AIRMASS", "airmass", "AM"):
                 if col in headers_df.columns:
-                    for _, row in headers_df.iterrows():
-                        fn = str(row["Filename"])
-                        am_val = pd.to_numeric(row[col], errors="coerce")
-                        if np.isfinite(am_val):
-                            header_airmass_map[fn] = float(am_val)
+                    am_series = pd.to_numeric(headers_df[col], errors="coerce")
+                    fnames_series = headers_df["Filename"].astype(str)
+                    header_airmass_map = {
+                        fn: float(am)
+                        for fn, am in zip(fnames_series, am_series)
+                        if np.isfinite(am)
+                    }
                     break
 
         # 디버깅 통계
@@ -2254,6 +2360,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             filt_key = _normalize_filter_key(filt_val)
             filters.append(filt_key)
             airmasses.append(float(am) if np.isfinite(am) else np.nan)
+            diff_night_ids.append(diff_night_id_map.get(fname, 0))
 
             df = self._get_photometry_df(result_dir, fname)
             if df is None or df.empty:
@@ -2331,10 +2438,14 @@ class LightCurveBuilderWindow(StepWindowBase):
         t0 = np.nanmedian(tarr)
         rel_time_hr = (tarr - t0) * 24.0
 
+        bjd_arr = self._compute_bjd_array(tarr, result_dir, target_id)
+
         result_df = pd.DataFrame({
             "file": files,
             "filter": filters,
+            "night_id": diff_night_ids,
             "JD": tarr,
+            "BJD_TDB": bjd_arr,
             "rel_time_hr": rel_time_hr,
             "diff_mag": np.array(diffs, float),
             "airmass": np.array(airmasses, float),
@@ -2351,6 +2462,19 @@ class LightCurveBuilderWindow(StepWindowBase):
         if not self.datasets:
             return None
         return Path(self.datasets[0][1])
+
+    def _compute_bjd_array(self, tarr: np.ndarray, result_dir: Path, target_id: int) -> np.ndarray:
+        """Compute BJD_TDB array; returns NaN array if site coords or target RA/Dec are missing."""
+        site_lat = float(getattr(self.params.P, "site_lat_deg", np.nan))
+        site_lon = float(getattr(self.params.P, "site_lon_deg", np.nan))
+        site_alt = float(getattr(self.params.P, "site_alt_m", 0.0))
+        tgt_ra, tgt_dec = _load_target_radec(result_dir, target_id)
+        if not np.isfinite(tgt_ra) and hasattr(self.params.P, "target"):
+            tgt_ra = float(getattr(self.params.P.target, "ra_deg", np.nan) or np.nan)
+            tgt_dec = float(getattr(self.params.P.target, "dec_deg", np.nan) or np.nan)
+        if np.isfinite(site_lat) and np.isfinite(site_lon) and np.isfinite(tgt_ra) and np.isfinite(tgt_dec):
+            return compute_bjd_tdb_array(tarr, tgt_ra, tgt_dec, site_lat, site_lon, site_alt)
+        return np.full(len(tarr), np.nan)
 
     def _frame_qc_marker_path(self, result_dir: Path) -> Path:
         return step10_dir(result_dir) / "frame_qc_done.json"
@@ -2557,7 +2681,14 @@ class LightCurveBuilderWindow(StepWindowBase):
         # X축 선택
         if self.x_axis_mode == "phase":
             # 위상 계산
-            jd_col = "JD" if "JD" in df.columns else ("jd" if "jd" in df.columns else None)
+            if "BJD_TDB" in df.columns and df["BJD_TDB"].notna().any():
+                jd_col = "BJD_TDB"
+            elif "JD" in df.columns:
+                jd_col = "JD"
+            elif "jd" in df.columns:
+                jd_col = "jd"
+            else:
+                jd_col = None
             if jd_col is None:
                 self.log("[WARN] JD column missing, cannot compute phase")
                 x_column = "rel_time_hr"
@@ -3354,6 +3485,29 @@ class LightCurveBuilderWindow(StepWindowBase):
     def validate_step(self) -> bool:
         return True
 
+    # ------------------------------------------------------------------
+    # Multi-dataset helpers
+    # ------------------------------------------------------------------
+
+    def _on_add_dataset(self):
+        p = QFileDialog.getExistingDirectory(self, "추가 result 폴더 선택", str(self.params.P.result_dir))
+        if not p:
+            return
+        p = Path(p)
+        for _, existing in self.datasets:
+            if existing.resolve() == p.resolve():
+                return
+        self.datasets.append((p.name, p))
+        self.ds_list_widget.addItem(p.name)
+
+    def _on_remove_dataset(self):
+        row = self.ds_list_widget.currentRow()
+        if row <= 0:  # row 0 is locked (current result_dir)
+            return
+        self.ds_list_widget.takeItem(row)
+        if row < len(self.datasets):
+            self.datasets.pop(row)
+
     def save_state(self):
         state_data = {
             "build_diff": self.opt_diff,
@@ -3373,6 +3527,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             "period_max": self.period_max,
             "filter_visibility": self.filter_visibility,
             "filter_colors": self.filter_colors,
+            "extra_result_dirs": [str(p) for _, p in self.datasets[1:]],
         }
         self.project_state.store_step_data("light_curve", state_data)
 
@@ -3413,3 +3568,14 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._update_comp_ids_from_input()
         self._update_qc_threshold_label()
         self._update_qc_gate_ui()
+        # Restore extra datasets
+        if state_data:
+            for dir_str in state_data.get("extra_result_dirs", []):
+                p = Path(dir_str)
+                if not p.exists():
+                    continue
+                if any(existing.resolve() == p.resolve() for _, existing in self.datasets):
+                    continue
+                self.datasets.append((p.name, p))
+                if hasattr(self, "ds_list_widget"):
+                    self.ds_list_widget.addItem(p.name)

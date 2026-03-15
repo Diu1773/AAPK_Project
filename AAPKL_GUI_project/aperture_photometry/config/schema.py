@@ -95,6 +95,12 @@ class IOConfig(BaseModel):
         default="cache",
         description="Cache directory name"
     )
+    night_gap_hours: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=24.0,
+        description="JD gap threshold in hours to start a new night"
+    )
 
 
 class TargetConfig(BaseModel):

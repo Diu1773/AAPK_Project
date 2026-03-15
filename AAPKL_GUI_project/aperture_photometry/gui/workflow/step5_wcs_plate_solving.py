@@ -46,6 +46,7 @@ from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step2_cropped_dir,
     crop_is_active,
+    crop_rect_path,
     step4_dir,
     step5_dir,
     legacy_step5_refbuild_dir,
@@ -54,6 +55,14 @@ from ...utils.step_paths import (
 )
 from ...utils.constants import get_parallel_workers
 from ...utils.io_utils import coerce_int64_source_id
+from ...utils.cache_utils import (
+    norm_path_key,
+    build_file_signature,
+    file_signature_matches,
+    file_signature_matches_relaxed,
+    astap_wcs_candidates,
+    parse_astap_wcs_file,
+)
 
 
 def _tail_text(value: str | None, limit: int = 800, max_lines: int = 8) -> str:
@@ -73,6 +82,18 @@ def _tail_text(value: str | None, limit: int = 800, max_lines: int = 8) -> str:
 
 def _exc_brief(exc: Exception, limit: int = 260) -> str:
     return _tail_text(f"{type(exc).__name__}: {exc}", limit=limit, max_lines=4)
+
+
+def _coerce_source_id_int64(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Normalize Gaia source_id as signed int64 without float precision loss."""
+    if df is None or df.empty or "source_id" not in df.columns:
+        return df
+    out = df.copy()
+    sid = coerce_int64_source_id(out["source_id"])
+    valid = sid.notna()
+    out = out.loc[valid].copy()
+    out["source_id"] = sid.loc[valid].astype("int64")
+    return out
 
 
 class WcsWorker(QThread):
@@ -102,43 +123,6 @@ class WcsWorker(QThread):
         if p.exists():
             return str(p)
         return exe
-
-    def _astap_wcs_candidates(self, fits_path: Path):
-        return [
-            fits_path.with_suffix(".wcs"),
-            Path(str(fits_path) + ".wcs"),
-            fits_path.parent / (fits_path.stem + ".wcs"),
-            fits_path.parent / (fits_path.name + ".wcs"),
-        ]
-
-    def _parse_astap_wcs_file(self, wcs_path: Path) -> dict:
-        d = {}
-        try:
-            lines = wcs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception:
-            return d
-        for ln in lines:
-            s = ln.strip()
-            if not s or s.startswith("#"):
-                continue
-            if "/" in s:
-                s = s.split("/", 1)[0].strip()
-            if "=" not in s:
-                continue
-            key, val = [t.strip() for t in s.split("=", 1)]
-            if not key:
-                continue
-            if val.startswith("'") and val.endswith("'"):
-                d[key] = val.strip("'")
-                continue
-            try:
-                if "." in val or "E" in val.upper():
-                    d[key] = float(val)
-                else:
-                    d[key] = int(val)
-            except Exception:
-                d[key] = val
-        return d
 
     def _inject_wcs_into_header(self, hdr: fits.Header, wcs_dict: dict):
         for k, v in wcs_dict.items():
@@ -191,8 +175,19 @@ class WcsWorker(QThread):
         stem = fits_path.stem
         new_path = outdir / f"{stem}.new"
         solved_path = outdir / f"{stem}.solved"
-        if use_cache and new_path.exists() and solved_path.exists():
-            return True, 0.0, "cache_hit", "", [], new_path
+        wcs_path_out = outdir / f"{stem}.wcs"
+        sig_path = outdir / f"{stem}.input.json"
+        source_sig = build_file_signature(fits_path, use_cropped=bool(self.use_cropped))
+        if use_cache and new_path.exists() and (solved_path.exists() or wcs_path_out.exists()):
+            cache_ok = False
+            try:
+                if sig_path.exists():
+                    saved_sig = json.loads(sig_path.read_text(encoding="utf-8"))
+                    cache_ok = file_signature_matches_relaxed(saved_sig, source_sig)
+            except Exception:
+                cache_ok = False
+            if cache_ok:
+                return True, 0.0, "cache_hit", "", [], new_path
         for p in outdir.glob(f"{stem}.*"):
             try:
                 p.unlink()
@@ -272,7 +267,15 @@ class WcsWorker(QThread):
             start = time.time()
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
             dt = time.time() - start
-            ok = (cp.returncode == 0 and new_path.exists() and solved_path.exists())
+            # Some solve-field builds return non-zero even when solution artifacts are created.
+            # Prefer artifact existence over process return code.
+            wcs_path_check = outdir / f"{stem}.wcs"
+            ok = bool(new_path.exists() and (solved_path.exists() or wcs_path_check.exists()))
+            if ok:
+                try:
+                    sig_path.write_text(json.dumps(source_sig, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             if staged_path != fits_path:
                 try:
                     staged_path.unlink()
@@ -301,10 +304,10 @@ class WcsWorker(QThread):
             return False, 0.0, "", str(e), cmd, None
 
     def _try_ingest_wcs(self, fits_path: Path, hdr: fits.Header) -> bool:
-        for wp in self._astap_wcs_candidates(fits_path):
+        for wp in astap_wcs_candidates(fits_path):
             if not wp.exists():
                 continue
-            wcsd = self._parse_astap_wcs_file(wp)
+            wcsd = parse_astap_wcs_file(wp)
             if not wcsd:
                 continue
             self._inject_wcs_into_header(hdr, wcsd)
@@ -378,19 +381,108 @@ class WcsWorker(QThread):
         except Exception:
             return 0
 
+    def _resolve_source_fits_path(self, fname: str):
+        if self.use_cropped:
+            cand = step2_cropped_dir(self.result_dir) / fname
+            if cand.exists():
+                return cand
+            legacy = self.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        try:
+            orig = self.params.get_file_path(fname)
+            orig = Path(orig)
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        return None
+
+    def _compatible_detect_signature(self, fname: str):
+        src = self._resolve_source_fits_path(fname)
+        if src is None or not src.exists():
+            return None
+        return build_file_signature(src, use_cropped=bool(self.use_cropped))
+
+    def _detect_meta_matches(self, payload: dict, sig_now: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict) or not isinstance(sig_now, dict):
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return False
+        if not file_signature_matches_relaxed(payload, sig_now):
+            return False
+        return True
+
+    def _legacy_detect_cache_allowed(self, marker_path: Path) -> bool:
+        try:
+            marker_mtime = int(marker_path.stat().st_mtime_ns)
+        except Exception:
+            return False
+        if self.use_cropped:
+            rect_path = crop_rect_path(self.result_dir)
+            if rect_path.exists():
+                try:
+                    rect_mtime = int(rect_path.stat().st_mtime_ns)
+                    if marker_mtime < rect_mtime:
+                        return False
+                except Exception:
+                    return False
+        return True
+
     def _load_fwhm_for_frame(self, fname: str):
-        meta_json = self.cache_dir / f"detect_{fname}.json"
-        if meta_json.exists():
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
+            return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
+        candidates = [
+            self.cache_dir / f"detect_{fname}.json",
+            step4_dir(self.result_dir) / f"detect_{fname}.json",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for meta_json in candidates:
             try:
                 meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._detect_meta_matches(meta, sig_now, meta_json):
+                continue
+            try:
                 fpx = float(meta.get("fwhm_med_rad_px", meta.get("fwhm_med_px", np.nan)))
                 farc = float(meta.get("fwhm_med_rad_arcsec", meta.get("fwhm_med_arc", np.nan)))
                 return fpx, farc
             except Exception:
-                pass
+                continue
+        # Backward compatibility: legacy detect cache (schema<2) can be used
+        # when it is newer than the current crop selection marker.
+        for meta_json in candidates:
+            try:
+                meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            try:
+                schema = int(meta.get("cache_schema", 0) or 0)
+            except Exception:
+                schema = 0
+            if schema >= 2:
+                continue
+            if not self._legacy_detect_cache_allowed(meta_json):
+                continue
+            try:
+                fpx = float(meta.get("fwhm_med_rad_px", meta.get("fwhm_med_px", np.nan)))
+                farc = float(meta.get("fwhm_med_rad_arcsec", meta.get("fwhm_med_arc", np.nan)))
+                return fpx, farc
+            except Exception:
+                continue
         return float(getattr(self.params.P, "fwhm_seed_px", 6.0)), np.nan
 
     def _load_detect_xy(self, fname: str) -> np.ndarray:
+        sig_now = self._compatible_detect_signature(fname)
+        if sig_now is None:
+            return np.zeros((0, 2), float)
         candidates = [
             self.cache_dir / f"detect_{fname}.csv",
             step4_dir(self.result_dir) / f"detect_{fname}.csv",
@@ -398,8 +490,43 @@ class WcsWorker(QThread):
         for path in candidates:
             if not path.exists():
                 continue
+            meta_path = path.with_suffix(".json")
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not self._detect_meta_matches(payload, sig_now, meta_path):
+                continue
             try:
                 df = pd.read_csv(path)
+            except Exception:
+                continue
+            if not {"x", "y"} <= set(df.columns):
+                continue
+            xy = df[["x", "y"]].to_numpy(float)
+            xy = xy[np.isfinite(xy).all(axis=1)]
+            return xy
+        # Backward compatibility for legacy detect cache.
+        for csv_path in candidates:
+            if not csv_path.exists():
+                continue
+            meta_path = csv_path.with_suffix(".json")
+            schema = 0
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                    schema = int(payload.get("cache_schema", 0) or 0)
+                except Exception:
+                    continue
+            if schema >= 2:
+                continue
+            marker_path = meta_path if meta_path.exists() else csv_path
+            if not self._legacy_detect_cache_allowed(marker_path):
+                continue
+            try:
+                df = pd.read_csv(csv_path)
             except Exception:
                 continue
             if not {"x", "y"} <= set(df.columns):
@@ -417,6 +544,7 @@ class WcsWorker(QThread):
             "n_inlier": 0,
             "match_rate": np.nan,
             "match_rate_cat": np.nan,
+            "match_rate_eff": np.nan,
             "match_radius_arcsec": np.nan,
             "match_radius_px": np.nan,
             "dx_med_px": np.nan,
@@ -547,6 +675,7 @@ class WcsWorker(QThread):
         out["n_match"] = n_match
         out["match_rate"] = float(n_match / max(int(len(det_xy)), 1))
         out["match_rate_cat"] = float(n_match / max(int(len(gaia_xy)), 1))
+        out["match_rate_eff"] = float(max(out["match_rate"], out["match_rate_cat"]))
         if n_match == 0:
             return out
 
@@ -608,37 +737,48 @@ class WcsWorker(QThread):
                 return np.nan
 
         reasons: list[str] = []
+        gaia_available = bool(metrics.get("gaia_available", True))
 
         require_wcs_ok = bool(getattr(self.params.P, "wcs_qc_require_wcs_ok", True))
         if require_wcs_ok and not wcs_ok:
             reasons.append("wcs_fail")
 
+        n_detect = int(metrics.get("n_detect", 0) or 0)
         n_match = int(metrics.get("n_match", 0) or 0)
-        min_match_n = int(getattr(self.params.P, "wcs_qc_min_match_n", 20))
-        if min_match_n > 0 and n_match < min_match_n:
-            reasons.append("low_match_n")
+        if n_detect <= 0:
+            reasons.append("no_detect_data")
 
-        min_match_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
-        mrate = _num("match_rate")
-        if np.isfinite(min_match_rate) and min_match_rate > 0:
-            if (not np.isfinite(mrate)) or (mrate < min_match_rate):
-                reasons.append("low_match_rate")
+        if gaia_available:
+            min_match_n = int(getattr(self.params.P, "wcs_qc_min_match_n", 20))
+            if min_match_n > 0 and n_match < min_match_n:
+                reasons.append("low_match_n")
+
+            min_match_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
+            mrate_det = _num("match_rate")
+            mrate_cat = _num("match_rate_cat")
+            mrate_eff = _num("match_rate_eff")
+            if not np.isfinite(mrate_eff):
+                if np.isfinite(mrate_det) or np.isfinite(mrate_cat):
+                    mrate_eff = float(np.nanmax([v for v in [mrate_det, mrate_cat] if np.isfinite(v)] or [np.nan]))
+            if np.isfinite(min_match_rate) and min_match_rate > 0:
+                if (not np.isfinite(mrate_eff)) or (mrate_eff < min_match_rate):
+                    reasons.append("low_match_rate")
 
         max_rms_px = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
-        rms_px = _num("rms_px")
-        if np.isfinite(max_rms_px) and max_rms_px > 0:
+        if n_match > 0 and np.isfinite(max_rms_px) and max_rms_px > 0:
+            rms_px = _num("rms_px")
             if (not np.isfinite(rms_px)) or (rms_px > max_rms_px):
                 reasons.append("high_rms")
 
         max_p99_px = float(getattr(self.params.P, "wcs_qc_max_p99_px", 5.0))
-        p99_px = _num("resid_p99_px")
-        if np.isfinite(max_p99_px) and max_p99_px > 0:
+        if n_match > 0 and np.isfinite(max_p99_px) and max_p99_px > 0:
+            p99_px = _num("resid_p99_px")
             if (not np.isfinite(p99_px)) or (p99_px > max_p99_px):
                 reasons.append("high_p99")
 
         min_inlier_rate = float(getattr(self.params.P, "wcs_qc_min_inlier_rate", 0.50))
-        inlier_rate = _num("inlier_rate")
-        if np.isfinite(min_inlier_rate) and min_inlier_rate > 0:
+        if n_match > 0 and np.isfinite(min_inlier_rate) and min_inlier_rate > 0:
+            inlier_rate = _num("inlier_rate")
             if (not np.isfinite(inlier_rate)) or (inlier_rate < min_inlier_rate):
                 reasons.append("low_inlier")
 
@@ -666,9 +806,55 @@ class WcsWorker(QThread):
                 if need not in cols:
                     return None
             tab.rename_columns(tab.colnames, cols)
-            return tab.to_pandas()
+            return _coerce_source_id_int64(tab.to_pandas())
         except Exception:
             return None
+
+    def _query_gaia_vizier(self, center: SkyCoord, radius_deg: float, mag_max: float):
+        """VizieR mirror fallback (Strasbourg CDS). Used when ESA server is unavailable/blocked."""
+        try:
+            from astroquery.utils.tap.core import TapPlus
+        except ImportError:
+            raise RuntimeError("astroquery.utils.tap not available")
+        mag_where = f'AND "I/355/gaiadr3".Gmag <= {mag_max:.4f}' if np.isfinite(mag_max) and mag_max > 0 else ""
+        adql = f"""
+SELECT
+  "I/355/gaiadr3".Source AS source_id,
+  "I/355/gaiadr3".RA_ICRS AS ra,
+  "I/355/gaiadr3".DE_ICRS AS dec,
+  "I/355/gaiadr3".Gmag AS phot_g_mean_mag,
+  "I/355/gaiadr3".BPmag AS phot_bp_mean_mag,
+  "I/355/gaiadr3".RPmag AS phot_rp_mean_mag,
+  "I/355/gaiadr3".RUWE AS ruwe,
+  "I/355/gaiadr3".Plx AS parallax,
+  "I/355/gaiadr3".e_Plx AS parallax_error,
+  "I/355/gaiadr3".pmRA AS pmra,
+  "I/355/gaiadr3".e_pmRA AS pmra_error,
+  "I/355/gaiadr3".pmDE AS pmdec,
+  "I/355/gaiadr3".e_pmDE AS pmdec_error
+FROM "I/355/gaiadr3"
+WHERE 1=CONTAINS(
+    POINT('ICRS', "I/355/gaiadr3".RA_ICRS, "I/355/gaiadr3".DE_ICRS),
+    CIRCLE('ICRS', {center.ra.deg:.8f}, {center.dec.deg:.8f}, {radius_deg:.8f})
+)
+{mag_where}
+        """.strip()
+        tap = TapPlus(url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap")
+        try:
+            job = tap.launch_job(adql)
+            tab = job.get_results()
+        except Exception as e:
+            raise RuntimeError(f"VizieR fallback query failed: {_exc_brief(e)}") from e
+        df = tab.to_pandas()
+        df.columns = [c.lower() for c in df.columns]
+        if "bp_rp" not in df.columns and "phot_bp_mean_mag" in df.columns and "phot_rp_mean_mag" in df.columns:
+            bp = pd.to_numeric(df["phot_bp_mean_mag"], errors="coerce")
+            rp = pd.to_numeric(df["phot_rp_mean_mag"], errors="coerce")
+            df["bp_rp"] = bp - rp
+        if "phot_g_mean_mag" in df.columns and np.isfinite(mag_max):
+            g = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce")
+            df = df[g.notna() & (g <= float(mag_max))]
+        return _coerce_source_id_int64(df)
 
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
@@ -694,10 +880,34 @@ class WcsWorker(QThread):
             job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
         except Exception as e:
-            raise RuntimeError(f"Gaia TAP async query failed: {_exc_brief(e)}") from e
+            err_str = str(e).lower()
+            if "ip" in err_str and any(w in err_str for w in ("disabled", "blocked", "banned", "heavy")):
+                cause = "IP_BANNED"
+            elif "404" in err_str or "job not found" in err_str:
+                cause = "SERVER_JOB_LOST"
+            elif any(c in err_str for c in ("503", "502", "500")):
+                cause = "SERVER_DOWN"
+            elif "timeout" in err_str or "timed out" in err_str:
+                cause = "TIMEOUT"
+            elif any(w in err_str for w in ("connection", "refused", "unreachable")):
+                cause = "NETWORK_ERROR"
+            else:
+                cause = "UNKNOWN"
+            # ESA down/blocked: auto-fallback to VizieR mirror
+            if cause in ("IP_BANNED", "SERVER_JOB_LOST", "SERVER_DOWN"):
+                try:
+                    df_viz = self._query_gaia_vizier(center, radius_deg, mag_max)
+                    df_viz.attrs["gaia_source"] = "vizier_fallback"
+                    return df_viz
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}; "
+                        f"VizieR fallback also failed: {_exc_brief(e2)}"
+                    ) from e
+            raise RuntimeError(f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
-        return tab.to_pandas()
+        return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
         step5_out = step5_dir(self.result_dir)
@@ -719,6 +929,67 @@ class WcsWorker(QThread):
         mag_max = float(getattr(self.params.P, "gaia_mag_max", 18.0))
         allow_no_cache = bool(getattr(self.params.P, "gaia_allow_no_cache", True))
 
+        def _cache_mag_max(df_in: pd.DataFrame, meta_in) -> float:
+            try:
+                if isinstance(meta_in, dict) and ("mag_max" in meta_in):
+                    v = float(meta_in.get("mag_max"))
+                    if np.isfinite(v):
+                        return v
+            except Exception:
+                pass
+            try:
+                if "phot_g_mean_mag" in df_in.columns:
+                    g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+                    if g.notna().any():
+                        return float(g.max())
+            except Exception:
+                pass
+            return np.nan
+
+        def _filter_cache_by_mag(df_in: pd.DataFrame) -> pd.DataFrame:
+            if not np.isfinite(mag_max):
+                return df_in
+            if "phot_g_mean_mag" not in df_in.columns:
+                return df_in
+            g = pd.to_numeric(df_in["phot_g_mean_mag"], errors="coerce")
+            keep = g.notna() & (g <= float(mag_max))
+            return df_in.loc[keep].copy()
+
+        def _cache_covers_field(df_in: pd.DataFrame, ctr: SkyCoord, rad_deg: float) -> bool:
+            """Guard against stale/misaligned Gaia caches that cover only part of the field."""
+            try:
+                ra = pd.to_numeric(df_in.get("ra"), errors="coerce")
+                dec = pd.to_numeric(df_in.get("dec"), errors="coerce")
+            except Exception:
+                return False
+            m = ra.notna() & dec.notna()
+            n = int(m.sum())
+            if n <= 0:
+                return False
+            if n < 50:
+                return True
+            ra_v = ra[m].to_numpy(float)
+            dec_v = dec[m].to_numpy(float)
+            cos_dec = float(np.cos(np.deg2rad(float(ctr.dec.deg))))
+            if not np.isfinite(cos_dec) or cos_dec <= 0:
+                cos_dec = 1.0
+            dx = (ra_v - float(ctr.ra.deg)) * cos_dec
+            dy = dec_v - float(ctr.dec.deg)
+            if dx.size == 0 or dy.size == 0:
+                return False
+            side_frac = 0.60 if n >= 200 else 0.45
+            need = float(rad_deg) * side_frac
+            min_x = float(np.nanmin(dx))
+            max_x = float(np.nanmax(dx))
+            min_y = float(np.nanmin(dy))
+            max_y = float(np.nanmax(dy))
+            return bool(
+                np.isfinite(min_x) and np.isfinite(max_x)
+                and np.isfinite(min_y) and np.isfinite(max_y)
+                and (min_x <= -need) and (max_x >= need)
+                and (min_y <= -need) and (max_y >= need)
+            )
+
         # 캐시 유효성 체크 - 좌표가 맞는지 확인
         cache_valid = False
         df_cache = None
@@ -735,18 +1006,25 @@ class WcsWorker(QThread):
                 cached_ra = float(meta.get("center_ra_deg", 0))
                 cached_dec = float(meta.get("center_dec_deg", 0))
                 cached_radius = float(meta.get("radius_deg", 0))
-                # 중심 좌표가 0.1도 이내이고 반경이 비슷하면 캐시 사용
+                cached_mag_max = _cache_mag_max(df_cache, meta)
                 dist_deg = np.hypot(center.ra.deg - cached_ra, center.dec.deg - cached_dec)
-                if dist_deg < 0.1 and cached_radius >= radius_deg * 0.9:
+                same_field = bool(dist_deg < 0.03 and cached_radius >= radius_deg * 0.9)
+                mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+                coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+                if same_field and mag_ok and coverage_ok:
                     cache_valid = True
             except Exception:
                 pass
         elif df_cache is not None:
             # 메타 파일이 없으면 일단 캐시 사용 (이전 버전 호환)
-            cache_valid = True
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            coverage_ok = _cache_covers_field(df_cache, center, radius_deg)
+            if mag_ok and coverage_ok:
+                cache_valid = True
 
         if cache_valid and df_cache is not None:
-            return df_cache, "cache"
+            return _filter_cache_by_mag(df_cache), "cache"
         if not _HAS_GAIA:
             if allow_no_cache:
                 return pd.DataFrame(), "no_gaia_module"
@@ -760,13 +1038,7 @@ class WcsWorker(QThread):
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
                 try:
-                    # Ensure source_id is stored as int64 (not float64) to preserve
-                    # 19-digit Gaia IDs; astropy may convert masked int→float in to_pandas()
-                    df_out = df.copy()
-                    if "source_id" in df_out.columns and not pd.api.types.is_integer_dtype(df_out["source_id"]):
-                        sid = coerce_int64_source_id(df_out["source_id"])
-                        df_out = df_out.loc[sid.notna()].copy()
-                        df_out["source_id"] = sid[sid.notna()].astype("int64")
+                    df_out = _coerce_source_id_int64(df.copy())
                     Table.from_pandas(df_out).write(cache_path, format="ascii.ecsv", overwrite=True)
                     # 메타데이터 저장
                     meta_path.write_text(json.dumps({
@@ -778,7 +1050,8 @@ class WcsWorker(QThread):
                     }, indent=2), encoding="utf-8")
                 except Exception:
                     pass
-                return df, "query"
+                gaia_src_tag = df.attrs.get("gaia_source", "query") if hasattr(df, "attrs") else "query"
+                return df, gaia_src_tag
             except Exception as e:
                 if self._stop_requested:
                     raise RuntimeError("stopped")
@@ -794,7 +1067,10 @@ class WcsWorker(QThread):
 
         df_cache = self._load_gaia_cache_if_ok(cache_path)
         if df_cache is not None:
-            return df_cache, "cache(after_fail)"
+            cached_mag_max = _cache_mag_max(df_cache, None)
+            mag_ok = (not np.isfinite(mag_max)) or (not np.isfinite(cached_mag_max)) or (cached_mag_max + 1e-6 >= mag_max)
+            if mag_ok:
+                return _filter_cache_by_mag(df_cache), "cache(after_fail)"
         if allow_no_cache:
             if last_err is None:
                 return pd.DataFrame(), "fail_no_cache:unknown"
@@ -1589,7 +1865,7 @@ class AstrometryNetWorker(QThread):
                 if need not in cols:
                     return None
             tab.rename_columns(tab.colnames, cols)
-            return tab.to_pandas()
+            return _coerce_source_id_int64(tab.to_pandas())
         except Exception:
             return None
 
@@ -1691,13 +1967,7 @@ class AstrometryNetWorker(QThread):
                 df = self._query_gaia(center, radius_deg, mag_max)
                 df.columns = [c.lower() for c in df.columns]
                 try:
-                    # Ensure source_id is stored as int64 (not float64) to preserve
-                    # 19-digit Gaia IDs; astropy may convert masked int→float in to_pandas()
-                    df_out = df.copy()
-                    if "source_id" in df_out.columns and not pd.api.types.is_integer_dtype(df_out["source_id"]):
-                        sid = coerce_int64_source_id(df_out["source_id"])
-                        df_out = df_out.loc[sid.notna()].copy()
-                        df_out["source_id"] = sid[sid.notna()].astype("int64")
+                    df_out = _coerce_source_id_int64(df.copy())
                     Table.from_pandas(df_out).write(cache_path, format="ascii.ecsv", overwrite=True)
                     meta_path.write_text(json.dumps({
                         "center_ra_deg": float(center.ra.deg),
@@ -1807,6 +2077,7 @@ class AstrometryNetWorker(QThread):
             "n_inlier": 0,
             "match_rate": np.nan,
             "match_rate_cat": np.nan,
+            "match_rate_eff": np.nan,
             "match_radius_arcsec": np.nan,
             "match_radius_px": np.nan,
             "dx_med_px": np.nan,
@@ -1937,6 +2208,7 @@ class AstrometryNetWorker(QThread):
         out["n_match"] = n_match
         out["match_rate"] = float(n_match / max(int(len(det_xy)), 1))
         out["match_rate_cat"] = float(n_match / max(int(len(gaia_xy)), 1))
+        out["match_rate_eff"] = float(max(out["match_rate"], out["match_rate_cat"]))
         if n_match == 0:
             return out
 
@@ -2120,8 +2392,19 @@ class AstrometryNetWorker(QThread):
         stem = fits_path.stem
         new_path = outdir / f"{stem}.new"
         solved_path = outdir / f"{stem}.solved"
-        if use_cache and new_path.exists() and solved_path.exists():
-            return True, 0.0, "cache_hit", "", [], new_path
+        wcs_path_out = outdir / f"{stem}.wcs"
+        sig_path = outdir / f"{stem}.input.json"
+        source_sig = build_file_signature(fits_path, use_cropped=bool(self.use_cropped))
+        if use_cache and new_path.exists() and (solved_path.exists() or wcs_path_out.exists()):
+            cache_ok = False
+            try:
+                if sig_path.exists():
+                    saved_sig = json.loads(sig_path.read_text(encoding="utf-8"))
+                    cache_ok = file_signature_matches_relaxed(saved_sig, source_sig)
+            except Exception:
+                cache_ok = False
+            if cache_ok:
+                return True, 0.0, "cache_hit", "", [], new_path
         for p in outdir.glob(f"{stem}.*"):
             try:
                 p.unlink()

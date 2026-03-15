@@ -38,6 +38,7 @@ from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step2_cropped_dir,
     crop_is_active,
+    crop_rect_path,
     step4_dir,
     step5_dir,
     step6_dir,
@@ -47,6 +48,14 @@ from ...utils.step_paths import (
 )
 from ...utils.qc_utils import filter_files_by_qc, filter_files_by_wcs_qc
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+from ...utils.cache_utils import (
+    norm_path_key,
+    build_file_signature,
+    file_signature_matches,
+    file_signature_matches_relaxed,
+    astap_wcs_candidates,
+    parse_astap_wcs_file,
+)
 
 
 def _safe_float(x, default=np.nan):
@@ -62,45 +71,6 @@ def _safe_float(x, default=np.nan):
 
 
 _DATE_RE = re.compile(r"(20\d{6})")
-
-
-def _astap_wcs_candidates(fits_path: Path) -> List[Path]:
-    return [
-        fits_path.with_suffix(".wcs"),
-        Path(str(fits_path) + ".wcs"),
-        fits_path.parent / (fits_path.stem + ".wcs"),
-        fits_path.parent / (fits_path.name + ".wcs"),
-    ]
-
-
-def _parse_astap_wcs_file(wcs_path: Path) -> dict:
-    d: Dict[str, object] = {}
-    try:
-        lines = wcs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return d
-    for ln in lines:
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        if "/" in s:
-            s = s.split("/", 1)[0].strip()
-        if "=" not in s:
-            continue
-        key, val = [t.strip() for t in s.split("=", 1)]
-        if not key:
-            continue
-        if val.startswith("'") and val.endswith("'"):
-            d[key] = val.strip("'")
-            continue
-        try:
-            if "." in val or "E" in val.upper():
-                d[key] = float(val)
-            else:
-                d[key] = int(val)
-        except Exception:
-            d[key] = val
-    return d
 
 
 def _parse_date_key(value: str, params) -> Optional[str]:
@@ -324,6 +294,10 @@ class IdMatchWorker(QThread):
         self._stop_requested = False
         self._log_file = None
         self._ref_cache: Dict[str, Tuple[np.ndarray, SkyCoord]] = {}
+        self._detect_csv_fallback_warned: set = set()
+        self._detect_csv_missing_warned: set = set()
+        self._detect_csv_invalid_warned: set = set()
+        self._detect_meta_fallback_warned: set = set()
 
     def stop(self):
         self._stop_requested = True
@@ -337,30 +311,115 @@ class IdMatchWorker(QThread):
             except Exception:
                 pass
 
+    def _current_file_signature(self, fname: str) -> Optional[dict]:
+        path = self._resolve_fits_path(fname)
+        if path is None or not path.exists():
+            return None
+        return build_file_signature(path, use_cropped=bool(crop_is_active(self.result_dir)))
+
+    def _detect_meta_compatible(self, fname: str, payload: dict, meta_path: Path) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        try:
+            schema = int(payload.get("cache_schema", 0) or 0)
+        except Exception:
+            schema = 0
+        if schema < 2:
+            return self._legacy_detect_cache_allowed(meta_path)
+        sig_now = self._current_file_signature(fname)
+        if sig_now is None:
+            return False
+        if file_signature_matches(payload, sig_now):
+            payload["__compat_relaxed_mtime"] = False
+            payload["__compat_relaxed_size"] = False
+            return True
+        if not file_signature_matches_relaxed(payload, sig_now):
+            return False
+        payload["__compat_relaxed_mtime"] = True
+        payload["__compat_relaxed_size"] = True
+        return True
+
+    def _legacy_detect_cache_allowed(self, marker_path: Path) -> bool:
+        try:
+            marker_mtime = int(marker_path.stat().st_mtime_ns)
+        except Exception:
+            return False
+        if crop_is_active(self.result_dir):
+            rect_path = crop_rect_path(self.result_dir)
+            if rect_path.exists():
+                try:
+                    rect_mtime = int(rect_path.stat().st_mtime_ns)
+                    if marker_mtime < rect_mtime:
+                        return False
+                except Exception:
+                    return False
+        return True
+
     def _load_meta(self, fname: str) -> dict:
-        meta_path = self.cache_dir / f"detect_{fname}.json"
-        if not meta_path.exists():
-            fallback = step4_dir(self.result_dir) / f"detect_{fname}.json"
-            if fallback.exists():
-                meta_path = fallback
-        if meta_path.exists():
+        candidates = [
+            self.cache_dir / f"detect_{fname}.json",
+            step4_dir(self.result_dir) / f"detect_{fname}.json",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        fallback_payload = None
+        for meta_path in candidates:
             try:
-                return json.loads(meta_path.read_text(encoding="utf-8"))
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
-                return {}
+                continue
+            if fallback_payload is None:
+                fallback_payload = payload
+            if self._detect_meta_compatible(fname, payload, meta_path):
+                return payload
+        if fallback_payload is not None:
+            if fname not in self._detect_meta_fallback_warned:
+                self._detect_meta_fallback_warned.add(fname)
+                self._log(
+                    f"[IDMATCH][QC] {fname}: using detection meta despite signature mismatch "
+                    f"(cache drift; re-run Step4 recommended)"
+                )
+            fallback_payload["__compat_fallback"] = True
+            return fallback_payload
         return {}
 
     def _resolve_detect_csv(self, fname: str) -> Optional[Path]:
-        cand = self.cache_dir / f"detect_{fname}.csv"
-        if cand.exists():
-            return cand
-        fallback = step4_dir(self.result_dir) / f"detect_{fname}.csv"
-        if fallback.exists():
-            return fallback
+        candidates = [
+            self.cache_dir / f"detect_{fname}.csv",
+            step4_dir(self.result_dir) / f"detect_{fname}.csv",
+        ]
+        candidates = [p for p in candidates if p.exists()]
+        candidates.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        fallback_candidate = None
+        for cand in candidates:
+            if fallback_candidate is None and cand.exists() and cand.stat().st_size > 0:
+                fallback_candidate = cand
+            meta_path = cand.with_suffix(".json")
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if self._detect_meta_compatible(fname, payload, meta_path):
+                    return cand
+        # Hard fallback: if compatibility checks fail but detect CSV exists, use it.
+        if fallback_candidate is not None:
+            if fname not in self._detect_csv_fallback_warned:
+                self._detect_csv_fallback_warned.add(fname)
+                self._log(
+                    f"[IDMATCH][QC] {fname}: using detection CSV despite incompatible meta "
+                    f"(cache signature drift; re-run Step4 recommended)"
+                )
+            return fallback_candidate
         return None
 
     def _load_detect_xy(self, fname: str) -> np.ndarray:
         p = self._resolve_detect_csv(fname)
+        if p is None:
+            if fname not in self._detect_csv_missing_warned:
+                self._detect_csv_missing_warned.add(fname)
+                self._log(f"[IDMATCH][QC] {fname}: detection CSV not found")
+            return np.zeros((0, 2), float)
         if p is not None and p.exists() and p.stat().st_size > 0:
             try:
                 df = pd.read_csv(p)
@@ -368,19 +427,33 @@ class IdMatchWorker(QThread):
                     xy = df[["x", "y"]].to_numpy(float)
                     xy = xy[np.isfinite(xy).all(axis=1)]
                     return xy
+                if fname not in self._detect_csv_invalid_warned:
+                    self._detect_csv_invalid_warned.add(fname)
+                    self._log(f"[IDMATCH][QC] {fname}: detection CSV has no valid x/y rows")
             except Exception:
-                pass
+                if fname not in self._detect_csv_invalid_warned:
+                    self._detect_csv_invalid_warned.add(fname)
+                    self._log(f"[IDMATCH][QC] {fname}: detection CSV read failed")
         return np.zeros((0, 2), float)
 
     def _resolve_fits_path(self, fname: str) -> Optional[Path]:
-        step5_out = step5_dir(self.result_dir)
-        cand = step5_out / fname
-        if cand.exists():
-            return cand
         if crop_is_active(self.result_dir):
             cand = step2_cropped_dir(self.result_dir) / fname
             if cand.exists():
                 return cand
+            legacy = self.result_dir / "cropped" / fname
+            if legacy.exists():
+                return legacy
+        try:
+            orig = Path(self.params.get_file_path(fname))
+            if orig.exists():
+                return orig
+        except Exception:
+            pass
+        step5_out = step5_dir(self.result_dir)
+        cand = step5_out / fname
+        if cand.exists():
+            return cand
         try:
             return Path(self.params.get_file_path(fname))
         except Exception:
@@ -403,10 +476,10 @@ class IdMatchWorker(QThread):
                 w = WCS(hdr, relax=True)
                 if w.has_celestial:
                     return w
-                for wcs_path in _astap_wcs_candidates(path):
+                for wcs_path in astap_wcs_candidates(path):
                     if not wcs_path.exists():
                         continue
-                    wcs_dict = _parse_astap_wcs_file(wcs_path)
+                    wcs_dict = parse_astap_wcs_file(wcs_path)
                     if not wcs_dict:
                         continue
                     hdr2 = fits.Header()

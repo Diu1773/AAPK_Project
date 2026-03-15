@@ -42,6 +42,9 @@ class FileManager:
         self.path_map: Dict[str, Path] = {}
         self.selected_dirs: List[Path] = []
         self.root_dir: Optional[Path] = None
+        # Night classification (populated by Step 1 after JD-gap classification)
+        self.night_assignments: Dict[str, int] = {}  # filename -> night_id (1-based)
+        self.excluded_nights: set = set()  # set of night_ids to exclude
 
     def set_multi_night_dirs(self, root_dir: Path, night_dirs: List[Path]) -> None:
         """Configure multi-night scanning with selected subdirectories."""

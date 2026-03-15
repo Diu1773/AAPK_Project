@@ -48,8 +48,19 @@ from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
 from ...utils.step_paths import step1_dir, step8_dir, step9_dir, step10_dir, step11_dir, legacy_step11_zeropoint_dir
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
-from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+from ...utils.io_utils import (
+    read_csv_int64_source_id,
+    coerce_int64_source_id,
+    load_night_assignments as _load_night_assignments_util,
+    load_headers_table as _load_headers_table_util,
+)
 from ...utils.qc_utils import load_frame_excludes
+from ...utils.astro_utils import compute_bjd_tdb_array
+
+
+def _load_night_assignments_from_disk(result_dir: Path) -> dict[str, int]:
+    """Load filename -> night_id from step1/night_assignments.json."""
+    return _load_night_assignments_util(result_dir)
 
 
 def _fmt_float(value, default: str = "") -> str:
@@ -80,15 +91,7 @@ def _parse_color_expr(expr: str | None) -> tuple[str, str] | None:
 
 
 def _load_headers_table(result_dir: Path) -> pd.DataFrame:
-    headers_path = step1_dir(result_dir) / "headers.csv"
-    if not headers_path.exists():
-        headers_path = result_dir / "headers.csv"
-    if not headers_path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(headers_path)
-    except Exception:
-        return pd.DataFrame()
+    return _load_headers_table_util(result_dir)
 
 
 def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> dict[int, int]:
@@ -168,7 +171,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.global_min_comps = 3
         self.global_sigma = 3.0
         self.global_iters = 3
-        self.global_rms_pct = 20.0
+        self.global_rms_pct = 10.0
         self.global_rms_threshold = 0.0
         self.global_frame_sigma = 3.0
         self.global_gauge = "meanZ0"
@@ -219,7 +222,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         # Hidden QLineEdit (used internally by load logic)
         self.target_edit = QLineEdit()
 
-        # Fix dataset to current result_dir (single entry)
+        # Fix base dataset to current result_dir
         rd = Path(self.params.P.result_dir)
         self.datasets = [(rd.name, rd)]
 
@@ -915,9 +918,16 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.raw_df["diff_mag_raw"] = pd.to_numeric(self.raw_df["diff_mag_raw"], errors="coerce")
         self.raw_df["airmass"] = pd.to_numeric(self.raw_df.get("airmass", np.nan), errors="coerce")
         self.raw_df["JD"] = pd.to_numeric(self.raw_df.get("JD", np.nan), errors="coerce")
+        # BJD_TDB가 있으면 JD 컬럼을 덮어쓰기 (위상/시간 분석 모두 BJD_TDB 기준)
+        if "BJD_TDB" in self.raw_df.columns:
+            bjd = pd.to_numeric(self.raw_df["BJD_TDB"], errors="coerce")
+            valid_bjd = bjd.notna() & np.isfinite(bjd)
+            if valid_bjd.any():
+                self.raw_df.loc[valid_bjd, "JD"] = bjd[valid_bjd]
         if "date" not in self.raw_df.columns:
             self.raw_df["date"] = "unknown"
         self._fill_date_from_jd()
+        self._fill_night_id()
         self._fill_airmass_from_headers()
 
         self._load_comp_selection()
@@ -1098,6 +1108,46 @@ class DetrendNightMergeWindow(StepWindowBase):
             if m:
                 d = m.group(1)
                 date_col[i] = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+        self.raw_df["date"] = date_col
+
+    def _fill_night_id(self) -> None:
+        """Fill night_id column from file_manager or disk, then overwrite date with 'Night N' labels."""
+        if self.raw_df.empty or "file" not in self.raw_df.columns:
+            return
+
+        # Already filled from step10 output?
+        has_night_id = "night_id" in self.raw_df.columns and self.raw_df["night_id"].notna().any()
+        night_id_map: dict[str, int] = {}
+
+        if has_night_id:
+            # Use existing column from step10 series
+            for fn, nid in zip(self.raw_df["file"].astype(str), pd.to_numeric(self.raw_df["night_id"], errors="coerce")):
+                if not pd.isna(nid) and int(nid) > 0:
+                    night_id_map[fn] = int(nid)
+
+        if not night_id_map:
+            fm = getattr(self, "file_manager", None)
+            if fm is not None:
+                night_id_map = dict(getattr(fm, "night_assignments", {}))
+
+        if not night_id_map and self.datasets:
+            for _label, rdir in self.datasets:
+                m = _load_night_assignments_from_disk(Path(rdir))
+                night_id_map.update(m)
+
+        if not night_id_map:
+            return
+
+        files = self.raw_df["file"].astype(str).tolist()
+        nids = [night_id_map.get(fn, 0) for fn in files]
+        self.raw_df["night_id"] = nids
+
+        # Overwrite date with "Night N" label for frames with a valid night_id
+        # so that cross-midnight observations stay in the same group
+        date_col = self.raw_df["date"].astype(str).to_numpy(object)
+        for i, nid in enumerate(nids):
+            if nid and int(nid) > 0:
+                date_col[i] = f"Night {int(nid)}"
         self.raw_df["date"] = date_col
 
     def _fill_airmass_from_headers(self) -> None:
@@ -1552,12 +1602,9 @@ class DetrendNightMergeWindow(StepWindowBase):
             return
         self.mode = mode
         is_global = mode == "global"
-        if hasattr(self, "color_map_group"):
-            self.color_map_group.setEnabled(not is_global)
-        if hasattr(self, "chk_global_k2"):
-            self.chk_global_k2.setEnabled(not is_global)
-        if hasattr(self, "mode_color"):
-            self.mode_color.setEnabled(True)
+        self.color_map_group.setEnabled(not is_global)
+        self.chk_global_k2.setEnabled(not is_global)
+        self.mode_color.setEnabled(True)
         if not self.raw_df.empty:
             self.corrected_df = pd.DataFrame()
             self.params_df = pd.DataFrame()
@@ -1635,7 +1682,7 @@ class DetrendNightMergeWindow(StepWindowBase):
                 self.color_status_label.setText("")
 
         fit_df = self.raw_df
-        use_global_k2 = self.chk_global_k2.isChecked() if hasattr(self, "chk_global_k2") else True
+        use_global_k2 = self.chk_global_k2.isChecked()
 
         # Color mode with global k'' fitting
         global_k2_by_filter: dict[str, tuple[float, float]] = {}
@@ -1800,6 +1847,46 @@ class DetrendNightMergeWindow(StepWindowBase):
         self._log_fit_summary()
         self._save_comprehensive_results()
 
+    def _apply_bjd_to_raw_df(self, target_id: int | None = None) -> None:
+        """Convert raw_df["JD"] (plain JD_UTC) to BJD_TDB in-place when possible."""
+        if self.raw_df.empty or "JD" not in self.raw_df.columns:
+            return
+        site_lat = float(getattr(self.params.P, "site_lat_deg", np.nan))
+        site_lon = float(getattr(self.params.P, "site_lon_deg", np.nan))
+        site_alt = float(getattr(self.params.P, "site_alt_m", 0.0))
+        if not (np.isfinite(site_lat) and np.isfinite(site_lon)):
+            return
+        # Target RA/Dec: try master_catalog first, then params
+        tgt_ra, tgt_dec = np.nan, np.nan
+        if target_id is not None and self.datasets:
+            result_dir = Path(self.datasets[0][1])
+            step8_out = step8_dir(result_dir)
+            for path in list(step8_out.glob("master_catalog_*.tsv")) + [step8_out / "master_catalog.tsv"]:
+                if not path.exists():
+                    continue
+                try:
+                    df_cat = read_csv_int64_source_id(path, sep="\t")
+                    row = df_cat[pd.to_numeric(df_cat.get("ID", pd.Series([])), errors="coerce") == int(target_id)]
+                    if not row.empty and "ra_deg" in df_cat.columns:
+                        tgt_ra = float(pd.to_numeric(row["ra_deg"].values[0], errors="coerce"))
+                        tgt_dec = float(pd.to_numeric(row["dec_deg"].values[0], errors="coerce"))
+                        if np.isfinite(tgt_ra) and np.isfinite(tgt_dec):
+                            break
+                except Exception:
+                    continue
+        if not np.isfinite(tgt_ra):
+            tgt_ra = float(getattr(getattr(self.params.P, "target", None), "ra_deg", np.nan) or np.nan)
+            tgt_dec = float(getattr(getattr(self.params.P, "target", None), "dec_deg", np.nan) or np.nan)
+        if not (np.isfinite(tgt_ra) and np.isfinite(tgt_dec)):
+            return
+        jd_arr = self.raw_df["JD"].to_numpy(float)
+        bjd_arr = compute_bjd_tdb_array(jd_arr, tgt_ra, tgt_dec, site_lat, site_lon, site_alt)
+        valid = np.isfinite(bjd_arr)
+        if valid.any():
+            self.raw_df.loc[valid, "JD"] = bjd_arr[valid]
+            delta = np.nanmedian(bjd_arr[valid] - jd_arr[valid]) * 86400
+            self.log(f"[BJD] JD → BJD_TDB applied ({valid.sum()} pts, median correction {delta:+.1f}s)")
+
     def _run_global_ensemble(self) -> None:
         try:
             df_global = self._load_global_ensemble_df()
@@ -1877,9 +1964,12 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.raw_df["JD"] = self.raw_df["jd"]
         if "JD" not in self.raw_df.columns:
             self.raw_df["JD"] = np.nan
+        # BJD_TDB 보정 (global ensemble jd는 plain JD이므로 여기서 변환)
+        self._apply_bjd_to_raw_df(target_id)
         if "date" not in self.raw_df.columns:
             self.raw_df["date"] = "unknown"
         self._fill_date_from_jd()
+        self._fill_night_id()
 
         self._populate_date_list()
         self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
@@ -2670,7 +2760,7 @@ class DetrendNightMergeWindow(StepWindowBase):
             "phase_cycles": self.phase_cycles,
             "color_map_by_filter": self.color_map_by_filter,
             "color_by": self.color_by,
-            "use_global_k2": self.chk_global_k2.isChecked() if hasattr(self, "chk_global_k2") else True,
+            "use_global_k2": self.chk_global_k2.isChecked(),
             "global_min_comps": self.global_min_comps,
             "global_sigma": self.global_sigma,
             "global_iters": self.global_iters,
@@ -2699,8 +2789,7 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.color_map_by_filter = self._normalize_color_map(state_data.get("color_map_by_filter", {}))
             self.color_by = state_data.get("color_by", self.color_by)
             use_global_k2 = state_data.get("use_global_k2", True)
-            if hasattr(self, "chk_global_k2"):
-                self.chk_global_k2.setChecked(bool(use_global_k2))
+            self.chk_global_k2.setChecked(bool(use_global_k2))
             self.global_min_comps = int(state_data.get("global_min_comps", self.global_min_comps))
             self.global_sigma = float(state_data.get("global_sigma", self.global_sigma))
             self.global_iters = int(state_data.get("global_iters", self.global_iters))

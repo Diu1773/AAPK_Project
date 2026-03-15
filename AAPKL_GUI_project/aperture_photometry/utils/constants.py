@@ -70,7 +70,13 @@ def get_parallel_workers(params=None) -> int:
     # Try to get from params
     if params is not None:
         try:
-            val = int(getattr(params.P, "max_workers", 0))
+            val = int(
+                getattr(
+                    params.P,
+                    "max_workers",
+                    getattr(params.P, "parallel_max_workers", 0),
+                )
+            )
             if val > 0:
                 return min(val, PARALLEL.MAX_WORKERS_CAP)
         except (AttributeError, TypeError, ValueError):
