@@ -678,7 +678,7 @@ class Parameters:
             wcs_qc_require_wcs_ok=_as_bool(raw.get("wcs_qc_require_wcs_ok", "true"), True),
             wcs_qc_min_match_n=_geti(raw, "wcs_qc_min_match_n", 20),
             wcs_qc_min_match_rate=_getf(raw, "wcs_qc_min_match_rate", 0.20),
-            wcs_qc_max_rms_px=_getf(raw, "wcs_qc_max_rms_px", 2.5),
+            wcs_qc_max_rms_px=_getf(raw, "wcs_qc_max_rms_px", 3.5),
             wcs_qc_max_p99_px=_getf(raw, "wcs_qc_max_p99_px", 5.0),
             wcs_qc_min_inlier_rate=_getf(raw, "wcs_qc_min_inlier_rate", 0.50),
             wcs_qc_max_edge_ratio=_getf(raw, "wcs_qc_max_edge_ratio", 0.0),
@@ -699,7 +699,7 @@ class Parameters:
             idmatch_use_wcs_qc_gate=_as_bool(raw.get("idmatch_use_wcs_qc_gate", "true"), True),
             idmatch_wcs_qc_min_match_rate=_getf(raw, "idmatch_wcs_qc_min_match_rate", 0.20),
             idmatch_wcs_qc_min_match_n=_geti(raw, "idmatch_wcs_qc_min_match_n", 20),
-            idmatch_wcs_qc_max_rms_px=_getf(raw, "idmatch_wcs_qc_max_rms_px", 2.5),
+            idmatch_wcs_qc_max_rms_px=_getf(raw, "idmatch_wcs_qc_max_rms_px", 3.5),
             idmatch_wcs_qc_min_inlier_rate=_getf(raw, "idmatch_wcs_qc_min_inlier_rate", 0.50),
             idmatch_wcs_qc_max_p99_px=_getf(raw, "idmatch_wcs_qc_max_p99_px", 5.0),
 

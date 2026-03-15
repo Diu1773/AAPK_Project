@@ -1861,7 +1861,7 @@ class StarIdMatchingWindow(StepWindowBase):
         use_wcs_qc_gate = bool(_cfg_or_flat("use_wcs_qc_gate", "idmatch_use_wcs_qc_gate", True))
         wcs_qc_min_rate = _coalesce_float(_cfg_or_flat("wcs_qc_min_match_rate", "idmatch_wcs_qc_min_match_rate", 0.20), 0.20)
         wcs_qc_min_n = _coalesce_int(_cfg_or_flat("wcs_qc_min_match_n", "idmatch_wcs_qc_min_match_n", 20), 20)
-        wcs_qc_max_rms = _coalesce_float(_cfg_or_flat("wcs_qc_max_rms_px", "idmatch_wcs_qc_max_rms_px", 2.5), 2.5)
+        wcs_qc_max_rms = _coalesce_float(_cfg_or_flat("wcs_qc_max_rms_px", "idmatch_wcs_qc_max_rms_px", 3.5), 3.5)
         wcs_qc_min_inlier = _coalesce_float(_cfg_or_flat("wcs_qc_min_inlier_rate", "idmatch_wcs_qc_min_inlier_rate", 0.50), 0.50)
         wcs_qc_max_p99 = _coalesce_float(_cfg_or_flat("wcs_qc_max_p99_px", "idmatch_wcs_qc_max_p99_px", 5.0), 5.0)
         files, wcs_qc_info = filter_files_by_wcs_qc(

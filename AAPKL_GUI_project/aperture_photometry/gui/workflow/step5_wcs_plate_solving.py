@@ -1843,6 +1843,52 @@ class AstrometryNetWorker(QThread):
         except Exception:
             return None
 
+    def _query_gaia_vizier(self, center: SkyCoord, radius_deg: float, mag_max: float):
+        """VizieR mirror fallback (Strasbourg CDS). Used when ESA server is unavailable/blocked."""
+        try:
+            from astroquery.utils.tap.core import TapPlus
+        except ImportError:
+            raise RuntimeError("astroquery.utils.tap not available")
+        mag_where = f'AND "I/355/gaiadr3".Gmag <= {mag_max:.4f}' if np.isfinite(mag_max) and mag_max > 0 else ""
+        adql = f"""
+SELECT
+  "I/355/gaiadr3".Source AS source_id,
+  "I/355/gaiadr3".RA_ICRS AS ra,
+  "I/355/gaiadr3".DE_ICRS AS dec,
+  "I/355/gaiadr3".Gmag AS phot_g_mean_mag,
+  "I/355/gaiadr3".BPmag AS phot_bp_mean_mag,
+  "I/355/gaiadr3".RPmag AS phot_rp_mean_mag,
+  "I/355/gaiadr3".RUWE AS ruwe,
+  "I/355/gaiadr3".Plx AS parallax,
+  "I/355/gaiadr3".e_Plx AS parallax_error,
+  "I/355/gaiadr3".pmRA AS pmra,
+  "I/355/gaiadr3".e_pmRA AS pmra_error,
+  "I/355/gaiadr3".pmDE AS pmdec,
+  "I/355/gaiadr3".e_pmDE AS pmdec_error
+FROM "I/355/gaiadr3"
+WHERE 1=CONTAINS(
+    POINT('ICRS', "I/355/gaiadr3".RA_ICRS, "I/355/gaiadr3".DE_ICRS),
+    CIRCLE('ICRS', {center.ra.deg:.8f}, {center.dec.deg:.8f}, {radius_deg:.8f})
+)
+{mag_where}
+        """.strip()
+        tap = TapPlus(url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap")
+        try:
+            job = tap.launch_job(adql)
+            tab = job.get_results()
+        except Exception as e:
+            raise RuntimeError(f"VizieR fallback query failed: {_exc_brief(e)}") from e
+        df = tab.to_pandas()
+        df.columns = [c.lower() for c in df.columns]
+        if "bp_rp" not in df.columns and "phot_bp_mean_mag" in df.columns and "phot_rp_mean_mag" in df.columns:
+            bp = pd.to_numeric(df["phot_bp_mean_mag"], errors="coerce")
+            rp = pd.to_numeric(df["phot_rp_mean_mag"], errors="coerce")
+            df["bp_rp"] = bp - rp
+        if "phot_g_mean_mag" in df.columns and np.isfinite(mag_max):
+            g = pd.to_numeric(df["phot_g_mean_mag"], errors="coerce")
+            df = df[g.notna() & (g <= float(mag_max))]
+        return _coerce_source_id_int64(df)
+
     def _query_gaia(self, center: SkyCoord, radius_deg: float, mag_max: float):
         if not _HAS_GAIA:
             raise RuntimeError("astroquery.gaia not available")
@@ -1861,27 +1907,43 @@ class AstrometryNetWorker(QThread):
     )
         """.strip()
         Gaia.ROW_LIMIT = -1
+        if self._stop_requested:
+            raise RuntimeError("stopped")
         try:
-            job = Gaia.launch_job(adql, dump_to_file=False)
+            job = Gaia.launch_job_async(adql, dump_to_file=False)
             tab = job.get_results()
-        except Exception as sync_err:
-            if self._stop_requested:
-                raise RuntimeError("stopped")
-            msg = str(sync_err).lower()
-            if ("404" in msg) or ("job" in msg and "not found" in msg):
-                try:
-                    job = Gaia.launch_job_async(adql, dump_to_file=False)
-                    tab = job.get_results()
-                except Exception as async_err:
-                    raise RuntimeError(
-                        "Gaia TAP query failed "
-                        f"(sync={_exc_brief(sync_err)}, async={_exc_brief(async_err)})"
-                    ) from async_err
+        except Exception as e:
+            err_str = str(e).lower()
+            if "ip" in err_str and any(w in err_str for w in ("disabled", "blocked", "banned", "heavy")):
+                cause = "IP_BANNED"
+            elif "404" in err_str or "job not found" in err_str:
+                cause = "SERVER_JOB_LOST"
+            elif any(c in err_str for c in ("503", "502", "500")):
+                cause = "SERVER_DOWN"
+            elif "timeout" in err_str or "timed out" in err_str:
+                cause = "TIMEOUT"
+            elif any(w in err_str for w in ("connection", "refused", "unreachable")):
+                cause = "NETWORK_ERROR"
             else:
-                raise RuntimeError(f"Gaia TAP sync query failed: {_exc_brief(sync_err)}") from sync_err
+                cause = "UNKNOWN"
+            if cause in ("IP_BANNED", "SERVER_JOB_LOST", "SERVER_DOWN"):
+                try:
+                    df_viz = self._query_gaia_vizier(center, radius_deg, mag_max)
+                    self.log_message.emit(
+                        f"[Gaia][WARN] ESA TAP failed [{cause}] → VizieR fallback 사용 (N={len(df_viz)}). "
+                        f"mag_max={mag_max:.2f}. WCS-QC match rate가 예상보다 낮을 수 있음."
+                    )
+                    df_viz.attrs["gaia_source"] = "vizier_fallback"
+                    return df_viz
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}; "
+                        f"VizieR fallback also failed: {_exc_brief(e2)}"
+                    ) from e
+            raise RuntimeError(f"Gaia TAP async query failed [{cause}]: {_exc_brief(e)}") from e
         if "phot_g_mean_mag" in tab.colnames and np.isfinite(mag_max):
             tab = tab[np.isfinite(tab["phot_g_mean_mag"]) & (tab["phot_g_mean_mag"] <= mag_max)]
-        return tab.to_pandas()
+        return _coerce_source_id_int64(tab.to_pandas())
 
     def _load_or_query_gaia(self, center: SkyCoord, radius_deg: float):
         step5_out = step5_dir(self.result_dir)

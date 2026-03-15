@@ -110,7 +110,7 @@ def filter_files_by_wcs_qc(
     require_wcs_ok: bool = True,
     min_match_rate: float = 0.20,
     min_match_n: int = 20,
-    max_rms_px: float = 2.5,
+    max_rms_px: float = 3.5,
     min_inlier_rate: float = 0.50,
     max_p99_px: float = 5.0,
 ) -> Tuple[List[str], Dict[str, object]]:

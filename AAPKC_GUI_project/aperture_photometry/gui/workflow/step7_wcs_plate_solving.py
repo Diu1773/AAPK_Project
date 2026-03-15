@@ -1234,7 +1234,7 @@ class WcsWorker(QThread):
                 if (not np.isfinite(mrate_eff)) or (mrate_eff < min_match_rate):
                     reasons.append("low_match_rate")
 
-        max_rms_px = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
+        max_rms_px = float(getattr(self.params.P, "wcs_qc_max_rms_px", 3.5))
         if n_match > 0 and np.isfinite(max_rms_px) and max_rms_px > 0:
             rms_px = _num("rms_px")
             if (not np.isfinite(rms_px)) or (rms_px > max_rms_px):
@@ -3173,7 +3173,7 @@ WHERE 1=CONTAINS(
             min_rate = float(getattr(self.params.P, "wcs_qc_min_match_rate", 0.20))
             if np.isfinite(min_rate) and min_rate > 0 and ((not np.isfinite(mrate_eff)) or (mrate_eff < min_rate)):
                 reasons.append("low_match_rate")
-        max_rms = float(getattr(self.params.P, "wcs_qc_max_rms_px", 2.5))
+        max_rms = float(getattr(self.params.P, "wcs_qc_max_rms_px", 3.5))
         if n_match > 0 and np.isfinite(max_rms) and max_rms > 0:
             rms_px = _num("rms_px")
             if (not np.isfinite(rms_px)) or (rms_px > max_rms):

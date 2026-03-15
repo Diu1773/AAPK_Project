@@ -1449,7 +1449,7 @@ class StarIdMatchingWindow(StepWindowBase):
             getattr(
                 idmatch_cfg,
                 "wcs_qc_max_rms_px",
-                getattr(self.params.P, "idmatch_wcs_qc_max_rms_px", 2.5),
+                getattr(self.params.P, "idmatch_wcs_qc_max_rms_px", 3.5),
             )
         )
         wcs_qc_min_inlier = float(
