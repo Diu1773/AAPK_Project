@@ -50,6 +50,7 @@ STEP12_CMD_DIRNAME     = "step12_cmd"
 STEP13_ISO_DIRNAME     = "step13_isochrone"
 # Old legacy fallback directories
 LEGACY_STEP5_WCS_DIRNAME      = "step5_wcs"         # pre-step7_wcs WCS output
+LEGACY_STEP7_WCS_DIRNAME      = STEP7_WCS_DIRNAME   # compatibility alias during renumbering
 LEGACY_STEP9_PHOT_DIRNAME     = "step9_photometry"  # old forced-phot
 LEGACY_STEP5_REFBUILD_DIRNAME = "step5_refbuild"     # very old refbuild
 LEGACY_STEP7_REFBUILD_DIRNAME = "step7_refbuild"     # old refbuild fallback

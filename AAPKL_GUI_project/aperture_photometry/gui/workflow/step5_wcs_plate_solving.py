@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import time
 import subprocess
+import tempfile
 import threading
 import warnings
 import shlex
@@ -94,6 +95,42 @@ def _coerce_source_id_int64(df: "pd.DataFrame") -> "pd.DataFrame":
     out = out.loc[valid].copy()
     out["source_id"] = sid.loc[valid].astype("int64")
     return out
+
+
+def _wsl_stage_fits(
+    fits_path: Path,
+    fits_arg: str,
+    win_to_wsl_path,
+) -> "tuple[Path | None, str, str, str | None]":
+    """Copy FITS to a WSL-accessible C: temp dir when the original drive is not mounted in WSL.
+
+    Returns (tmp_dir, new_fits_arg, new_outdir_arg, error_msg).
+    On success error_msg is None; caller must remove tmp_dir after use.
+    On failure tmp_dir is None and error_msg describes the problem.
+    """
+    try:
+        tmp_base = Path(tempfile.gettempdir())
+        if not (len(str(tmp_base)) >= 3 and str(tmp_base)[1] == ":" and str(tmp_base)[0].lower() == "c"):
+            raise RuntimeError(f"System temp is not on C: ({tmp_base}); cannot auto-stage for WSL")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="aapk_wcs_", dir=tmp_base))
+        staged = tmp_dir / fits_path.name
+        shutil.copy2(fits_path, staged)
+        new_fits_arg = win_to_wsl_path(staged)
+        new_outdir_arg = win_to_wsl_path(tmp_dir)
+        chk = subprocess.run(
+            ["wsl", "test", "-f", new_fits_arg],
+            capture_output=True, text=True, timeout=5.0,
+        )
+        if chk.returncode != 0:
+            raise RuntimeError("WSL still cannot access C: temp dir")
+        return tmp_dir, new_fits_arg, new_outdir_arg, None
+    except Exception as e:
+        return None, fits_arg, "", (
+            f"wsl_path_unavailable:{fits_arg} | "
+            f"Auto-staging to C:\\Temp failed ({e}). "
+            "Use ASTAP solver, or enable WSL drive auto-mount "
+            "(add [automount] enabled=true to /etc/wsl.conf and restart WSL)."
+        )
 
 
 class WcsWorker(QThread):
@@ -213,6 +250,8 @@ class WcsWorker(QThread):
         fits_arg = self._win_to_wsl_path(staged_path) if use_wsl else str(staged_path)
         if not staged_path.exists():
             return False, 0.0, "", f"input_missing:{staged_path}", cmd, None
+
+        _wsl_tmp_dir: Path | None = None  # C: staging dir; cleaned up after solve
         if use_wsl and cmd and str(cmd[0]).lower() == "wsl":
             try:
                 chk = subprocess.run(
@@ -222,12 +261,13 @@ class WcsWorker(QThread):
                     timeout=5.0,
                 )
                 if chk.returncode != 0:
-                    err_msg = (
-                        f"wsl_path_unavailable:{fits_arg} | "
-                        "WSL cannot read this file path. Use ASTAP solver or move data to a local "
-                        "drive/folder that WSL can access (e.g. C:) and rerun."
+                    # Drive not mounted in WSL — stage to C: temp dir instead
+                    _wsl_tmp_dir, fits_arg, outdir_arg, err_msg = _wsl_stage_fits(
+                        fits_path, fits_arg, self._win_to_wsl_path
                     )
-                    return False, 0.0, "", err_msg, cmd, None
+                    if err_msg is not None:
+                        return False, 0.0, "", err_msg, cmd, None
+                    staged_path = _wsl_tmp_dir / fits_path.name
             except FileNotFoundError:
                 return (
                     False,
@@ -239,6 +279,22 @@ class WcsWorker(QThread):
                 )
             except Exception:
                 pass
+
+        def _cleanup_tmp():
+            if _wsl_tmp_dir and _wsl_tmp_dir.exists():
+                shutil.rmtree(_wsl_tmp_dir, ignore_errors=True)
+
+        def _copy_results_from_tmp():
+            """Copy solve-field outputs from C: temp staging dir back to original outdir."""
+            if _wsl_tmp_dir is None:
+                return
+            for f in _wsl_tmp_dir.iterdir():
+                if f.name == fits_path.name:
+                    continue  # skip the input FITS copy
+                try:
+                    shutil.copy2(f, outdir / f.name)
+                except Exception:
+                    pass
 
         cmd += [
             "--dir", outdir_arg,
@@ -267,6 +323,7 @@ class WcsWorker(QThread):
             start = time.time()
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
             dt = time.time() - start
+            _copy_results_from_tmp()
             # Some solve-field builds return non-zero even when solution artifacts are created.
             # Prefer artifact existence over process return code.
             wcs_path_check = outdir / f"{stem}.wcs"
@@ -281,6 +338,7 @@ class WcsWorker(QThread):
                     staged_path.unlink()
                 except Exception:
                     pass
+            _cleanup_tmp()
             return ok, dt, cp.stdout, cp.stderr, cmd, new_path
         except subprocess.TimeoutExpired as e:
             if staged_path != fits_path:
@@ -288,6 +346,7 @@ class WcsWorker(QThread):
                     staged_path.unlink()
                 except Exception:
                     pass
+            _cleanup_tmp()
             out_s = e.stdout or ""
             err_s = e.stderr or ""
             err_msg = "timeout"
@@ -301,6 +360,7 @@ class WcsWorker(QThread):
                     staged_path.unlink()
                 except Exception:
                     pass
+            _cleanup_tmp()
             return False, 0.0, "", str(e), cmd, None
 
     def _try_ingest_wcs(self, fits_path: Path, hdr: fits.Header) -> bool:
@@ -2430,6 +2490,8 @@ class AstrometryNetWorker(QThread):
         fits_arg = self._win_to_wsl_path(staged_path) if use_wsl else str(staged_path)
         if not staged_path.exists():
             return False, 0.0, "", f"input_missing:{staged_path}", cmd, None
+
+        _wsl_tmp_dir: Path | None = None  # C: staging dir; cleaned up after solve
         if use_wsl and cmd and str(cmd[0]).lower() == "wsl":
             try:
                 chk = subprocess.run(
@@ -2439,12 +2501,13 @@ class AstrometryNetWorker(QThread):
                     timeout=5.0,
                 )
                 if chk.returncode != 0:
-                    err_msg = (
-                        f"wsl_path_unavailable:{fits_arg} | "
-                        "WSL cannot read this file path. Use ASTAP solver or move data to a local "
-                        "drive/folder that WSL can access (e.g. C:) and rerun."
+                    # Drive not mounted in WSL — stage to C: temp dir instead
+                    _wsl_tmp_dir, fits_arg, outdir_arg, err_msg = _wsl_stage_fits(
+                        fits_path, fits_arg, self._win_to_wsl_path
                     )
-                    return False, 0.0, "", err_msg, cmd, None
+                    if err_msg is not None:
+                        return False, 0.0, "", err_msg, cmd, None
+                    staged_path = _wsl_tmp_dir / fits_path.name
             except FileNotFoundError:
                 return (
                     False,
@@ -2456,6 +2519,21 @@ class AstrometryNetWorker(QThread):
                 )
             except Exception:
                 pass
+
+        def _cleanup_tmp():
+            if _wsl_tmp_dir and _wsl_tmp_dir.exists():
+                shutil.rmtree(_wsl_tmp_dir, ignore_errors=True)
+
+        def _copy_results_from_tmp():
+            if _wsl_tmp_dir is None:
+                return
+            for f in _wsl_tmp_dir.iterdir():
+                if f.name == fits_path.name:
+                    continue
+                try:
+                    shutil.copy2(f, outdir / f.name)
+                except Exception:
+                    pass
 
         cmd += [
             "--dir", outdir_arg,
@@ -2511,6 +2589,7 @@ class AstrometryNetWorker(QThread):
                             staged_path.unlink()
                         except Exception:
                             pass
+                    _cleanup_tmp()
                     err_msg = "stopped"
                     err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
                     if err_tail:
@@ -2538,6 +2617,7 @@ class AstrometryNetWorker(QThread):
                             staged_path.unlink()
                         except Exception:
                             pass
+                    _cleanup_tmp()
                     err_msg = "timeout"
                     err_tail = _tail_text(stderr_s, limit=1000, max_lines=10)
                     if err_tail:
@@ -2554,14 +2634,17 @@ class AstrometryNetWorker(QThread):
 
             dt = time.time() - start
             rc = int(proc.returncode if proc.returncode is not None else -998)
+            _copy_results_from_tmp()
             ok = (rc == 0 and new_path.exists() and solved_path.exists())
             if staged_path != fits_path:
                 try:
                     staged_path.unlink()
                 except Exception:
                     pass
+            _cleanup_tmp()
             return ok, dt, stdout_s, stderr_s, cmd, new_path
         except Exception as e:
+            _cleanup_tmp()
             return False, 0.0, "", str(e), cmd, None
 
     def _safe_header_update(self, fits_path: Path, new_hdr: fits.Header) -> None:

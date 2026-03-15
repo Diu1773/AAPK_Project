@@ -456,7 +456,8 @@ class Step6PSFWorker(QThread):
                 self._log("PSF fit mode: iterative 'new' (grouper off; photutils 2.3 requires grouper for mode='all')")
             self._log(
                 f"PSF scales | epsf_cutout={epsf_size_fwhm_mult:.2f}xFWHM | "
-                f"fit_window={fit_shape_fwhm_mult:.2f}xFWHM"
+                f"fit_window={fit_shape_fwhm_mult:.2f}xFWHM | "
+                "subtract_window≈2xEPSF"
             )
 
             frames = list(self.file_list)
@@ -526,6 +527,11 @@ class Step6PSFWorker(QThread):
                 )
                 if fit_shape_frame >= epsf_size_frame:
                     fit_shape_frame = _odd_int(max(3, epsf_size_frame - 4), min_value=3, max_value=31)
+                render_shape_frame = _odd_int(
+                    max(float(epsf_size_frame) * 2.0, float(fit_shape_frame)),
+                    min_value=11,
+                    max_value=201,
+                )
 
                 epsf_cache_key = this_filter if use_shared_filter_epsf else f"{this_filter}:{fname}"
                 h, w = img.shape
@@ -1031,7 +1037,7 @@ class Step6PSFWorker(QThread):
 
                     ap_rad = max(int(round(fwhm_safe * 2.0)), fit_shape_frame // 2 + 1)
 
-                    def _build_iterative_phot(with_grouper: bool):
+                    def _build_iterative_phot(with_grouper: bool, n_seed: int):
                         from photutils.psf import IterativePSFPhotometry
                         import inspect as _ins
                         psf_m = _clone_psf_model(epsf_model)
@@ -1049,9 +1055,9 @@ class Step6PSFWorker(QThread):
                             # mode='new' (default): iter1 fits all, iter2+ only new sources — fast
                             # mode='all': every iteration refits ALL sources — accurate but O(n×iter)
                             #   → can be slow for large fields; a performance warning is logged
-                            if fit_mode_cfg == "all" and len(init_params) > 800:
+                            if fit_mode_cfg == "all" and n_seed > 800:
                                 self._log(
-                                    f"  [PSF] fit_mode='all' | {len(init_params)} sources "
+                                    f"  [PSF] fit_mode='all' | {n_seed} sources "
                                     "— expect significantly slower fitting"
                                 )
                             kw["mode"] = fit_mode_cfg
@@ -1061,8 +1067,133 @@ class Step6PSFWorker(QThread):
                             )
                         return IterativePSFPhotometry(**kw)
 
+                    def _results_to_init_params(results_tbl, photometry_obj=None):
+                        if results_tbl is None or len(results_tbl) == 0:
+                            return None
+                        if photometry_obj is not None and hasattr(photometry_obj, "results_to_init_params"):
+                            try:
+                                tbl = photometry_obj.results_to_init_params()
+                                if tbl is not None and len(tbl) > 0:
+                                    return tbl
+                            except Exception as _ri:
+                                self._log(f"  [PSF] results_to_init_params fallback: {_ri}")
+                        try:
+                            cols = list(results_tbl.colnames)
+                            x_col = "x_fit" if "x_fit" in cols else ("x_0" if "x_0" in cols else None)
+                            y_col = "y_fit" if "y_fit" in cols else ("y_0" if "y_0" in cols else None)
+                            f_col = next((c for c in ("flux_fit", "flux", "flux_0") if c in cols), None)
+                            if x_col is None or y_col is None or f_col is None:
+                                return None
+                            x_arr = np.asarray(results_tbl[x_col], dtype=float)
+                            y_arr = np.asarray(results_tbl[y_col], dtype=float)
+                            f_arr = np.asarray(results_tbl[f_col], dtype=float)
+                            keep = (
+                                np.isfinite(x_arr) &
+                                np.isfinite(y_arr) &
+                                np.isfinite(f_arr) &
+                                (f_arr > 0)
+                            )
+                            if not np.any(keep):
+                                return None
+                            return AstropyTable({
+                                "x_0": x_arr[keep],
+                                "y_0": y_arr[keep],
+                                "flux_0": f_arr[keep],
+                            })
+                        except Exception:
+                            return None
+
+                    def _run_iterative_fit(seed_params, stage_label: str):
+                        fit_reason = None
+                        fit_photometry = None
+                        fit_results = None
+                        for _attempt, _use_grouper in enumerate(attempt_plan):
+                            if self._stop_requested:
+                                return None, None, "stopped"
+                            try:
+                                fit_photometry = _build_iterative_phot(
+                                    with_grouper=_use_grouper,
+                                    n_seed=len(seed_params),
+                                )
+                                if _attempt == 1:
+                                    self._log(
+                                        f"  [PSF] {stage_label} retry without SourceGrouper (fallback)"
+                                    )
+                                call_kw = {"init_params": seed_params}
+                                if error_img is not None:
+                                    call_kw["error"] = error_img
+                                fit_results = fit_photometry(img_sub, **call_kw)
+                                fit_reason = None
+                                break
+                            except RecursionError as _re:
+                                self._log(
+                                    f"  [PSF] {stage_label} RecursionError with grouper "
+                                    f"(photutils<2.3 compound-model bug): {_re}. Retrying without grouper."
+                                )
+                                fit_reason = str(_re)
+                                if _attempt + 1 < len(attempt_plan):
+                                    continue
+                            except Exception as _fe:
+                                fit_reason = str(_fe)
+                                self._log(
+                                    f"  [PSF] {stage_label} fit failed (attempt {_attempt+1}): {fit_reason}"
+                                )
+                                if _attempt + 1 < len(attempt_plan):
+                                    continue
+                                break
+                        return fit_photometry, fit_results, fit_reason
+
+                    def _render_model_from_results(results_tbl, photometry_obj=None):
+                        if results_tbl is None or len(results_tbl) == 0:
+                            return None
+                        try:
+                            cols = list(results_tbl.colnames)
+                            x_col = "x_fit" if "x_fit" in cols else ("x_0" if "x_0" in cols else None)
+                            y_col = "y_fit" if "y_fit" in cols else ("y_0" if "y_0" in cols else None)
+                            f_col = next((c for c in ("flux_fit", "flux", "flux_0") if c in cols), None)
+                            if x_col is None or y_col is None or f_col is None:
+                                return None
+                            x_arr = np.asarray(results_tbl[x_col], dtype=float)
+                            y_arr = np.asarray(results_tbl[y_col], dtype=float)
+                            f_arr = np.asarray(results_tbl[f_col], dtype=float)
+                            keep = (
+                                np.isfinite(x_arr) &
+                                np.isfinite(y_arr) &
+                                np.isfinite(f_arr) &
+                                (f_arr > 0)
+                            )
+                            if not np.any(keep):
+                                return None
+                            from photutils.datasets import make_model_image as _make_model_image
+                            pt = AstropyTable()
+                            pt["x_0"] = np.asarray(x_arr[keep], dtype=float)
+                            pt["y_0"] = np.asarray(y_arr[keep], dtype=float)
+                            pt["flux"] = np.asarray(f_arr[keep], dtype=float)
+                            out = _make_model_image(
+                                img_sub.shape,
+                                _clone_psf_model(epsf_model),
+                                pt,
+                                model_shape=(int(render_shape_frame), int(render_shape_frame)),
+                                x_name="x_0",
+                                y_name="y_0",
+                            )
+                            return np.asarray(out, dtype=np.float32)
+                        except Exception as _re:
+                            self._log(f"  [DIAG] wide model render failed: {_re}")
+                            if photometry_obj is not None:
+                                try:
+                                    out = photometry_obj.make_model_image(
+                                        img_sub.shape,
+                                        psf_shape=(int(render_shape_frame), int(render_shape_frame)),
+                                    )
+                                    return np.asarray(out, dtype=np.float32)
+                                except Exception as _pe:
+                                    self._log(f"  [DIAG] make_model_image fallback failed: {_pe}")
+                        return None
+
                     fit_fail_reason = None
                     phot_result = None
+                    photometry = None
                     model_img = None
 
                     self.progress.emit(completed[0], total, f"FIT | {fname}")
@@ -1070,33 +1201,37 @@ class Step6PSFWorker(QThread):
                     attempt_plan = [False]
                     if use_grouper and _has_grouper:
                         attempt_plan = [True, False]
-                    for _attempt, _use_grouper in enumerate(attempt_plan):
-                        if self._stop_requested:
-                            return {"file": fname, "status": "stopped"}
-                        try:
-                            photometry = _build_iterative_phot(with_grouper=_use_grouper)
-                            if _attempt == 1:
-                                self._log("  [PSF] Retry without SourceGrouper (fallback)")
-                            call_kw = {"init_params": init_params}
-                            if error_img is not None:
-                                call_kw["error"] = error_img
-                            phot_result = photometry(img_sub, **call_kw)
-                            fit_fail_reason = None
-                            break
-                        except RecursionError as _re:
-                            self._log(
-                                f"  [PSF] RecursionError with grouper (photutils<2.3 compound-model bug): {_re}. "
-                                "Retrying without grouper."
-                            )
-                            fit_fail_reason = str(_re)
-                            if _attempt + 1 < len(attempt_plan):
-                                continue
-                        except Exception as _fe:
-                            fit_fail_reason = str(_fe)
-                            self._log(f"  [PSF] fit failed (attempt {_attempt+1}): {fit_fail_reason}")
-                            if _attempt + 1 < len(attempt_plan):
-                                continue
-                            break
+                    photometry, phot_result, fit_fail_reason = _run_iterative_fit(init_params, "pass1")
+                    if fit_fail_reason == "stopped":
+                        return {"file": fname, "status": "stopped"}
+                    refine_pass_max_sources = 2500
+                    if phot_result is not None and len(phot_result) > 0:
+                        refine_init = _results_to_init_params(phot_result, photometry_obj=photometry)
+                        if refine_init is not None and len(refine_init) > 0:
+                            if len(refine_init) <= refine_pass_max_sources:
+                                photometry_refine, phot_result_refine, refine_reason = _run_iterative_fit(
+                                    refine_init,
+                                    "pass2",
+                                )
+                                if refine_reason == "stopped":
+                                    return {"file": fname, "status": "stopped"}
+                                if phot_result_refine is not None and len(phot_result_refine) > 0:
+                                    self._log(
+                                        f"  [PSF] refine pass accepted | seed={len(refine_init)} "
+                                        f"fit={len(phot_result_refine)}"
+                                    )
+                                    photometry = photometry_refine
+                                    phot_result = phot_result_refine
+                                    fit_fail_reason = None
+                                elif refine_reason:
+                                    self._log(
+                                        f"  [PSF] refine pass failed; keeping pass1 solution | {refine_reason}"
+                                    )
+                            else:
+                                self._log(
+                                    f"  [PSF] refine pass skipped | seed={len(refine_init)} "
+                                    f"> {refine_pass_max_sources}"
+                                )
 
                     raw_iter_counts: dict[int, int] = {}
                     n_new_raw_total = 0
@@ -1278,17 +1413,15 @@ class Step6PSFWorker(QThread):
                     # ── Model image & residual ────────────────────────────────────────────
                     residual = img_sub.copy()
                     if phot_result is not None and len(phot_result) > 0:
-                        try:
-                            model_img = photometry.make_model_image(img_sub.shape)
+                        model_img = _render_model_from_results(phot_result, photometry_obj=photometry)
+                        if model_img is not None:
                             residual = img_sub - model_img
                             self._log(
                                 f"  [DIAG] model_img sum={float(np.nansum(model_img)):.2f} "
                                 f"peak={float(np.nanmax(model_img)):.2f} | "
-                                f"img_sub peak={float(np.nanmax(img_sub)):.2f}"
+                                f"img_sub peak={float(np.nanmax(img_sub)):.2f} | "
+                                f"subtract_shape={render_shape_frame}"
                             )
-                        except Exception as _me:
-                            self._log(f"  [DIAG] make_model_image failed: {_me}")
-                            model_img = None
 
                     _, _, res_std = sigma_clipped_stats(residual, sigma=3.0, maxiters=3)
 
@@ -1366,11 +1499,6 @@ class Step6PSFWorker(QThread):
                             # fit_shape covers only the PSF core; residual subtraction
                             # needs the wings too.  Use 2× epsf_size so the rendered
                             # stamp captures flux out to ~4×FWHM from each source.
-                            render_shape = _odd_int(
-                                max(float(epsf_size_frame) * 2.0, float(fit_shape_frame)),
-                                min_value=11,
-                                max_value=201,
-                            )
                             pt = AstropyTable()
                             pt["x_0"] = np.asarray(xy_sub[:, 0], dtype=float)
                             pt["y_0"] = np.asarray(xy_sub[:, 1], dtype=float)
@@ -1380,7 +1508,7 @@ class Step6PSFWorker(QThread):
                                 img_sub.shape,
                                 mod,
                                 pt,
-                                model_shape=(int(render_shape), int(render_shape)),
+                                model_shape=(int(render_shape_frame), int(render_shape_frame)),
                                 x_name="x_0",
                                 y_name="y_0",
                             )
