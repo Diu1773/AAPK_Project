@@ -1574,6 +1574,7 @@ class StarIdMatchingWindow(StepWindowBase):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(files))
         self.progress_label.setText(f"0/{len(files)} | Starting...")
+        self._idmatch_start_time = time.monotonic()
         self.worker.start()
         self.show_log_window()
 
@@ -1583,7 +1584,15 @@ class StarIdMatchingWindow(StepWindowBase):
 
     def on_progress(self, current, total, filename):
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{current}/{total} | {filename}")
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_idmatch_start_time"):
+            elapsed = time.monotonic() - self._idmatch_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.progress_label.setText(f"{current}/{total}{eta_str} | {filename}")
 
     def on_file_done(self, filename, stat):
         self.results[filename] = stat

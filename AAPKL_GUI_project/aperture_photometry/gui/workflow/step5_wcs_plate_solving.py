@@ -3328,6 +3328,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.btn_stop_astrometrynet.setEnabled(True)
         self.astrometrynet_progress.setValue(0)
         self.astrometrynet_status.setText("Starting local astrometry.net...")
+        self._astnet_start_time = time.monotonic()
         self.log("=" * 50)
         self.log("Starting local astrometry.net (solve-field) plate solving...")
         self.log(f"Frames: {len(file_list)}")
@@ -3344,7 +3345,15 @@ class WcsPlateSolvingWindow(StepWindowBase):
     def on_astrometrynet_progress(self, current, total, status):
         pct = int(100 * current / max(1, total))
         self.astrometrynet_progress.setValue(pct)
-        self.astrometrynet_status.setText(status)
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_astnet_start_time"):
+            elapsed = time.monotonic() - self._astnet_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.astrometrynet_status.setText(f"{status}{eta_str}")
 
     def on_astrometrynet_file_done(self, filename, result):
         row = self.astrometrynet_results_table.rowCount()
@@ -3762,6 +3771,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(self.file_list))
         self.progress_label.setText(f"0/{len(self.file_list)} | Starting...")
+        self._wcs_start_time = time.monotonic()
         self.worker.start()
         self.show_log_window()
 
@@ -3775,7 +3785,15 @@ class WcsPlateSolvingWindow(StepWindowBase):
 
     def on_progress(self, current, total, filename):
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{current}/{total} | {filename}")
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_wcs_start_time"):
+            elapsed = time.monotonic() - self._wcs_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.progress_label.setText(f"{current}/{total}{eta_str} | {filename}")
 
     def on_file_done(self, filename, result):
         self.results[filename] = result

@@ -1301,6 +1301,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_progress_bar.setValue(0)
         self.apcorr_progress_bar.setMaximum(len(self.file_list))
         self.apcorr_status_label.setText("Running Apcorr...")
+        self._apcorr_start_time = time.monotonic()
         self.apcorr_worker.start()
 
     def stop_apcorr(self):
@@ -1311,7 +1312,15 @@ class ForcedPhotometryWindow(StepWindowBase):
     def _on_apcorr_progress(self, current: int, total: int, msg: str):
         self.apcorr_progress_bar.setMaximum(max(total, 1))
         self.apcorr_progress_bar.setValue(current)
-        self.apcorr_status_label.setText(msg)
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_apcorr_start_time"):
+            elapsed = time.monotonic() - self._apcorr_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.apcorr_status_label.setText(f"{msg}{eta_str}")
 
     def _on_apcorr_finished(self, result: dict):
         self.btn_run_apcorr.setEnabled(True)
@@ -1370,6 +1379,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(len(self.file_list))
         self.progress_label.setText(f"0/{len(self.file_list)} | Starting...")
+        self._phot_start_time = time.monotonic()
         self.worker.start()
         self.show_log_window()
 
@@ -1379,7 +1389,15 @@ class ForcedPhotometryWindow(StepWindowBase):
 
     def on_progress(self, current, total, filename):
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{current}/{total} | {filename}")
+        eta_str = ""
+        if current > 0 and total > 0 and hasattr(self, "_phot_start_time"):
+            elapsed = time.monotonic() - self._phot_start_time
+            remaining = elapsed / current * (total - current)
+            if remaining < 60:
+                eta_str = f" | ETA {int(remaining)}s"
+            else:
+                eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
+        self.progress_label.setText(f"{current}/{total}{eta_str} | {filename}")
 
     def on_frame_done(self, filename, result):
         if not hasattr(self, "frame_table"):
