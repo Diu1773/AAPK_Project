@@ -1969,6 +1969,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if self._imshow_obj is not None and not full_redraw:
             self._imshow_obj.set_data(stretched)
+            self.ax.set_title(f"{self.current_filename} | {self.current_filter}")
             self.canvas.draw_idle()
             return
 
