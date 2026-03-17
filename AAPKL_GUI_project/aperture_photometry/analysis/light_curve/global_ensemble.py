@@ -298,6 +298,7 @@ def _solve_one_filter(
         target_df,
         comp_df,
         zp_df,
+        mean_df,
         min_comps=min_comps,
         normalize_target=normalize_target,
     )
@@ -464,6 +465,7 @@ def _build_target_lc(
     target_df: pd.DataFrame,
     comp_df: pd.DataFrame,
     zp_df: pd.DataFrame,
+    mean_df: pd.DataFrame,
     min_comps: int,
     normalize_target: bool,
 ) -> pd.DataFrame:
@@ -481,6 +483,24 @@ def _build_target_lc(
     comp_mean = comp_df.groupby("time_id").apply(_weighted_mean, include_groups=False)
     comp_n = comp_df.groupby("time_id")["mag_inst"].count()
 
+    comp_ref = np.nan
+    if mean_df is not None and not mean_df.empty:
+        ref = mean_df.copy()
+        ref["M"] = pd.to_numeric(ref.get("M"), errors="coerce")
+        ref["M_err"] = pd.to_numeric(ref.get("M_err"), errors="coerce")
+        ref["n_used"] = pd.to_numeric(ref.get("n_used"), errors="coerce")
+        ref = ref[np.isfinite(ref["M"])].copy()
+        if not ref.empty:
+            w = np.where(
+                np.isfinite(ref["M_err"]) & (ref["M_err"] > 0),
+                1.0 / np.square(ref["M_err"].to_numpy(float)),
+                ref["n_used"].fillna(1.0).to_numpy(float),
+            )
+            if np.any(np.isfinite(w) & (w > 0)):
+                comp_ref = float(np.average(ref["M"].to_numpy(float), weights=np.where(np.isfinite(w) & (w > 0), w, 1.0)))
+            else:
+                comp_ref = float(np.nanmean(ref["M"].to_numpy(float)))
+
     lc = target_df.copy()
     lc = lc.rename(columns={"mag_inst": "mag"})
     lc["diff_mag_raw"] = lc["mag"] - lc["time_id"].map(comp_mean)
@@ -488,7 +508,12 @@ def _build_target_lc(
 
     zp_map = zp_df.set_index("time_id")["Z"]
     zp_err_map = zp_df.set_index("time_id")["Z_err"]
-    lc["diff_mag_corr"] = lc["mag"] - lc["time_id"].map(zp_map)
+    lc["mag_ensemble_corr"] = lc["mag"] - lc["time_id"].map(zp_map)
+    lc["comp_ref_mean"] = comp_ref
+    if np.isfinite(comp_ref):
+        lc["diff_mag_corr"] = lc["mag_ensemble_corr"] - comp_ref
+    else:
+        lc["diff_mag_corr"] = lc["mag_ensemble_corr"]
     lc["diff_err_corr"] = np.sqrt(
         np.square(lc["err"].to_numpy(float)) + np.square(lc["time_id"].map(zp_err_map).to_numpy(float))
     )
@@ -506,6 +531,8 @@ def _build_target_lc(
             "filter",
             "star_id",
             "mag",
+            "mag_ensemble_corr",
+            "comp_ref_mean",
             "diff_mag_raw",
             "diff_mag_corr",
             "diff_err",

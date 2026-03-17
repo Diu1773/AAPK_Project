@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,6 +17,7 @@ from astropy.time import Time
 from astropy.io import fits
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 from PyQt5.QtWidgets import (
@@ -45,9 +47,9 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QColor
-from PyQt5.QtWidgets import QShortcut, QStyle, QStyleOptionSlider
+from PyQt5.QtWidgets import QShortcut, QStyle, QStyleOptionSlider, QSplitter, QProgressBar
 
 from .step_window_base import StepWindowBase
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
@@ -57,6 +59,23 @@ from ...utils.io_utils import (
     load_night_assignments as _load_night_assignments_util,
     load_headers_table as _load_headers_table_util,
 )
+
+
+class _QcComputeWorker(QThread):
+    """Background worker for run_comp_qc heavy computation."""
+    finished = pyqtSignal(list)   # emits rows list
+    error = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            rows = self._fn()
+            self.finished.emit(rows)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ClickableSlider(QSlider):
@@ -179,6 +198,20 @@ def _date_from_dateobs(date_obs: str | None) -> str:
         return t.to_datetime().strftime("%Y-%m-%d")
     except Exception:
         return "unknown"
+
+
+def _display_date_from_dateobs(date_obs: str | None, tz_offset_hours: float = 0.0) -> str:
+    """Convert DATE-OBS to a display date, optionally shifted to site local time."""
+    if not date_obs:
+        return "unknown"
+    try:
+        t = Time(str(date_obs).strip())
+        tz_days = float(tz_offset_hours) / 24.0
+        if np.isfinite(tz_days) and tz_days != 0.0:
+            t = Time(t.jd + tz_days, format="jd", scale="utc")
+        return t.to_datetime().strftime("%Y-%m-%d")
+    except Exception:
+        return _date_from_dateobs(date_obs)
 
 
 def _load_headers_table(result_dir: Path) -> pd.DataFrame:
@@ -777,7 +810,7 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
         id_map_cache[key] = mapping
         return mapping
 
-    for sel_path in step8_out.glob("selection_*.json"):
+    for sel_path in sorted(step8_out.glob("selection_*.json")):
         flt = sel_path.stem.replace("selection_", "")
         try:
             data = json.loads(sel_path.read_text(encoding="utf-8"))
@@ -814,16 +847,132 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
                         if x is not None and int(x) in step6_map
                     })
 
+            # Check star
+            check_source_id = data.get("check_source_id")
+            check_id = data.get("check_id")
+            check_id_val = int(check_id) if check_id is not None else None
+            if check_id_val is None and check_source_id is not None:
+                sid_map = _load_step8_id_map(flt)
+                if int(check_source_id) in sid_map:
+                    check_id_val = int(sid_map[int(check_source_id)])
+                else:
+                    step6_map = _load_step6_id_map()
+                    if int(check_source_id) in step6_map:
+                        check_id_val = int(step6_map[int(check_source_id)])
+
             filter_selections[flt] = {
                 "target_id": target_id_val,
                 "comparison_ids": comp_id_vals,
                 "target_source_id": int(target_source_id) if target_source_id is not None else None,
                 "comparison_source_ids": [int(x) for x in comp_source_ids if x is not None],
+                "check_id": check_id_val,
+                "check_source_id": int(check_source_id) if check_source_id is not None else None,
             }
         except Exception:
             continue
 
     return filter_selections
+
+
+def _load_check_star_meta_by_filter(result_dir: Path) -> dict[str, dict[str, int]]:
+    """Load per-filter check star metadata from Step 8 selection JSONs."""
+    out: dict[str, dict[str, int]] = {}
+    filter_sel = _load_selection_ids_by_filter(result_dir)
+    for flt, sel in sorted(filter_sel.items()):
+        key = _normalize_filter_key(flt)
+        if not key:
+            continue
+        entry: dict[str, int] = {}
+        check_id = sel.get("check_id")
+        check_source_id = sel.get("check_source_id")
+        if check_id is not None:
+            entry["check_id"] = int(check_id)
+        if check_source_id is not None:
+            entry["check_source_id"] = int(check_source_id)
+        if entry:
+            out[key] = entry
+    return out
+
+
+def _load_check_star_id(result_dir: Path, filt: str | None = None):
+    """Load check star ID, optionally for a specific filter."""
+    meta_by_filter = _load_check_star_meta_by_filter(result_dir)
+    if filt:
+        entry = meta_by_filter.get(_normalize_filter_key(filt), {})
+        cid = entry.get("check_id")
+        return int(cid) if cid is not None else None
+    for flt in sorted(meta_by_filter):
+        cid = meta_by_filter[flt].get("check_id")
+        if cid is not None:
+            return int(cid)
+    return None
+
+
+def _load_check_star_csv(result_dir: Path, filt: str | None = None) -> tuple:
+    """Load check star CSV from step10 output.
+
+    If ``filt`` is given, prefer the filter-specific check-star CSV for that band.
+    Otherwise prefer the combined check-star CSV that merges all configured filters.
+    """
+    out_dir = step10_dir(result_dir)
+    if not out_dir.exists():
+        return None, pd.DataFrame()
+
+    if filt:
+        filt_key = _normalize_filter_key(filt)
+        check_id = _load_check_star_id(result_dir, filt_key)
+        candidates = []
+        if check_id is not None and filt_key:
+            candidates.append(out_dir / f"lightcurve_check_{filt_key}_ID{check_id}_raw.csv")
+            candidates.append(out_dir / f"lightcurve_check_ID{check_id}_raw.csv")
+        candidates.append(out_dir / "lightcurve_check_combined_raw.csv")
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            if "filter" in df.columns and filt_key:
+                df = df[df["filter"].astype(str).map(_normalize_filter_key) == filt_key].copy()
+            if "check_id" in df.columns and check_id is not None:
+                df = df[pd.to_numeric(df["check_id"], errors="coerce") == int(check_id)].copy()
+            if not df.empty:
+                return check_id, df
+        return check_id, pd.DataFrame()
+
+    combined_path = out_dir / "lightcurve_check_combined_raw.csv"
+    if combined_path.exists():
+        try:
+            df = pd.read_csv(combined_path)
+            cid = None
+            if "check_id" in df.columns:
+                ids = sorted({
+                    int(x) for x in pd.to_numeric(df["check_id"], errors="coerce").dropna().astype(int).tolist()
+                })
+                if len(ids) == 1:
+                    cid = ids[0]
+            return cid, df
+        except Exception:
+            pass
+
+    check_id = _load_check_star_id(result_dir)
+    if check_id is not None:
+        p = out_dir / f"lightcurve_check_ID{check_id}_raw.csv"
+        if p.exists():
+            try:
+                return check_id, pd.read_csv(p)
+            except Exception:
+                pass
+
+    for p in sorted(out_dir.glob("lightcurve_check_ID*_raw.csv")):
+        try:
+            cid = int(p.stem.replace("lightcurve_check_ID", "").replace("_raw", ""))
+            return cid, pd.read_csv(p)
+        except Exception:
+            continue
+
+    return None, pd.DataFrame()
 
 
 def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
@@ -874,6 +1023,7 @@ class LightCurveBuilderWindow(StepWindowBase):
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
         self.datasets = []  # will be set to single entry in setup
+        self.dataset_panel_expanded = False
         self.comp_ids_list = []
         self.comp_index = 0
         self.comp_candidate_ids = []
@@ -896,6 +1046,8 @@ class LightCurveBuilderWindow(StepWindowBase):
         # Diff series 캐시 (파일 재로드 방지)
         self._diff_series_cache: dict[tuple, pd.DataFrame] = {}
         self._diff_series_cache_key: tuple | None = None
+        # Check star series 캐시 (result_dir, comp_ids_tuple) → (ids_dict, df)
+        self._check_series_cache: dict[tuple, tuple[dict, pd.DataFrame]] = {}
 
         # FITS 헤더 캐시 (매번 FITS 파일 열기 방지)
         self._header_cache: dict[str, fits.Header | None] = {}
@@ -920,19 +1072,25 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._frame_exclude_cache: dict[str, dict[str, set[str]]] = {}
         self._frame_exclude_dirty: set[str] = set()
         self._frame_qc_selected: str | None = None
+        self._selected_point_xy: tuple[float, float] | None = None  # data coords of selected point
         self._frame_qc_selected_dir: Path | None = None
         self._frame_qc_total = 0
         self._plot_point_map: dict[object, dict[str, object]] = {}
+        self._lc_ever_plotted: bool = False
         self._qc_plot_point_map: dict[object, dict[str, object]] = {}
         self._qc_scope_df: pd.DataFrame | None = None
         self._qc_scope_files_all_filters: list[str] | None = None
+        self._qc_date_label_map: dict[str, str] = {}
         self._frame_qc_done_cache: dict[str, bool] = {}
+        # photometry_index 읽기 캐시 (result_dir → (mtime, df))
+        self._qc_idx_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        # headers 캐시
+        self._qc_headers_cache: dict[str, tuple[float, dict, pd.DataFrame]] = {}
 
         # 필터별 플롯 표시/색상 설정
         self.filter_visibility: dict[str, bool] = {}
         self.filter_colors: dict[str, str] = {}
         self._filter_keys: list[str] = []
-        self.filter_control_map: dict[str, QPushButton] = {}
 
         super().__init__(
             step_index=9,
@@ -973,19 +1131,41 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         # ----- 추가 데이터셋 패널 -----
         ds_group = QGroupBox("추가 데이터셋")
-        ds_group.setCheckable(True)
-        ds_group.setChecked(False)
         ds_group.setStyleSheet("QGroupBox { font-size: 8pt; } QGroupBox::title { color: #555; }")
+        self.ds_group = ds_group
         ds_vbox = QVBoxLayout(ds_group)
         ds_vbox.setContentsMargins(4, 4, 4, 4)
         ds_vbox.setSpacing(2)
 
+        ds_header_row = QHBoxLayout()
+        ds_header_row.setSpacing(6)
+        self.btn_ds_toggle = QPushButton("▶ 펼치기")
+        self.btn_ds_toggle.setCheckable(True)
+        self.btn_ds_toggle.setChecked(False)
+        self.btn_ds_toggle.setStyleSheet(
+            "QPushButton { border: none; text-align: left; color: #555; font-size: 8pt; padding: 0px; }"
+            "QPushButton:checked { color: #1565C0; }"
+        )
+        self.btn_ds_toggle.toggled.connect(lambda checked: self._set_dataset_panel_expanded(checked, persist=True))
+        ds_header_row.addWidget(self.btn_ds_toggle)
+
+        self.ds_summary_label = QLabel()
+        self.ds_summary_label.setStyleSheet("QLabel { color: #607D8B; font-size: 8pt; }")
+        ds_header_row.addWidget(self.ds_summary_label)
+        ds_header_row.addStretch()
+        ds_vbox.addLayout(ds_header_row)
+
+        self.ds_container = QWidget()
+        ds_container_layout = QVBoxLayout(self.ds_container)
+        ds_container_layout.setContentsMargins(0, 0, 0, 0)
+        ds_container_layout.setSpacing(4)
+
         self.ds_list_widget = QListWidget()
-        self.ds_list_widget.setMaximumHeight(72)
+        self.ds_list_widget.setMaximumHeight(64)
         self.ds_list_widget.setStyleSheet("QListWidget { font-size: 8pt; }")
         self.ds_list_widget.addItem(f"[현재] {rd.name}")
         self.ds_list_widget.item(0).setFlags(Qt.ItemIsEnabled)
-        ds_vbox.addWidget(self.ds_list_widget)
+        ds_container_layout.addWidget(self.ds_list_widget)
 
         ds_btn_row = QHBoxLayout()
         ds_btn_row.setSpacing(4)
@@ -1000,8 +1180,11 @@ class LightCurveBuilderWindow(StepWindowBase):
         ds_btn_row.addWidget(btn_ds_add)
         ds_btn_row.addWidget(btn_ds_remove)
         ds_btn_row.addStretch()
-        ds_vbox.addLayout(ds_btn_row)
+        ds_container_layout.addLayout(ds_btn_row)
+        ds_vbox.addWidget(self.ds_container)
         self.content_layout.addWidget(ds_group)
+        self._update_dataset_summary()
+        self._set_dataset_panel_expanded(False, persist=False)
 
         self.tab_widget = QTabWidget()
         self.light_tab = QWidget()
@@ -1010,7 +1193,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.qc_layout = QVBoxLayout(self.qc_tab)
         self.tab_widget.addTab(self.qc_tab, "Comparison QC")
         self.tab_widget.addTab(self.light_tab, "Light Curve")
-        self.content_layout.addWidget(self.tab_widget)
+        self.content_layout.addWidget(self.tab_widget, 1)
 
         plot_group = QGroupBox("Target - Comparison Light Curve")
         plot_group.setStyleSheet(
@@ -1025,10 +1208,6 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.plot_info_label = QLabel("Comparison: (none)")
         self.plot_info_label.setStyleSheet("QLabel { font-weight: bold; }")
         plot_layout.addWidget(self.plot_info_label)
-
-        self.qc_gate_label = QLabel("Frame QC: not confirmed. Exclude bad frames and click 'Save Exclusions'.")
-        self.qc_gate_label.setStyleSheet("QLabel { color: #D84315; font-weight: bold; }")
-        plot_layout.addWidget(self.qc_gate_label)
 
         # 컨트롤 버튼 row
         btn_row = QHBoxLayout()
@@ -1047,6 +1226,14 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.x_axis_combo.currentIndexChanged.connect(self._on_xaxis_changed)
         btn_row.addWidget(self.x_axis_combo)
 
+        self.btn_filter_colors = QPushButton("Browse Colors")
+        self.btn_filter_colors.setStyleSheet(
+            "QPushButton { background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { border: 1px solid #78909C; }"
+        )
+        self.btn_filter_colors.clicked.connect(self.show_filter_color_browser)
+        btn_row.addWidget(self.btn_filter_colors)
+
         btn_row.addStretch()
 
         # Plot 버튼 (자동 저장 포함)
@@ -1057,41 +1244,15 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         plot_layout.addLayout(btn_row)
 
-        filter_box = QGroupBox("Filters")
-        filter_box.setStyleSheet(
-            "QGroupBox { background-color: #EEF2F5; border: 1px solid #CFD8DC; border-radius: 6px; margin-top: 6px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #455A64; font-weight: bold; }"
-        )
-        filter_layout = QVBoxLayout(filter_box)
-        filter_btn_row = QHBoxLayout()
-        self.btn_filter_all = QPushButton("All")
-        self.btn_filter_all.setStyleSheet("QPushButton { background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; padding: 2px 8px; }")
-        self.btn_filter_all.clicked.connect(lambda: self._set_all_filters_visible(True))
-        filter_btn_row.addWidget(self.btn_filter_all)
-        self.btn_filter_none = QPushButton("None")
-        self.btn_filter_none.setStyleSheet("QPushButton { background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; padding: 2px 8px; }")
-        self.btn_filter_none.clicked.connect(lambda: self._set_all_filters_visible(False))
-        filter_btn_row.addWidget(self.btn_filter_none)
-        self.btn_filter_reset = QPushButton("Reset Colors")
-        self.btn_filter_reset.setStyleSheet("QPushButton { background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; padding: 2px 8px; }")
-        self.btn_filter_reset.clicked.connect(self._reset_filter_colors)
-        filter_btn_row.addWidget(self.btn_filter_reset)
-        filter_btn_row.addStretch()
-        filter_layout.addLayout(filter_btn_row)
-
-        self.filter_controls_layout = QGridLayout()
-        self.filter_controls_layout.setSpacing(6)
-        filter_layout.addLayout(self.filter_controls_layout)
-        plot_layout.addWidget(filter_box)
-
-        self.plot_canvas = FigureCanvas(Figure(figsize=(8, 4.8)))
+        self.plot_canvas = FigureCanvas(Figure(figsize=(8, 3.5)))
+        self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
+        plot_layout.addWidget(self.plot_toolbar)
         self.plot_ax = self.plot_canvas.figure.add_subplot(111)
         self.plot_canvas.setFocusPolicy(Qt.ClickFocus)
-        self.plot_canvas.setMinimumHeight(480)
+        self.plot_canvas.setMinimumHeight(220)
         self.plot_canvas.setStyleSheet("background-color: #FFFFFF; border: 1px solid #ECEFF1;")
-        self.plot_canvas.mpl_connect("pick_event", self._on_plot_pick)
-        self.plot_canvas.mpl_connect("button_press_event", lambda _evt: self.plot_canvas.setFocus())
-        plot_layout.addWidget(self.plot_canvas)
+        self.plot_canvas.mpl_connect("button_press_event", self._on_plot_click)
+        plot_layout.addWidget(self.plot_canvas, 1)
 
         # Phase Folding 슬라이더
         phase_box = QGroupBox("Phase Folding")
@@ -1131,34 +1292,34 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         plot_layout.addWidget(phase_box)
 
-        self.light_layout.addWidget(plot_group)
-
-        frame_qc_group = QGroupBox("Frame QC (Manual Exclude)")
-        frame_qc_group.setStyleSheet(
-            "QGroupBox { background-color: #F7F9FB; border: 1px solid #CFD8DC; border-radius: 8px; margin-top: 8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #37474F; font-weight: bold; }"
-        )
-        frame_qc_layout = QVBoxLayout(frame_qc_group)
-        self.frame_qc_hint = QLabel("Click a point to select. D = exclude, A = include (undo)")
-        self.frame_qc_hint.setStyleSheet("QLabel { color: #455A64; }")
-        frame_qc_layout.addWidget(self.frame_qc_hint)
+        # Frame QC bar — below phase sliders
+        frame_qc_row = QHBoxLayout()
+        frame_qc_row.addWidget(QLabel("더블클릭=선택  D=제외  A=복원  R=리셋"))
         self.frame_qc_selected_label = QLabel("Selected: (none)")
-        self.frame_qc_selected_label.setStyleSheet("QLabel { font-weight: bold; }")
-        frame_qc_layout.addWidget(self.frame_qc_selected_label)
+        self.frame_qc_selected_label.setStyleSheet("QLabel { font-weight: bold; color: #1565C0; }")
+        frame_qc_row.addWidget(self.frame_qc_selected_label, 1)
         self.frame_qc_summary_label = QLabel("Excluded: 0/0")
         self.frame_qc_summary_label.setStyleSheet("QLabel { color: #546E7A; }")
-        frame_qc_layout.addWidget(self.frame_qc_summary_label)
-
-        frame_btn_row = QHBoxLayout()
-        self.btn_frame_qc_save = QPushButton("Save Exclusions")
+        frame_qc_row.addWidget(self.frame_qc_summary_label)
+        self.btn_frame_qc_save = QPushButton("Save")
+        self.btn_frame_qc_save.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 3px 10px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
         self.btn_frame_qc_save.clicked.connect(self.save_frame_excludes)
-        frame_btn_row.addWidget(self.btn_frame_qc_save)
-        self.btn_frame_qc_clear = QPushButton("Clear Exclusions")
+        self.btn_frame_qc_save.setEnabled(False)
+        frame_qc_row.addWidget(self.btn_frame_qc_save)
+        self.btn_frame_qc_clear = QPushButton("Reset")
+        self.btn_frame_qc_clear.setStyleSheet(
+            "QPushButton { background-color: #F44336; color: white; font-weight: bold; padding: 3px 10px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
         self.btn_frame_qc_clear.clicked.connect(self.clear_frame_excludes)
-        frame_btn_row.addWidget(self.btn_frame_qc_clear)
-        frame_btn_row.addStretch()
-        frame_qc_layout.addLayout(frame_btn_row)
-        self.light_layout.addWidget(frame_qc_group)
+        self.btn_frame_qc_clear.setEnabled(False)
+        frame_qc_row.addWidget(self.btn_frame_qc_clear)
+        plot_layout.addLayout(frame_qc_row)
+
+        self.light_layout.addWidget(plot_group, 1)
 
         qc_group = QGroupBox("Comparison QC")
         qc_group.setStyleSheet(
@@ -1173,8 +1334,19 @@ class LightCurveBuilderWindow(StepWindowBase):
         btn_qc_params.clicked.connect(self.show_qc_parameters_dialog)
         qc_btn_row.addWidget(btn_qc_params)
 
+        self.btn_qc_run = QPushButton("Run QC")
+        self.btn_qc_run.setStyleSheet(
+            "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 4px 12px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
+        self.btn_qc_run.clicked.connect(self.run_comp_qc)
+        qc_btn_row.addWidget(self.btn_qc_run)
+
         self.btn_qc_auto = QPushButton("Auto Use")
-        self.btn_qc_auto.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 12px; }")
+        self.btn_qc_auto.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 12px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
         self.btn_qc_auto.clicked.connect(self.auto_use_qc)
         qc_btn_row.addWidget(self.btn_qc_auto)
 
@@ -1189,18 +1361,64 @@ class LightCurveBuilderWindow(StepWindowBase):
         qc_layout.addWidget(self.lbl_qc_thresholds)
         self._update_qc_threshold_label()
 
-        self.qc_table = QTableWidget()
-        self.qc_table.setColumnCount(6)
-        self.qc_table.setHorizontalHeaderLabels(
-            ["Use", "ID", "N(valid)", "RMS", "MAD", "Outlier%"]
+        self.qc_progress_bar = QProgressBar()
+        self.qc_progress_bar.setRange(0, 0)  # indeterminate (marquee)
+        self.qc_progress_bar.setMaximumHeight(6)
+        self.qc_progress_bar.setTextVisible(False)
+        self.qc_progress_bar.setStyleSheet(
+            "QProgressBar { border: none; background-color: #ECEFF1; border-radius: 3px; }"
+            "QProgressBar::chunk { background-color: #FF9800; border-radius: 3px; }"
         )
-        self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.qc_table.horizontalHeader().setStretchLastSection(True)
+        self.qc_progress_bar.hide()
+        qc_layout.addWidget(self.qc_progress_bar)
+
+        self.qc_table = QTableWidget()
+        self.qc_table.setColumnCount(7)
+        self.qc_table.setHorizontalHeaderLabels(
+            ["Use", "ID", "N", "RMS", "σ(night)", "MAD", "Out%"]
+        )
+        _qc_hdr = self.qc_table.horizontalHeader()
+        _qc_hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
+        _qc_hdr.setStretchLastSection(False)
+        _qc_hdr.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.qc_table.setColumnWidth(6, 52)
         self.qc_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.qc_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.qc_table.itemSelectionChanged.connect(self._on_qc_selection_changed)
         self.qc_table.itemChanged.connect(self._on_qc_table_changed)
-        qc_layout.addWidget(self.qc_table)
+
+        # Stats panel (right of table)
+        stats_group = QGroupBox("Selected Comp Stats")
+        stats_vbox = QVBoxLayout(stats_group)
+        stats_vbox.setSpacing(4)
+        self.qc_stats_night_cb = QCheckBox("밤별 구분")
+        self.qc_stats_night_cb.stateChanged.connect(self._refresh_qc_stats_panel)
+        stats_vbox.addWidget(self.qc_stats_night_cb)
+        self.qc_stats_table = QTableWidget()
+        self.qc_stats_table.setColumnCount(5)
+        self.qc_stats_table.setHorizontalHeaderLabels(["Filter", "N", "Median", "σ", "MAD"])
+        _sh = self.qc_stats_table.horizontalHeader()
+        _sh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        _sh.setStretchLastSection(True)
+        self.qc_stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.qc_stats_table.setSelectionBehavior(QTableWidget.SelectRows)
+        stats_vbox.addWidget(self.qc_stats_table)
+        stats_group.setMinimumWidth(200)
+
+        # Top pane: table (left) + stats (right) — horizontal splitter
+        top_splitter = QSplitter(Qt.Horizontal)
+        top_splitter.setChildrenCollapsible(False)
+        top_splitter.addWidget(self.qc_table)
+        top_splitter.addWidget(stats_group)
+        top_splitter.setStretchFactor(0, 3)
+        top_splitter.setStretchFactor(1, 2)
+        top_splitter.setMinimumHeight(160)
+
+        # Bottom pane: date/filter controls + preview canvas
+        check_group = QGroupBox("Comparison Preview")
+        check_layout = QVBoxLayout(check_group)
+        check_layout.setContentsMargins(4, 4, 4, 4)
+        check_layout.setSpacing(4)
 
         preview_ctrl = QHBoxLayout()
         preview_ctrl.addWidget(QLabel("Date:"))
@@ -1208,28 +1426,59 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.qc_date_combo.addItem("All")
         self.qc_date_combo.currentIndexChanged.connect(self._on_qc_date_changed)
         preview_ctrl.addWidget(self.qc_date_combo)
-
         preview_ctrl.addWidget(QLabel("Filter:"))
         self.qc_filter_combo = QComboBox()
         self.qc_filter_combo.addItem("All")
         self.qc_filter_combo.currentIndexChanged.connect(self._on_qc_preview_changed)
         preview_ctrl.addWidget(self.qc_filter_combo)
-
         preview_ctrl.addStretch()
-        qc_layout.addLayout(preview_ctrl)
+        check_layout.addLayout(preview_ctrl)
 
-        check_group = QGroupBox("Comparison Preview")
-        check_layout = QVBoxLayout(check_group)
-        self.check_plot_canvas = FigureCanvas(Figure(figsize=(6, 3)))
+        self.check_plot_canvas = FigureCanvas(Figure(figsize=(6, 4)))
         self.check_plot_ax = self.check_plot_canvas.figure.add_subplot(111)
-        self.check_plot_canvas.setMinimumHeight(280)
+        self.check_plot_canvas.setMinimumHeight(260)
         self.check_plot_canvas.setStyleSheet("background-color: #FFFFFF; border: 1px solid #ECEFF1;")
-        self.check_plot_canvas.mpl_connect("pick_event", self._on_qc_plot_pick)
         self.check_plot_canvas.mpl_connect("button_press_event", self._on_qc_plot_click)
-        check_layout.addWidget(self.check_plot_canvas)
-        qc_layout.addWidget(check_group)
+        self.check_plot_toolbar = NavigationToolbar(self.check_plot_canvas, self)
+        check_layout.addWidget(self.check_plot_toolbar)
+        check_layout.addWidget(self.check_plot_canvas, 1)
 
-        self.qc_layout.addWidget(qc_group)
+        qc_frame_row = QHBoxLayout()
+        qc_frame_row.addWidget(QLabel("더블클릭=선택  D=제외  A=복원  R=리셋"))
+        self.qc_frame_selected_label = QLabel("Selected: (none)")
+        self.qc_frame_selected_label.setStyleSheet("QLabel { font-weight: bold; color: #1565C0; }")
+        qc_frame_row.addWidget(self.qc_frame_selected_label, 1)
+        self.qc_frame_summary_label = QLabel("Excluded: 0/0")
+        self.qc_frame_summary_label.setStyleSheet("QLabel { color: #546E7A; }")
+        qc_frame_row.addWidget(self.qc_frame_summary_label)
+        self.btn_qc_frame_save = QPushButton("Save")
+        self.btn_qc_frame_save.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 3px 10px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
+        self.btn_qc_frame_save.clicked.connect(self.save_frame_excludes)
+        self.btn_qc_frame_save.setEnabled(False)
+        qc_frame_row.addWidget(self.btn_qc_frame_save)
+        self.btn_qc_frame_reset = QPushButton("Reset")
+        self.btn_qc_frame_reset.setStyleSheet(
+            "QPushButton { background-color: #F44336; color: white; font-weight: bold; padding: 3px 10px; }"
+            "QPushButton:disabled { background-color: #CFD8DC; color: #90A4AE; }"
+        )
+        self.btn_qc_frame_reset.clicked.connect(self.clear_frame_excludes)
+        self.btn_qc_frame_reset.setEnabled(False)
+        qc_frame_row.addWidget(self.btn_qc_frame_reset)
+        check_layout.addLayout(qc_frame_row)
+
+        # Vertical splitter: top=table+stats, bottom=preview
+        qc_splitter = QSplitter(Qt.Vertical)
+        qc_splitter.setChildrenCollapsible(False)
+        qc_splitter.addWidget(top_splitter)
+        qc_splitter.addWidget(check_group)
+        qc_splitter.setStretchFactor(0, 2)
+        qc_splitter.setStretchFactor(1, 3)
+
+        qc_layout.addWidget(qc_splitter, 1)
+        self.qc_layout.addWidget(qc_group, 1)
 
         self.shortcut_prev = QShortcut(QKeySequence(Qt.Key_Left), self)
         self.shortcut_prev.activated.connect(lambda: self._step_comp(-1))
@@ -1239,6 +1488,8 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.shortcut_exclude.activated.connect(self._exclude_selected_frame)
         self.shortcut_include = QShortcut(QKeySequence(Qt.Key_A), self)
         self.shortcut_include.activated.connect(self._include_selected_frame)
+        self.shortcut_reset = QShortcut(QKeySequence(Qt.Key_R), self)
+        self.shortcut_reset.activated.connect(self.clear_frame_excludes)
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -1267,12 +1518,11 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.log_text.append(msg)
 
     def _on_tab_changed(self, idx: int) -> None:
-        if self.tab_widget.widget(idx) == self.qc_tab:
-            self.run_comp_qc()
+        self._update_frame_qc_summary()
+        self._update_qc_gate_ui()
 
     def _on_qc_date_changed(self, _idx: int) -> None:
         self.qc_date_last = self.qc_date_combo.currentText()
-        self.run_comp_qc()
         self._on_qc_preview_changed()
 
     def _on_qc_preview_changed(self, *_args) -> None:
@@ -1594,99 +1844,106 @@ class LightCurveBuilderWindow(StepWindowBase):
     def _get_filter_color(self, key: str) -> str:
         return self.filter_colors.get(key, FILTER_COLORS.get(key, "#ff7f0e"))
 
-    def _apply_color_button_style(self, button: QPushButton, color: str, visible: bool) -> None:
-        if visible:
-            bg = color
-            border = "#455A64"
-        else:
-            bg = "#ECEFF1"
-            border = "#B0BEC5"
+    def _apply_filter_swatch_style(self, button: QPushButton, color: str) -> None:
         button.setStyleSheet(
-            f"QPushButton {{ background-color: {bg}; border: 1px solid {border}; border-radius: 3px; min-width: 20px; min-height: 14px; }}"
+            f"QPushButton {{ background-color: {color}; border: 1px solid #455A64; border-radius: 3px; min-width: 24px; min-height: 18px; }}"
             "QPushButton:hover { border: 1px solid #263238; }"
         )
 
-    def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-            elif item.layout() is not None:
-                self._clear_layout(item.layout())
-
-    def _ensure_filter_controls(self, filters: list[str]) -> None:
+    def _ensure_filter_colors(self, filters: list[str]) -> None:
         keys = sorted({self._filter_key_for_ui(f) for f in filters})
-        if keys == self._filter_keys and self.filter_control_map:
+        if keys == self._filter_keys:
+            for key in keys:
+                if key not in self.filter_colors:
+                    self.filter_colors[key] = FILTER_COLORS.get(key, "#ff7f0e")
             return
         self._filter_keys = keys
-        self._clear_layout(self.filter_controls_layout)
-        self.filter_control_map = {}
-
-        for row, key in enumerate(keys):
-            if key not in self.filter_visibility:
-                self.filter_visibility[key] = True
+        for key in keys:
             if key not in self.filter_colors:
                 self.filter_colors[key] = FILTER_COLORS.get(key, "#ff7f0e")
 
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(6)
-            row_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    def _available_filter_keys(self) -> list[str]:
+        keys = list(self._filter_keys)
+        if not keys:
+            keys = sorted(self.filter_colors.keys())
+        return keys
 
-            label = QLabel(f"{key}:")
-            label.setStyleSheet("QLabel { color: #37474F; }")
-
-            btn = QPushButton("")
-            btn.setToolTip("Left click: show/hide\nRight click: change color")
-            btn.setCheckable(True)
-            btn.setChecked(self.filter_visibility.get(key, True))
-            btn.toggled.connect(lambda checked, k=key: self._on_filter_toggle(k, checked))
-            btn.setContextMenuPolicy(Qt.CustomContextMenu)
-            btn.customContextMenuRequested.connect(lambda _pos, k=key: self._choose_filter_color(k))
-            btn.setFixedSize(20, 14)
-            self._apply_color_button_style(btn, self._get_filter_color(key), btn.isChecked())
-
-            row_layout.addWidget(label)
-            row_layout.addWidget(btn)
-            row_layout.addStretch()
-
-            self.filter_controls_layout.addWidget(row_widget, row, 0, alignment=Qt.AlignLeft)
-            self.filter_control_map[key] = btn
-
-    def _on_filter_toggle(self, key: str, visible: bool) -> None:
-        self.filter_visibility[key] = bool(visible)
-        btn = self.filter_control_map.get(key)
-        if btn is not None:
-            self._apply_color_button_style(btn, self._get_filter_color(key), visible)
-        self.plot_current_comparison()
-
-    def _set_all_filters_visible(self, visible: bool) -> None:
-        for key, btn in self.filter_control_map.items():
-            btn.blockSignals(True)
-            btn.setChecked(visible)
-            btn.blockSignals(False)
-            self.filter_visibility[key] = bool(visible)
-            self._apply_color_button_style(btn, self._get_filter_color(key), visible)
-        self.plot_current_comparison()
-
-    def _reset_filter_colors(self) -> None:
-        for key, btn in self.filter_control_map.items():
+    def _reset_filter_colors(self, keys: list[str] | None = None) -> None:
+        target_keys = keys or self._available_filter_keys()
+        for key in target_keys:
             self.filter_colors[key] = FILTER_COLORS.get(key, "#ff7f0e")
-            self._apply_color_button_style(btn, self._get_filter_color(key), btn.isChecked())
+        self.save_state()
         self.plot_current_comparison()
 
-    def _choose_filter_color(self, key: str) -> None:
+    def _choose_filter_color(self, key: str, preview_button: QPushButton | None = None, parent: QWidget | None = None) -> bool:
         current = QColor(self._get_filter_color(key))
-        picked = QColorDialog.getColor(current, self, f"Select color for {key}")
+        picked = QColorDialog.getColor(current, parent or self, f"Select color for {key}")
         if not picked.isValid():
-            return
+            return False
         self.filter_colors[key] = picked.name()
-        if key in self.filter_control_map:
-            btn = self.filter_control_map[key]
-            self._apply_color_button_style(btn, self._get_filter_color(key), btn.isChecked())
+        if preview_button is not None:
+            self._apply_filter_swatch_style(preview_button, self._get_filter_color(key))
+        self.save_state()
         self.plot_current_comparison()
+        return True
+
+    def show_filter_color_browser(self):
+        keys = self._available_filter_keys()
+        if not keys:
+            QMessageBox.information(self, "Filter Colors", "먼저 라이트커브를 한 번 표시한 뒤 색상을 변경하세요.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Filter Colors")
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+
+        info = QLabel("필터별 색상을 선택합니다.")
+        info.setStyleSheet("QLabel { color: #455A64; }")
+        layout.addWidget(info)
+
+        swatch_buttons: dict[str, QPushButton] = {}
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        for row, key in enumerate(keys):
+            label = QLabel(key)
+            label.setStyleSheet("QLabel { color: #37474F; font-weight: bold; }")
+            grid.addWidget(label, row, 0)
+
+            swatch = QPushButton("")
+            swatch.setFixedSize(28, 20)
+            swatch.setFocusPolicy(Qt.NoFocus)
+            self._apply_filter_swatch_style(swatch, self._get_filter_color(key))
+            grid.addWidget(swatch, row, 1)
+            swatch_buttons[key] = swatch
+
+            browse_btn = QPushButton("Browse...")
+            browse_btn.clicked.connect(
+                lambda _checked=False, k=key, sw=swatch, dlg=dialog: self._choose_filter_color(k, sw, dlg)
+            )
+            grid.addWidget(browse_btn, row, 2)
+
+        layout.addLayout(grid)
+
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Reset Colors")
+        btn_reset.clicked.connect(lambda: self._reset_filter_color_browser(keys, swatch_buttons))
+        btn_row.addWidget(btn_reset)
+        btn_row.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dialog.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dialog.exec_()
+
+    def _reset_filter_color_browser(self, keys: list[str], swatch_buttons: dict[str, QPushButton]) -> None:
+        self._reset_filter_colors(keys)
+        for key, swatch in swatch_buttons.items():
+            self._apply_filter_swatch_style(swatch, self._get_filter_color(key))
 
     def _expand_phase_cycles(self, df: pd.DataFrame) -> pd.DataFrame:
         cycles = float(self.phase_cycles)
@@ -1751,6 +2008,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._diff_series_cache.clear()
         self._photometry_cache.clear()
         self._photometry_cache_dir = None
+        self._check_series_cache.clear()
         if clear_headers:
             self._header_cache.clear()
             self.log("[CACHE] All caches cleared")
@@ -1909,7 +2167,12 @@ class LightCurveBuilderWindow(StepWindowBase):
             idx = idx[~idx["file"].astype(str).isin(exclude_map.keys())]
             if verbose and before != len(idx):
                 self.log(f"[Frame QC] Excluded frames: {before} → {len(idx)}")
-        files = files_override if files_override is not None else idx["file"].astype(str).tolist()
+        available_files = idx["file"].astype(str).tolist()
+        if files_override is not None:
+            allowed = set(available_files)
+            files = [str(fname) for fname in files_override if str(fname) in allowed]
+        else:
+            files = available_files
         if preload:
             self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
@@ -2019,7 +2282,14 @@ class LightCurveBuilderWindow(StepWindowBase):
             "mag_err": np.array(mag_errs, float),
         })
 
-    def _build_ensemble_series(self, result_dir: Path, target_id: int, comp_ids: list[int], verbose: bool = True) -> pd.DataFrame:
+    def _build_ensemble_series(
+        self,
+        result_dir: Path,
+        target_id: int,
+        comp_ids: list[int],
+        verbose: bool = True,
+        target_source_id_by_filter: dict[str, int] | None = None,
+    ) -> pd.DataFrame:
         idx_path = step9_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             idx_path = result_dir / "photometry_index.csv"
@@ -2052,19 +2322,20 @@ class LightCurveBuilderWindow(StepWindowBase):
                     header_filter_map = dict(zip(headers_df["Filename"].astype(str), headers_df[col].astype(str)))
                     break
 
-        # Night assignment map: filename -> night_id
-        # Prefer in-index column, fall back to file_manager or disk JSON
+        # Night assignment map: basename→night_id, merged from all sources
         night_id_map: dict[str, int] = {}
+        raw_na = _load_night_assignments(result_dir)
+        night_id_map.update({Path(str(k)).name: int(v) for k, v in raw_na.items() if int(v) > 0})
+        fm = getattr(self, "file_manager", None)
+        if fm is not None:
+            for k, v in getattr(fm, "night_assignments", {}).items():
+                if int(v) > 0:
+                    night_id_map[Path(str(k)).name] = int(v)
         if "night_id" in idx.columns:
             for fn, nid in zip(idx["file"].astype(str), pd.to_numeric(idx["night_id"], errors="coerce")):
-                if not pd.isna(nid):
-                    night_id_map[fn] = int(nid)
-        if not night_id_map:
-            fm = getattr(self, "file_manager", None)
-            if fm is not None:
-                night_id_map = dict(getattr(fm, "night_assignments", {}))
-        if not night_id_map:
-            night_id_map = _load_night_assignments(result_dir)
+                bn = Path(fn).name
+                if not pd.isna(nid) and int(nid) > 0 and bn not in night_id_map:
+                    night_id_map[bn] = int(nid)
 
         # Use instance-level header cache (self._header_cache)
         times = []
@@ -2140,7 +2411,17 @@ class LightCurveBuilderWindow(StepWindowBase):
             comp_source_map: dict[int, int] = {}
             if filt_key in filter_selections:
                 sel = filter_selections[filt_key]
-                target_source_id = sel.get("target_source_id")
+                override_target_sid = None
+                if target_source_id_by_filter is not None:
+                    override_target_sid = target_source_id_by_filter.get(filt_key)
+                if override_target_sid is not None:
+                    target_source_id = int(override_target_sid)
+                else:
+                    sel_target_id = sel.get("target_id")
+                    if sel_target_id is not None and int(sel_target_id) == int(target_id):
+                        target_source_id = sel.get("target_source_id")
+                    else:
+                        target_source_id = self._map_comp_source_id(sel, target_id)
                 for cid in comp_ids:
                     sid = self._map_comp_source_id(sel, cid)
                     if sid is not None:
@@ -2243,6 +2524,59 @@ class LightCurveBuilderWindow(StepWindowBase):
             "airmass": np.array(airmasses, float),
         })
 
+    def _build_check_star_series(
+        self,
+        result_dir: Path,
+        comp_ids: list[int],
+        verbose: bool = False,
+    ) -> tuple[dict[str, int], pd.DataFrame]:
+        # 캐시 확인
+        _ck_key = (str(result_dir), tuple(sorted(comp_ids)))
+        if _ck_key in self._check_series_cache:
+            return self._check_series_cache[_ck_key]
+
+        meta_by_filter = _load_check_star_meta_by_filter(result_dir)
+        check_ids_by_filter = {
+            flt: int(meta["check_id"])
+            for flt, meta in meta_by_filter.items()
+            if meta.get("check_id") is not None
+        }
+        check_source_ids_by_filter = {
+            flt: int(meta["check_source_id"])
+            for flt, meta in meta_by_filter.items()
+            if meta.get("check_source_id") is not None
+        }
+        if not check_ids_by_filter and not check_source_ids_by_filter:
+            return {}, pd.DataFrame()
+
+        fallback_id = next(iter(check_ids_by_filter.values()), -1)
+        check_df = self._build_ensemble_series(
+            result_dir,
+            int(fallback_id),
+            comp_ids,
+            verbose=verbose,
+            target_source_id_by_filter=check_source_ids_by_filter or None,
+        )
+        if check_df.empty:
+            return check_ids_by_filter, check_df
+
+        valid_filters = set(check_ids_by_filter) | set(check_source_ids_by_filter)
+        if "filter" in check_df.columns and valid_filters:
+            filter_keys = check_df["filter"].astype(str).map(_normalize_filter_key)
+            check_df = check_df[filter_keys.isin(valid_filters)].copy()
+            if not check_df.empty:
+                check_df["check_id"] = filter_keys.loc[check_df.index].map(check_ids_by_filter)
+        if "check_id" in check_df.columns:
+            check_ids = pd.to_numeric(check_df["check_id"], errors="coerce")
+            check_df = check_df[check_ids.notna()].copy()
+            if not check_df.empty:
+                check_df["check_id"] = pd.to_numeric(check_df["check_id"], errors="coerce").astype(int)
+        if "JD" in check_df.columns and not check_df.empty:
+            check_df = check_df.sort_values("JD").reset_index(drop=True)
+        result = (check_ids_by_filter, check_df)
+        self._check_series_cache[_ck_key] = result
+        return result
+
     def _build_diff_series(self, result_dir: Path, target_id: int, comp_id: int, verbose: bool = True) -> pd.DataFrame:
         # 캐시 키 생성
         cache_key = (str(result_dir), int(target_id), int(comp_id))
@@ -2263,6 +2597,11 @@ class LightCurveBuilderWindow(StepWindowBase):
             if verbose:
                 self.log(f"[DEBUG] photometry_index.csv missing 'file' column")
             return pd.DataFrame()
+        # Apply frame exclusions to the series computation
+        exclude_map = self._get_frame_exclude_map(result_dir)
+        if exclude_map:
+            excluded_set = set(exclude_map.keys())
+            idx = idx[~idx["file"].astype(str).isin(excluded_set)].reset_index(drop=True)
         files = idx["file"].astype(str).tolist()
         self._preload_photometry_cache(result_dir, files)
         headers_map = _load_headers_map(result_dir)
@@ -2290,16 +2629,18 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         # Night assignment map for this series
         diff_night_id_map: dict[str, int] = {}
+        raw_na = _load_night_assignments(result_dir)
+        diff_night_id_map.update({Path(str(k)).name: int(v) for k, v in raw_na.items() if int(v) > 0})
+        fm_d = getattr(self, "file_manager", None)
+        if fm_d is not None:
+            for k, v in getattr(fm_d, "night_assignments", {}).items():
+                if int(v) > 0:
+                    diff_night_id_map[Path(str(k)).name] = int(v)
         if "night_id" in idx.columns:
             for fn, nid in zip(idx["file"].astype(str), pd.to_numeric(idx["night_id"], errors="coerce")):
-                if not pd.isna(nid):
-                    diff_night_id_map[fn] = int(nid)
-        if not diff_night_id_map:
-            fm = getattr(self, "file_manager", None)
-            if fm is not None:
-                diff_night_id_map = dict(getattr(fm, "night_assignments", {}))
-        if not diff_night_id_map:
-            diff_night_id_map = _load_night_assignments(result_dir)
+                bn = Path(fn).name
+                if not pd.isna(nid) and int(nid) > 0 and bn not in diff_night_id_map:
+                    diff_night_id_map[bn] = int(nid)
 
         times = []
         diffs = []
@@ -2506,23 +2847,28 @@ class LightCurveBuilderWindow(StepWindowBase):
 
     def _is_frame_qc_ready(self, result_dir: Path | None) -> bool:
         if result_dir is None:
-            return False
+            return True
         done = self._load_frame_qc_done(result_dir)
         dirty = str(result_dir) in self._frame_exclude_dirty
         return done and not dirty
 
     def _update_qc_gate_ui(self) -> None:
-        result_dir = self._current_result_dir()
-        ready = self._is_frame_qc_ready(result_dir)
         if hasattr(self, "btn_plot"):
-            self.btn_plot.setEnabled(ready)
-        if hasattr(self, "qc_gate_label"):
-            if ready:
-                self.qc_gate_label.setText("Frame QC: ready. You can build the light curve.")
-                self.qc_gate_label.setStyleSheet("QLabel { color: #2E7D32; font-weight: bold; }")
-            else:
-                self.qc_gate_label.setText("Frame QC: not confirmed. Exclude bad frames and click 'Save Exclusions'.")
-                self.qc_gate_label.setStyleSheet("QLabel { color: #D84315; font-weight: bold; }")
+            self.btn_plot.setEnabled(True)
+        # Enable save/reset buttons only when there are unsaved frame exclusion changes
+        result_dir = self._current_result_dir()
+        dirty = result_dir is not None and str(result_dir) in self._frame_exclude_dirty
+        has_excludes = False
+        if result_dir is not None:
+            has_excludes = bool(self._get_frame_exclude_map(result_dir))
+        for attr in ("btn_frame_qc_save", "btn_qc_frame_save"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(dirty)
+        for attr in ("btn_frame_qc_clear", "btn_qc_frame_reset"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(dirty or has_excludes)
 
     def _get_frame_exclude_map(self, result_dir: Path) -> dict[str, set[str]]:
         key = str(result_dir)
@@ -2535,15 +2881,56 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._frame_qc_selected_dir = result_dir
         if not fname or result_dir is None:
             self.frame_qc_selected_label.setText("Selected: (none)")
+            if hasattr(self, "qc_frame_selected_label"):
+                self.qc_frame_selected_label.setText("Selected: (none)")
             return
         exclude_map = self._get_frame_exclude_map(result_dir)
         status = "excluded" if fname in exclude_map else "included"
-        self.frame_qc_selected_label.setText(f"Selected: {fname} ({status})")
+        text = f"Selected: {fname} ({status})"
+        self.frame_qc_selected_label.setText(text)
+        if hasattr(self, "qc_frame_selected_label"):
+            self.qc_frame_selected_label.setText(text)
+
+    def _draw_qc_selection_indicator(self, xy: tuple[float, float]) -> None:
+        """Draw red hollow circle on QC preview plot at given data coords."""
+        prev = getattr(self, "_qc_selection_indicator_artist", None)
+        if prev is not None:
+            try:
+                prev.remove()
+            except Exception:
+                pass
+        sc = self.check_plot_ax.scatter([xy[0]], [xy[1]], s=220, facecolors="none",
+                                        edgecolors="red", linewidths=2.0, zorder=20)
+        self._qc_selection_indicator_artist = sc
+        self.check_plot_canvas.draw_idle()
+
+    def _draw_selection_indicator(self) -> None:
+        """Draw red hollow circle around the selected point on the light curve plot."""
+        xy = getattr(self, "_selected_point_xy", None)
+        if xy is None:
+            return
+        ax = self.plot_ax
+        # Remove previous indicator if any
+        prev = getattr(self, "_selection_indicator_artist", None)
+        if prev is not None:
+            try:
+                prev.remove()
+            except Exception:
+                pass
+        sc = ax.scatter([xy[0]], [xy[1]], s=220, facecolors="none",
+                        edgecolors="red", linewidths=2.0, zorder=20)
+        self._selection_indicator_artist = sc
+        self.plot_canvas.draw_idle()
 
     def _refresh_qc_preview(self) -> None:
         comp_id = getattr(self, "_qc_last_selected_comp_id", None)
         if comp_id is not None:
             self._plot_comp_preview(int(comp_id))
+
+    def _refresh_lc_plot(self) -> None:
+        """Replot light curve only if it has been built at least once."""
+        if getattr(self, "_lc_ever_plotted", False):
+            self.plot_current_comparison()
 
     def _update_frame_qc_summary(self) -> None:
         result_dir = self._current_result_dir()
@@ -2555,34 +2942,60 @@ class LightCurveBuilderWindow(StepWindowBase):
         exc = len(exclude_map)
         dirty = str(result_dir) in self._frame_exclude_dirty
         suffix = " (unsaved)" if dirty else ""
-        self.frame_qc_summary_label.setText(f"Excluded: {exc}/{total}{suffix}")
+        text = f"Excluded: {exc}/{total}{suffix}"
+        self.frame_qc_summary_label.setText(text)
+        if hasattr(self, "qc_frame_summary_label"):
+            self.qc_frame_summary_label.setText(text)
 
-    def _on_plot_pick(self, event) -> None:
-        artist = event.artist
-        meta = self._plot_point_map.get(artist)
-        if not meta:
+    def _on_plot_click(self, event) -> None:
+        self.plot_canvas.setFocus()
+        if not event.dblclick:
             return
-        indices = getattr(event, "ind", None)
-        if indices is None or len(indices) == 0:
+        if event.inaxes != self.plot_ax:
             return
-        idx = int(indices[0])
-        files = meta.get("files", [])
-        if idx < 0 or idx >= len(files):
+        if event.xdata is None or event.ydata is None:
             return
-        fname = str(files[idx])
-        result_dir = self._current_result_dir()
-        self._set_selected_frame(fname, result_dir)
+        TOLERANCE_PX = 20
+        ax = self.plot_ax
+        click_disp = ax.transData.transform([[event.xdata, event.ydata]])[0]
+        best_dist = float("inf")
+        best_fname = None
+        best_xy = None
+        for artist, meta in self._plot_point_map.items():
+            offsets = artist.get_offsets()
+            files = meta.get("files", [])
+            if len(offsets) == 0 or len(files) == 0:
+                continue
+            try:
+                disp = ax.transData.transform(np.asarray(offsets))
+            except Exception:
+                continue
+            dists = np.linalg.norm(disp - click_disp, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist and idx < len(files):
+                best_dist = dists[idx]
+                best_fname = str(files[idx])
+                arr = np.asarray(offsets)
+                best_xy = (float(arr[idx, 0]), float(arr[idx, 1]))
+        if best_fname and best_dist <= TOLERANCE_PX:
+            result_dir = self._current_result_dir()
+            self._selected_point_xy = best_xy
+            self._set_selected_frame(best_fname, result_dir)
+            self._draw_selection_indicator()
 
     def _exclude_selected_frame(self) -> None:
         if not self._frame_qc_selected or self._frame_qc_selected_dir is None:
             return
         exclude_map = self._get_frame_exclude_map(self._frame_qc_selected_dir)
+        if self._frame_qc_selected in exclude_map:
+            return  # already excluded — nothing to do
         exclude_map.setdefault(self._frame_qc_selected, set()).add("manual")
         self._frame_exclude_dirty.add(str(self._frame_qc_selected_dir))
         self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
         self._update_frame_qc_summary()
-        self.plot_current_comparison()
+        self._refresh_qc_stats_panel()
         self._refresh_qc_preview()
+        self._refresh_lc_plot()
         self._update_qc_gate_ui()
 
     def _exclude_selected_frame_all_filters(self) -> None:
@@ -2606,33 +3019,44 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._frame_exclude_dirty.add(str(result_dir))
         self._set_selected_frame(self._frame_qc_selected, result_dir)
         self._update_frame_qc_summary()
-        self.plot_current_comparison()
+        self._refresh_qc_stats_panel()
         self._refresh_qc_preview()
+        self._refresh_lc_plot()
         self._update_qc_gate_ui()
 
     def _include_selected_frame(self) -> None:
         if not self._frame_qc_selected or self._frame_qc_selected_dir is None:
             return
         exclude_map = self._get_frame_exclude_map(self._frame_qc_selected_dir)
-        if self._frame_qc_selected in exclude_map:
-            del exclude_map[self._frame_qc_selected]
-            self._frame_exclude_dirty.add(str(self._frame_qc_selected_dir))
+        if self._frame_qc_selected not in exclude_map:
+            return  # already included — nothing to do
+        del exclude_map[self._frame_qc_selected]
+        self._frame_exclude_dirty.add(str(self._frame_qc_selected_dir))
         self._set_selected_frame(self._frame_qc_selected, self._frame_qc_selected_dir)
         self._update_frame_qc_summary()
-        self.plot_current_comparison()
+        self._refresh_qc_stats_panel()
         self._refresh_qc_preview()
+        self._refresh_lc_plot()
         self._update_qc_gate_ui()
 
     def clear_frame_excludes(self) -> None:
         result_dir = self._current_result_dir()
         if result_dir is None:
             return
-        self._frame_exclude_cache[str(result_dir)] = {}
-        self._frame_exclude_dirty.add(str(result_dir))
+        rkey = str(result_dir)
+        had_excludes = bool(self._get_frame_exclude_map(result_dir))
+        self._frame_exclude_cache[rkey] = {}
+        # If there were any excludes (in-memory or on disk), mark dirty so Save can persist the empty state
+        if had_excludes or rkey in self._frame_exclude_dirty:
+            self._frame_exclude_dirty.add(rkey)
+        self._frame_qc_selected = None
+        self._selected_point_xy = None
         self._update_frame_qc_summary()
-        self.plot_current_comparison()
+        self._refresh_qc_stats_panel()
         self._refresh_qc_preview()
+        self._refresh_lc_plot()
         self._update_qc_gate_ui()
+        self.log("[Frame QC] Reset all exclusions.")
 
     def save_frame_excludes(self) -> None:
         result_dir = self._current_result_dir()
@@ -2640,15 +3064,20 @@ class LightCurveBuilderWindow(StepWindowBase):
             return
         exclude_map = self._get_frame_exclude_map(result_dir)
         try:
-            save_frame_excludes_file(result_dir, exclude_map)
+            saved_path = save_frame_excludes_file(result_dir, exclude_map)
             if str(result_dir) in self._frame_exclude_dirty:
                 self._frame_exclude_dirty.remove(str(result_dir))
             self._mark_frame_qc_done(result_dir)
             self._update_frame_qc_summary()
             self._update_qc_gate_ui()
-            self.log("[Frame QC] Saved frame exclusions.")
+            # Invalidate series caches so next plot/build uses updated exclusions
+            rdir_str = str(result_dir)
+            self._diff_series_cache = {k: v for k, v in self._diff_series_cache.items() if k[0] != rdir_str}
+            self._check_series_cache = {k: v for k, v in self._check_series_cache.items() if k[0] != rdir_str}
+            self.log(f"[Frame QC] Saved {len(exclude_map)} exclusion(s).")
         except Exception as e:
             self.log(f"[Frame QC] Save failed: {e}")
+            QMessageBox.warning(self, "Frame QC", f"제외 프레임 저장 실패:\n{e}")
 
     def plot_current_comparison(self):
         if not self.datasets:
@@ -2674,7 +3103,8 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.log("No light curve data to plot.")
             return
         y_col = "diff_mag_raw" if "diff_mag_raw" in df.columns else "diff_mag"
-        self._ensure_filter_controls(df["filter"].astype(str).tolist())
+        self._ensure_filter_colors(df["filter"].astype(str).tolist())
+        self._lc_ever_plotted = True
         self.plot_ax.clear()
         self._plot_point_map = {}
 
@@ -2719,8 +3149,6 @@ class LightCurveBuilderWindow(StepWindowBase):
         y_label = "dmag (raw)"
         for filt, sub in df.groupby("filter"):
             fkey = self._filter_key_for_ui(filt)
-            if not self.filter_visibility.get(fkey, True):
-                continue
             label = fkey
             c = self._get_filter_color(fkey)
 
@@ -2746,91 +3174,164 @@ class LightCurveBuilderWindow(StepWindowBase):
                 )
                 self._plot_point_map[scx] = {"files": files[m_ex].tolist()}
 
+        # Check star overlay
+        try:
+            check_ids_by_filter, check_df = self._build_check_star_series(
+                result_dir,
+                self.comp_ids_list,
+                verbose=False,
+            )
+            if not check_df.empty:
+                if self.x_axis_mode == "phase" and "phase" not in check_df.columns:
+                    if "JD" in check_df.columns and self.phase_period > 0:
+                        jd_c = check_df["JD"].to_numpy(float)
+                        t0_c = self.phase_t0 if self.phase_t0 > 0 else np.nanmin(jd_c)
+                        phase_c = ((jd_c - t0_c) / self.phase_period) % 1.0
+                        check_df = check_df.copy()
+                        check_df["phase"] = phase_c
+                        check_df = self._expand_phase_cycles(check_df)
+                ck_x_col = x_column if x_column in check_df.columns else "rel_time_hr"
+                ck_y_col = "diff_mag_raw" if "diff_mag_raw" in check_df.columns else "diff_mag"
+                if ck_x_col in check_df.columns and ck_y_col in check_df.columns:
+                    cx = check_df[ck_x_col].to_numpy(float)
+                    cy = pd.to_numeric(check_df[ck_y_col], errors="coerce").to_numpy(float)
+                    m_ck = np.isfinite(cx) & np.isfinite(cy)
+                    if np.any(m_ck):
+                        unique_check_ids = sorted(set(check_ids_by_filter.values()))
+                        check_label = f"Check (ID {unique_check_ids[0]})" if len(unique_check_ids) == 1 else "Check"
+                        self.plot_ax.scatter(
+                            cx[m_ck], cy[m_ck], s=6, color="#FFD700", alpha=0.5,
+                            zorder=2, label=check_label, marker="."
+                        )
+        except Exception:
+            pass
+
         self.plot_ax.set_xlabel(x_label)
         self.plot_ax.set_ylabel(f"{y_label} (Target - Comparison)")
         if self.x_axis_mode == "phase" and self.phase_cycles > 1:
             self.plot_ax.set_xlim(0, float(self.phase_cycles))
         self.plot_ax.grid(True, alpha=0.3)
-        self.plot_ax.invert_yaxis()
+
+        # Auto-scale y-axis: median-centered with robust range
+        all_y = []
+        for artist, meta in self._plot_point_map.items():
+            offsets = artist.get_offsets()
+            if len(offsets) > 0:
+                all_y.extend(np.asarray(offsets)[:, 1].tolist())
+        all_y = np.array([v for v in all_y if np.isfinite(v)])
+        if len(all_y) >= 2:
+            med = float(np.nanmedian(all_y))
+            mad = float(np.nanmedian(np.abs(all_y - med)))
+            half = max(mad * 5.0, 0.05)
+            self.plot_ax.set_ylim(med + half, med - half)  # inverted y
+        else:
+            self.plot_ax.invert_yaxis()
+
         handles, labels = self.plot_ax.get_legend_handles_labels()
         if handles:
             self.plot_ax.legend(loc="best", fontsize=8)
-        self.plot_canvas.draw()
+
+        # Restore selection indicator if a point is still selected
+        self._selection_indicator_artist = None
+        if getattr(self, "_selected_point_xy", None) is not None:
+            self._draw_selection_indicator()
+        else:
+            self.plot_canvas.draw()
 
     def _compute_comp_qc(
         self,
         result_dir: Path,
         target_id: int,
         comp_ids: list[int],
-        date_filter: str | None = None,
+        files_override: list[str] | None = None,
         verbose: bool = True,
     ) -> list[dict]:
+        """Check-star QC: each comp is treated as target against remaining comps as ensemble."""
         rows = []
         active_set = set(self.comp_ids_list)
+        if not hasattr(self, "_qc_checkstar_cache"):
+            self._qc_checkstar_cache: dict[int, pd.DataFrame] = {}
+
         for comp_id in comp_ids:
-            df = self._build_star_mag_series(result_dir, comp_id, verbose=False)
+            other_comps = [c for c in comp_ids if c != comp_id]
+            if not other_comps:
+                # Only 1 comp — fall back to absolute mag scatter
+                df = self._build_star_mag_series(result_dir, comp_id, verbose=False,
+                                                  files_override=files_override)
+                if df.empty:
+                    rows.append({"comp_id": int(comp_id), "n": 0, "rms": np.nan, "mad": np.nan,
+                                 "sigma_nights": np.nan, "outliers": 0, "outlier_frac": np.nan,
+                                 "use": comp_id in active_set})
+                    continue
+                y = df["mag"].to_numpy(float)
+                m = np.isfinite(y)
+                yv = y[m]
+                med = np.nanmedian(yv)
+                yv = yv - med
+                rms = float(np.nanstd(yv))
+                mad = float(np.nanmedian(np.abs(yv - np.nanmedian(yv))))
+                rows.append({"comp_id": int(comp_id), "n": int(m.sum()), "rms": rms, "mad": mad,
+                             "sigma_nights": np.nan, "outliers": 0, "outlier_frac": np.nan,
+                             "use": comp_id in active_set})
+                continue
+
+            # Check star: build diff series with this comp as "target"
+            df = self._build_ensemble_series(result_dir, comp_id, other_comps, verbose=False)
+            if files_override:
+                df = df[df["file"].isin(set(files_override))].copy()
+            self._qc_checkstar_cache[comp_id] = df  # cache for preview plot
+
             if df.empty:
-                rows.append({
-                    "comp_id": int(comp_id),
-                    "n": 0,
-                    "rms": np.nan,
-                    "mad": np.nan,
-                    "outliers": 0,
-                    "outlier_frac": np.nan,
-                    "use": comp_id in active_set,
-                })
+                rows.append({"comp_id": int(comp_id), "n": 0, "rms": np.nan, "mad": np.nan,
+                             "sigma_nights": np.nan, "outliers": 0, "outlier_frac": np.nan,
+                             "use": comp_id in active_set})
                 continue
-            if date_filter:
-                df = df[df["date"].astype(str) == str(date_filter)]
-            y = df["mag"].to_numpy(float)
-            filters = df["filter"].astype(str).tolist()
-            # filter-wise median alignment
-            y_adj = np.full_like(y, np.nan, dtype=float)
-            for fkey in sorted(set(filters)):
-                idx = [i for i, f in enumerate(filters) if f == fkey]
-                if not idx:
-                    continue
-                vals = y[idx]
-                if not np.any(np.isfinite(vals)):
-                    continue
-                med = np.nanmedian(vals)
-                if not np.isfinite(med):
-                    continue
-                y_adj[idx] = vals - med
-            m = np.isfinite(y_adj)
-            n = int(np.sum(m))
+
+            y = pd.to_numeric(df["diff_mag_raw"], errors="coerce").to_numpy(float)
+            night_ids = df["night_id"].to_numpy(int) if "night_id" in df.columns else np.zeros(len(df), int)
+            m = np.isfinite(y)
+            n = int(m.sum())
             if n <= 1:
-                rows.append({
-                    "comp_id": int(comp_id),
-                    "n": n,
-                    "rms": np.nan,
-                    "mad": np.nan,
-                    "outliers": 0,
-                    "outlier_frac": np.nan,
-                    "use": comp_id in active_set,
-                })
+                rows.append({"comp_id": int(comp_id), "n": n, "rms": np.nan, "mad": np.nan,
+                             "sigma_nights": np.nan, "outliers": 0, "outlier_frac": np.nan,
+                             "use": comp_id in active_set})
                 continue
-            yv = y_adj[m] if np.isfinite(y_adj).any() else y[m]
-            med = np.nanmedian(yv)
-            mad = np.nanmedian(np.abs(yv - med))
+
+            yv = y[m]
             rms = float(np.nanstd(yv))
-            outlier_count = 0
-            if np.isfinite(mad) and mad > 0:
-                outlier_count = int(np.sum(np.abs(yv - med) > self.qc_sigma * mad))
+            med = float(np.nanmedian(yv))
+            mad = float(np.nanmedian(np.abs(yv - med)))
+
+            # Per-night medians → σ(nights) = night-to-night stability
+            night_medians = []
+            for nid in sorted(set(night_ids[m])):
+                if nid <= 0:
+                    continue
+                nm = m & (night_ids == nid)
+                if nm.sum() > 0:
+                    night_medians.append(float(np.nanmedian(y[nm])))
+            sigma_nights = float(np.std(night_medians, ddof=1)) if len(night_medians) >= 2 else np.nan
+
+            # Outliers (3σ from median)
+            outlier_count = int(np.sum(np.abs(yv - med) > self.qc_sigma * mad)) if np.isfinite(mad) and mad > 0 else 0
             outlier_frac = outlier_count / max(n, 1)
+
+            if verbose:
+                sn_str = f"{sigma_nights:.4f}" if np.isfinite(sigma_nights) else "nan"
+                self.log(f"[QC] Comp {comp_id}: RMS={rms:.4f} σ_nights={sn_str}")
 
             rows.append({
                 "comp_id": int(comp_id),
                 "n": n,
                 "rms": rms,
-                "mad": float(mad) if np.isfinite(mad) else np.nan,
+                "mad": mad,
+                "sigma_nights": sigma_nights,
+                "night_medians": night_medians,
                 "outliers": outlier_count,
                 "outlier_frac": float(outlier_frac),
                 "use": comp_id in active_set,
             })
 
-        if verbose:
-            self.log(f"[QC] Computed metrics for {len(rows)} comps")
         return rows
 
     def _save_comp_qc_summary(self, result_dir: Path, rows: list[dict]) -> None:
@@ -2861,8 +3362,9 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.qc_table.setItem(r, 1, QTableWidgetItem(str(row.get("comp_id", ""))))
             self.qc_table.setItem(r, 2, QTableWidgetItem(str(row.get("n", ""))))
             self.qc_table.setItem(r, 3, QTableWidgetItem(_fmt_float(row.get("rms"))))
-            self.qc_table.setItem(r, 4, QTableWidgetItem(_fmt_float(row.get("mad"))))
-            self.qc_table.setItem(r, 5, QTableWidgetItem(_fmt_percent(row.get("outlier_frac"))))
+            self.qc_table.setItem(r, 4, QTableWidgetItem(_fmt_float(row.get("sigma_nights"))))
+            self.qc_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("mad"))))
+            self.qc_table.setItem(r, 6, QTableWidgetItem(_fmt_percent(row.get("outlier_frac"))))
 
         self._qc_table_block = False
         self._update_comp_count_label()
@@ -2889,6 +3391,98 @@ class LightCurveBuilderWindow(StepWindowBase):
             return Path(self.datasets[0][1])
         return Path(self.params.P.result_dir)
 
+    def _load_qc_night_id_map(self, result_dir: Path, idx: pd.DataFrame) -> dict[str, int]:
+        """Return basename→night_id map. Merges all sources; result is cached per result_dir."""
+        cache_key = str(result_dir)
+        if not hasattr(self, "_night_id_map_cache"):
+            self._night_id_map_cache: dict[str, dict[str, int]] = {}
+
+        if cache_key not in self._night_id_map_cache:
+            night_id_map: dict[str, int] = {}
+            # Source 1: file_manager (in-memory, fastest)
+            fm = getattr(self, "file_manager", None)
+            if fm is not None:
+                for k, v in getattr(fm, "night_assignments", {}).items():
+                    if int(v) > 0:
+                        night_id_map[Path(str(k)).name] = int(v)
+            # Source 2: disk JSON (step1 ground truth)
+            if not night_id_map:
+                raw = _load_night_assignments(result_dir)
+                night_id_map.update({Path(str(k)).name: int(v) for k, v in raw.items() if int(v) > 0})
+            self._night_id_map_cache[cache_key] = night_id_map
+
+        base_map = dict(self._night_id_map_cache[cache_key])
+        # Source 3: CSV column fills gaps only (may be stale/partial)
+        if "night_id" in idx.columns:
+            for fname, night_id in zip(idx["file"].astype(str), pd.to_numeric(idx["night_id"], errors="coerce")):
+                bn = Path(str(fname)).name
+                if not pd.isna(night_id) and int(night_id) > 0 and bn not in base_map:
+                    base_map[bn] = int(night_id)
+        return base_map
+
+    def _build_qc_date_label_map(
+        self,
+        result_dir: Path,
+        idx: pd.DataFrame | None = None,
+    ) -> tuple[list[str], dict[str, str]]:
+        if idx is None:
+            idx_path = step9_dir(result_dir) / "photometry_index.csv"
+            if not idx_path.exists():
+                idx_path = result_dir / "photometry_index.csv"
+            if not idx_path.exists():
+                self._qc_date_label_map = {}
+                return [], {}
+            try:
+                idx = pd.read_csv(idx_path)
+            except Exception:
+                self._qc_date_label_map = {}
+                return [], {}
+        if "file" not in idx.columns:
+            self._qc_date_label_map = {}
+            return [], {}
+
+        files = idx["file"].astype(str).tolist()
+        if not files:
+            self._qc_date_label_map = {}
+            return [], {}
+
+        headers_map = _load_headers_map(result_dir)
+        tz = float(getattr(self.params.P, "site_tz_offset_hours", 0.0))
+        base_dates: dict[str, str] = {}
+        for fname in files:
+            date_obs = headers_map.get(fname)
+            if date_obs:
+                base_dates[fname] = _display_date_from_dateobs(date_obs, tz)
+            else:
+                base_dates[fname] = _extract_date_from_path(result_dir, fname)
+
+        night_id_map = self._load_qc_night_id_map(result_dir, idx)
+        unique_nights = sorted({night_id_map.get(fname, 0) for fname in files if night_id_map.get(fname, 0) > 0})
+
+        if len(unique_nights) <= 1:
+            self._qc_date_label_map = dict(base_dates)
+            return files, dict(base_dates)
+
+        night_dates: dict[int, str] = {}
+        for night_id in unique_nights:
+            candidates = [
+                base_dates.get(fname, "unknown")
+                for fname in files
+                if night_id_map.get(fname, 0) == night_id and base_dates.get(fname, "unknown") != "unknown"
+            ]
+            night_dates[night_id] = candidates[0] if candidates else "unknown"
+
+        labels: dict[str, str] = {}
+        for fname in files:
+            night_id = night_id_map.get(fname, 0)
+            if night_id > 0:
+                labels[fname] = f"N{night_id}"
+            else:
+                labels[fname] = base_dates.get(fname, "unknown")
+
+        self._qc_date_label_map = dict(labels)
+        return files, labels
+
     def _refresh_qc_filter_combo(self, filters: list[str]) -> None:
         if not hasattr(self, "qc_filter_combo"):
             return
@@ -2912,17 +3506,16 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.qc_date_combo.blockSignals(True)
         self.qc_date_combo.clear()
         self.qc_date_combo.addItem("All")
-        keys = sorted({str(d) for d in dates if d})
+        keys = list(dict.fromkeys(str(d) for d in dates if d and str(d) != "unknown"))
         for key in keys:
             self.qc_date_combo.addItem(key)
-        # Prefer last selected date > current selection > first date
-        prefer = self.qc_date_last
+        # Restore previous selection; if not found, keep "All"
+        prefer = getattr(self, "qc_date_last", "")
         if prefer and prefer in keys:
             self.qc_date_combo.setCurrentText(prefer)
         elif current and current in keys:
             self.qc_date_combo.setCurrentText(current)
-        elif keys:
-            self.qc_date_combo.setCurrentText(keys[0])
+        # else: leave "All" selected
         self.qc_date_combo.blockSignals(False)
 
     def _get_qc_selected_comp_id(self) -> int | None:
@@ -2954,11 +3547,16 @@ class LightCurveBuilderWindow(StepWindowBase):
         return False
 
     def run_comp_qc(self):
+        if getattr(self, "_qc_running", False):
+            return
         if not self.datasets:
             return
+
+        # Collect params on main thread before spawning worker
         prev_comp_id = self._get_qc_selected_comp_id()
         if prev_comp_id is None:
             prev_comp_id = getattr(self, "_qc_last_selected_comp_id", None)
+
         target_id_text = self.target_edit.text().strip()
         if not target_id_text:
             target_id, comp_ids = _load_selection_ids(self.datasets[0][1])
@@ -2972,17 +3570,62 @@ class LightCurveBuilderWindow(StepWindowBase):
         target_id = int(self.target_edit.text().strip())
         if not self.comp_candidate_ids:
             self.comp_candidate_ids = list(_safe_int_list(self.comp_edit.text()))
+
         result_dir = self._get_qc_result_dir()
-        if self.comp_candidate_ids:
-            date_probe = self._build_star_mag_series(result_dir, int(self.comp_candidate_ids[0]), verbose=False)
-            if not date_probe.empty and "date" in date_probe.columns:
-                self._refresh_qc_date_combo(date_probe["date"].astype(str).tolist())
+        qc_files_all, qc_date_label_map = self._build_qc_date_label_map(result_dir)
+        if qc_date_label_map:
+            self._refresh_qc_date_combo([qc_date_label_map.get(fname, "") for fname in qc_files_all])
+
         date_sel = None
+        files_for_metrics = None
         if hasattr(self, "qc_date_combo"):
             current_date = self.qc_date_combo.currentText()
             if current_date and current_date != "All":
                 date_sel = current_date
-        rows = self._compute_comp_qc(result_dir, target_id, self.comp_candidate_ids, date_filter=date_sel, verbose=True)
+        if date_sel:
+            files_for_metrics = [fname for fname in qc_files_all if qc_date_label_map.get(fname) == date_sel]
+
+        self._qc_running = True
+        self._qc_prev_comp_id = prev_comp_id
+        self._qc_compute_result_dir = result_dir
+
+        # Disable buttons and show progress bar while running
+        if hasattr(self, "btn_qc_run"):
+            self.btn_qc_run.setEnabled(False)
+            self.btn_qc_run.setText("Running...")
+        if hasattr(self, "btn_qc_auto"):
+            self.btn_qc_auto.setEnabled(False)
+        if hasattr(self, "qc_progress_bar"):
+            self.qc_progress_bar.show()
+        self.log(f"[QC] Computing QC for {len(self.comp_candidate_ids)} comp(s)...")
+
+        comp_candidates = list(self.comp_candidate_ids)
+        files_override = files_for_metrics
+
+        def _compute():
+            return self._compute_comp_qc(
+                result_dir, target_id, comp_candidates,
+                files_override=files_override, verbose=True,
+            )
+
+        self._qc_worker = _QcComputeWorker(_compute)
+        self._qc_worker.finished.connect(self._on_qc_rows_ready)
+        self._qc_worker.error.connect(self._on_qc_error)
+        self._qc_worker.start()
+
+    def _on_qc_rows_ready(self, rows: list) -> None:
+        self._qc_running = False
+        if hasattr(self, "btn_qc_run"):
+            self.btn_qc_run.setEnabled(True)
+            self.btn_qc_run.setText("Run QC")
+        if hasattr(self, "btn_qc_auto"):
+            self.btn_qc_auto.setEnabled(True)
+        if hasattr(self, "qc_progress_bar"):
+            self.qc_progress_bar.hide()
+
+        result_dir = getattr(self, "_qc_compute_result_dir", None)
+        prev_comp_id = getattr(self, "_qc_prev_comp_id", None)
+
         self.qc_rows = rows
         self._populate_qc_table(rows)
         restored = False
@@ -2991,11 +3634,34 @@ class LightCurveBuilderWindow(StepWindowBase):
         if not restored and self.qc_table.rowCount() > 0:
             self.qc_table.setCurrentCell(0, 1)
             self.qc_table.selectRow(0)
-        self._save_comp_qc_summary(result_dir, rows)
+        if result_dir is not None:
+            self._save_comp_qc_summary(result_dir, rows)
+        self.log(f"[QC] Done. {len(rows)} comp(s) evaluated.")
+        # If auto_use was pending (user clicked Auto Use before QC was run)
+        if getattr(self, "_pending_auto_use", False):
+            self._pending_auto_use = False
+            self._apply_auto_use_thresholds()
+
+    def _on_qc_error(self, msg: str) -> None:
+        self._qc_running = False
+        if hasattr(self, "btn_qc_run"):
+            self.btn_qc_run.setEnabled(True)
+            self.btn_qc_run.setText("Run QC")
+        if hasattr(self, "btn_qc_auto"):
+            self.btn_qc_auto.setEnabled(True)
+        if hasattr(self, "qc_progress_bar"):
+            self.qc_progress_bar.hide()
+        self.log(f"[QC] Error: {msg}")
 
     def auto_use_qc(self):
         if not self.qc_rows:
+            # QC not yet run — run it and apply thresholds when done
+            self._pending_auto_use = True
             self.run_comp_qc()
+            return
+        self._apply_auto_use_thresholds()
+
+    def _apply_auto_use_thresholds(self):
         if not self.qc_rows:
             return
         df = pd.DataFrame(self.qc_rows)
@@ -3066,9 +3732,67 @@ class LightCurveBuilderWindow(StepWindowBase):
             return
         self._qc_last_selected_comp_id = comp_id
         self._plot_comp_preview(comp_id)
+        self._refresh_qc_stats_panel()
+
+    def _refresh_qc_stats_panel(self, *_):
+        comp_id = self._get_qc_selected_comp_id()
+        if not hasattr(self, "qc_stats_table") or comp_id is None:
+            return
+        by_night = hasattr(self, "qc_stats_night_cb") and self.qc_stats_night_cb.isChecked()
+
+        cache = getattr(self, "_qc_checkstar_cache", {})
+        df = cache.get(int(comp_id))
+        if df is None or df.empty:
+            self.qc_stats_table.setRowCount(0)
+            return
+
+        # Apply current frame exclusions to stats
+        result_dir = self._current_result_dir()
+        if result_dir is not None:
+            excl = set(self._get_frame_exclude_map(result_dir).keys())
+            if excl and "file" in df.columns:
+                df = df[~df["file"].astype(str).isin(excl)]
+
+        y_col = "diff_mag_raw" if "diff_mag_raw" in df.columns else ("diff_mag" if "diff_mag" in df.columns else "mag")
+        filt_col = "filter" if "filter" in df.columns else None
+        night_col = "night_id" if "night_id" in df.columns else None
+
+        rows = []
+        groups = []
+        if by_night and night_col and filt_col:
+            for (flt, night), sub in df.groupby([filt_col, night_col]):
+                groups.append((f"{flt} N{night}", sub))
+        elif filt_col:
+            for flt, sub in df.groupby(filt_col):
+                groups.append((str(flt), sub))
+        else:
+            groups.append(("all", df))
+
+        for label, sub in groups:
+            y = pd.to_numeric(sub[y_col], errors="coerce").dropna().to_numpy(float)
+            y = y[np.isfinite(y)]
+            if len(y) == 0:
+                continue
+            med = float(np.nanmedian(y))
+            sig = float(np.nanstd(y))
+            mad = float(np.nanmedian(np.abs(y - med)))
+            rows.append((label, len(y), med, sig, mad))
+
+        self.qc_stats_table.setRowCount(len(rows))
+        for i, (label, n, med, sig, mad) in enumerate(rows):
+            self.qc_stats_table.setItem(i, 0, QTableWidgetItem(label))
+            self.qc_stats_table.setItem(i, 1, QTableWidgetItem(str(n)))
+            self.qc_stats_table.setItem(i, 2, QTableWidgetItem(f"{med:.4f}"))
+            sig_item = QTableWidgetItem(f"{sig:.4f}")
+            if sig > 0.03:
+                sig_item.setForeground(QColor("#E53935"))
+            elif sig > 0.015:
+                sig_item.setForeground(QColor("#FB8C00"))
+            self.qc_stats_table.setItem(i, 3, sig_item)
+            self.qc_stats_table.setItem(i, 4, QTableWidgetItem(f"{mad:.4f}"))
 
     def _init_qc_view(self) -> None:
-        """Initialize QC tab view even if Light tab was never opened."""
+        """Initialize QC tab: populate table with all candidates checked (no metric computation)."""
         if not self.datasets:
             return
         if not self.target_edit.text().strip() or not self.comp_edit.text().strip():
@@ -3079,36 +3803,47 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.comp_edit.setText(",".join(str(i) for i in comp_ids))
                 self.comp_candidate_ids = list(comp_ids)
         self._update_comp_ids_from_input()
-        if self.tab_widget.currentWidget() == self.qc_tab:
-            self.run_comp_qc()
+        # Populate table with all candidates checked — no heavy QC computation on open
+        if self.comp_candidate_ids and self.qc_table.rowCount() == 0:
+            active_set = set(self.comp_ids_list)
+            rows = [{"comp_id": cid, "use": cid in active_set or not active_set}
+                    for cid in self.comp_candidate_ids]
+            self._populate_qc_table(rows)
 
     def _on_qc_plot_click(self, event) -> None:
+        self.check_plot_canvas.setFocus()
+        if not event.dblclick:
+            return
         if event.inaxes != self.check_plot_ax:
             return
         if event.xdata is None or event.ydata is None:
             return
-        if not hasattr(self, "_qc_plot_points") or not self._qc_plot_points:
-            return
-        x = self._qc_plot_points.get("x")
-        y = self._qc_plot_points.get("y")
-        files = self._qc_plot_points.get("file")
-        if x is None or y is None or files is None:
-            return
-        if len(x) == 0:
-            return
-        xy = np.column_stack([np.array(x, float), np.array(y, float)])
-        click = np.array([[event.xdata, event.ydata]], float)
-        px = self.check_plot_ax.transData.transform(xy)
-        click_px = self.check_plot_ax.transData.transform(click)[0]
-        d2 = np.sum((px - click_px) ** 2, axis=1)
-        i = int(np.argmin(d2))
-        if i < 0 or i >= len(files):
-            return
-        if d2[i] > 100:  # 10px radius
-            return
-        fname = str(files[i])
-        result_dir = self._current_result_dir()
-        self._set_selected_frame(fname, result_dir)
+        TOLERANCE_PX = 20
+        ax = self.check_plot_ax
+        click_disp = ax.transData.transform([[event.xdata, event.ydata]])[0]
+        best_dist = float("inf")
+        best_fname = None
+        best_xy = None
+        for artist, meta in self._qc_plot_point_map.items():
+            offsets = artist.get_offsets()
+            files = meta.get("files", [])
+            if len(offsets) == 0 or len(files) == 0:
+                continue
+            try:
+                disp = ax.transData.transform(np.asarray(offsets))
+            except Exception:
+                continue
+            dists = np.linalg.norm(disp - click_disp, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist and idx < len(files):
+                best_dist = dists[idx]
+                best_fname = str(files[idx])
+                arr = np.asarray(offsets)
+                best_xy = (float(arr[idx, 0]), float(arr[idx, 1]))
+        if best_fname and best_dist <= TOLERANCE_PX:
+            result_dir = self._current_result_dir()
+            self._set_selected_frame(best_fname, result_dir)
+            self._draw_qc_selection_indicator(best_xy)
 
     def _frame_group_key(self, fname: str) -> str:
         stem = Path(str(fname)).stem
@@ -3127,22 +3862,43 @@ class LightCurveBuilderWindow(StepWindowBase):
             idx_path = result_dir / "photometry_index.csv"
         if not idx_path.exists():
             return [], [], []
+
+        # Cache photometry_index by mtime
+        cache_key = str(idx_path)
         try:
-            idx = pd.read_csv(idx_path)
-        except Exception:
-            return [], [], []
+            mtime = idx_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        cached = self._qc_idx_cache.get(cache_key)
+        if cached and cached[0] == mtime:
+            idx = cached[1]
+        else:
+            try:
+                idx = pd.read_csv(idx_path)
+            except Exception:
+                return [], [], []
+            self._qc_idx_cache[cache_key] = (mtime, idx)
+
         if "file" not in idx.columns:
             return [], [], []
 
         files = idx["file"].astype(str).tolist()
+        _, qc_date_label_map = self._build_qc_date_label_map(result_dir, idx)
         filter_map = {}
         if "filter" in idx.columns:
             filter_map = dict(zip(idx["file"].astype(str), idx["filter"].astype(str)))
         elif "FILTER" in idx.columns:
             filter_map = dict(zip(idx["file"].astype(str), idx["FILTER"].astype(str)))
 
-        headers_map = _load_headers_map(result_dir)
-        headers_df = _load_headers_table(result_dir)
+        # Cache headers by result_dir
+        h_key = str(result_dir)
+        h_cached = self._qc_headers_cache.get(h_key)
+        if h_cached:
+            headers_map, headers_df = h_cached[1], h_cached[2]
+        else:
+            headers_map = _load_headers_map(result_dir)
+            headers_df = _load_headers_table(result_dir)
+            self._qc_headers_cache[h_key] = (mtime, headers_map, headers_df)
         header_filter_map = {}
         if not headers_df.empty and "Filename" in headers_df.columns:
             for col in ("FILTER", "filter"):
@@ -3152,52 +3908,25 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         date_sel = self.qc_date_combo.currentText() if hasattr(self, "qc_date_combo") else "All"
         if date_sel and date_sel != "All":
-            filtered = []
-            for fname in files:
-                date_obs = headers_map.get(fname)
-                if date_obs:
-                    date_val = _date_from_dateobs(date_obs)
-                else:
-                    date_val = _extract_date_from_path(result_dir, fname)
-                if str(date_val) == str(date_sel):
-                    filtered.append(fname)
-            files = filtered
+            files = [fname for fname in files if qc_date_label_map.get(fname) == date_sel]
 
         files_all = list(files)
 
-        filters_all = []
-        for fname in files_all:
-            filt_val = filter_map.get(fname, "") or header_filter_map.get(fname, "")
-            fkey = self._filter_key_for_ui(str(filt_val))
-            if fkey:
-                filters_all.append(fkey)
+        filters_all = list(dict.fromkeys(
+            fkey for fname in files_all
+            for fkey in [self._filter_key_for_ui(str(filter_map.get(fname, "") or header_filter_map.get(fname, "")))]
+            if fkey
+        ))
 
         filter_sel = self.qc_filter_combo.currentText() if hasattr(self, "qc_filter_combo") else "All"
         if filter_sel and filter_sel not in ("All", "", None):
-            filtered = []
-            for fname in files:
-                filt_val = filter_map.get(fname, "") or header_filter_map.get(fname, "")
-                if self._filter_key_for_ui(str(filt_val)) == filter_sel:
-                    filtered.append(fname)
+            filtered = [
+                fname for fname in files_all
+                if self._filter_key_for_ui(str(filter_map.get(fname, "") or header_filter_map.get(fname, ""))) == filter_sel
+            ]
             return files_all, filtered, filters_all
 
         return files_all, files_all, filters_all
-
-    def _on_qc_plot_pick(self, event) -> None:
-        artist = event.artist
-        meta = self._qc_plot_point_map.get(artist)
-        if not meta:
-            return
-        indices = getattr(event, "ind", None)
-        if indices is None or len(indices) == 0:
-            return
-        idx = int(indices[0])
-        files = meta.get("files", [])
-        if idx < 0 or idx >= len(files):
-            return
-        fname = str(files[idx])
-        result_dir = self._current_result_dir()
-        self._set_selected_frame(fname, result_dir)
 
     def _plot_comp_preview(self, comp_id: int) -> None:
         if not self.datasets:
@@ -3205,30 +3934,40 @@ class LightCurveBuilderWindow(StepWindowBase):
         result_dir = self._get_qc_result_dir()
         files_all, files_use, filters_all = self._collect_qc_preview_files(result_dir)
         self._qc_scope_files_all_filters = files_all
-        df = self._build_star_mag_series(
-            result_dir,
-            int(comp_id),
-            verbose=False,
-            include_excluded=True,
-            files_override=files_use,
-            preload=False,
-        )
+        # Use cached check star diff series if available; else fall back to absolute mag
+        cache = getattr(self, "_qc_checkstar_cache", {})
+        if int(comp_id) in cache:
+            df = cache[int(comp_id)].copy()
+            _use_diff = True
+            # date/filter selection 적용
+            if files_use is not None and set(files_use) != set(files_all):
+                df = df[df["file"].isin(set(files_use))].copy()
+        else:
+            df = self._build_star_mag_series(
+                result_dir,
+                int(comp_id),
+                verbose=False,
+                include_excluded=True,
+                files_override=files_use,
+                preload=False,
+            )
+            _use_diff = False
         self.check_plot_ax.clear()
+        self._qc_selection_indicator_artist = None  # axes cleared; old artist is detached
         self._qc_plot_point_map = {}
         self._qc_plot_points = {"x": [], "y": [], "file": []}
         if df.empty:
             self.check_plot_canvas.draw()
             return
-        if "date" in df.columns:
-            self._refresh_qc_date_combo(df["date"].astype(str).tolist())
         if filters_all:
             self._refresh_qc_filter_combo(filters_all)
         self._qc_scope_df = df.copy()
 
-        x = df["rel_time_hr"].to_numpy(float)
-        y = df["mag"].to_numpy(float)
+        x = df["JD"].to_numpy(float) if "JD" in df.columns else df.get("rel_time_hr", pd.Series(np.arange(len(df)))).to_numpy(float)
+        y = df["diff_mag_raw"].to_numpy(float) if _use_diff and "diff_mag_raw" in df.columns else df["mag"].to_numpy(float)
+        night_ids_plot = df["night_id"].to_numpy(int) if "night_id" in df.columns else np.zeros(len(df), int)
         files = df["file"].astype(str).to_numpy()
-        filters = df["filter"].astype(str).tolist()
+        filters = df["filter"].astype(str).tolist() if "filter" in df.columns else ["?"] * len(df)
         plotted_y = []
         excluded_files = set(self._get_frame_exclude_map(result_dir).keys())
         if np.isfinite(x).any() and np.isfinite(y).any():
@@ -3269,20 +4008,12 @@ class LightCurveBuilderWindow(StepWindowBase):
                 plotted_y.extend(yv[m].tolist())
         self.check_plot_ax.set_title(f"Comp ID {comp_id}")
         self.check_plot_ax.set_xlabel("Time (hr)")
-        self.check_plot_ax.set_ylabel("mag")
+        ylabel = "Δmag (check star)" if _use_diff else "Inst. Mag"
+        self.check_plot_ax.set_ylabel(ylabel, fontsize=9)
+        if _use_diff:
+            self.check_plot_ax.axhline(0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+            self.check_plot_ax.invert_yaxis()
         self.check_plot_ax.grid(True, alpha=0.3)
-        if self._frame_qc_selected:
-            try:
-                sel_idx = np.where(files == str(self._frame_qc_selected))[0]
-                if len(sel_idx) > 0:
-                    i0 = int(sel_idx[0])
-                    self.check_plot_ax.scatter(
-                        [x[i0]], [y[i0]],
-                        s=80, facecolors="none", edgecolors="#FF1744",
-                        linewidths=1.8, zorder=6
-                    )
-            except Exception:
-                pass
         if plotted_y:
             y_arr = np.array(plotted_y, float)
             scale_mode = self.qc_scale_mode
@@ -3303,25 +4034,24 @@ class LightCurveBuilderWindow(StepWindowBase):
         handles, labels = self.check_plot_ax.get_legend_handles_labels()
         if handles:
             self.check_plot_ax.legend(loc="best", fontsize=8)
+        # Redraw selection indicator (single source of truth)
+        if self._frame_qc_selected:
+            try:
+                sel_idx = np.where(files == str(self._frame_qc_selected))[0]
+                if len(sel_idx) > 0:
+                    i0 = int(sel_idx[0])
+                    sc = self.check_plot_ax.scatter(
+                        [x[i0]], [y[i0]], s=220, facecolors="none",
+                        edgecolors="red", linewidths=2.0, zorder=20
+                    )
+                    self._qc_selection_indicator_artist = sc
+            except Exception:
+                pass
         self.check_plot_canvas.draw()
 
     def build_light_curve(self):
         if not self.datasets:
             QMessageBox.information(self, "Light Curve", "데이터셋이 없습니다.")
-            return
-
-        pending_qc = []
-        for label, path in self.datasets:
-            if not self._is_frame_qc_ready(Path(path)):
-                pending_qc.append(label)
-        if pending_qc:
-            QMessageBox.information(
-                self,
-                "Light Curve",
-                "Frame QC가 완료되지 않았습니다.\n"
-                "나쁜 프레임을 제외한 뒤 'Save Exclusions'을 눌러주세요.\n\n"
-                f"미완료: {', '.join(pending_qc)}",
-            )
             return
 
         target_id = self.target_edit.text().strip()
@@ -3358,6 +4088,9 @@ class LightCurveBuilderWindow(StepWindowBase):
         )
 
         combined_raw = []
+        base_dir = step10_dir(self.params.P.result_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        single_dataset_mode = len(self.datasets) == 1
         for label, result_dir in self.datasets:
             result_dir = Path(result_dir)
             raw_df = self._build_ensemble_series(result_dir, target_id, active_comp_ids, verbose=True)
@@ -3417,17 +4150,57 @@ class LightCurveBuilderWindow(StepWindowBase):
             out_path = out_dir / f"lightcurve_ID{target_id}_raw.csv"
             raw_df.to_csv(out_path, index=False)
             self.log(f"[{label}] Saved {out_path.name}")
+
+            # Export check star light curve if defined
+            try:
+                check_ids_by_filter, check_df = self._build_check_star_series(
+                    result_dir,
+                    active_comp_ids,
+                    verbose=False,
+                )
+                if not check_df.empty:
+                    check_df.to_csv(out_dir / "lightcurve_check_combined_raw.csv", index=False)
+                    for filt_key, check_id in sorted(check_ids_by_filter.items()):
+                        part = check_df[
+                            check_df["filter"].astype(str).map(_normalize_filter_key) == filt_key
+                        ].copy()
+                        if part.empty:
+                            continue
+                        part_path = out_dir / f"lightcurve_check_{filt_key}_ID{int(check_id)}_raw.csv"
+                        part.to_csv(part_path, index=False)
+                        self.log(f"  Check star saved → {part_path.name}")
+                    if "check_id" in check_df.columns:
+                        for check_id in sorted({
+                            int(x) for x in pd.to_numeric(check_df["check_id"], errors="coerce").dropna().astype(int).tolist()
+                        }):
+                            part = check_df[pd.to_numeric(check_df["check_id"], errors="coerce") == int(check_id)].copy()
+                            if part.empty:
+                                continue
+                            legacy_path = out_dir / f"lightcurve_check_ID{int(check_id)}_raw.csv"
+                            part.to_csv(legacy_path, index=False)
+                elif check_ids_by_filter:
+                    self.log("  Check star configured but no usable check-star light curve was built")
+            except Exception as e:
+                self.log(f"  Check star export failed: {e}")
+
             combined_raw.append(raw_df)
 
         # combined outputs
         if combined_raw:
-            base_dir = step10_dir(self.params.P.result_dir)
-            base_dir.mkdir(parents=True, exist_ok=True)
             comb = pd.concat(combined_raw, ignore_index=True)
             comb = comb.sort_values("JD")
             comb_path = base_dir / f"lightcurve_combined_ID{target_id}_raw.csv"
-            comb.to_csv(comb_path, index=False)
-            self.log(f"[combined] Saved {comb_path.name}")
+            if single_dataset_mode:
+                if comb_path.exists():
+                    try:
+                        comb_path.unlink()
+                        self.log(f"[combined] Removed stale {comb_path.name} (single dataset)")
+                    except Exception as e:
+                        self.log(f"[combined] Failed to remove stale {comb_path.name}: {e}")
+                self.log("[combined] Skipped combined raw output (single dataset)")
+            else:
+                comb.to_csv(comb_path, index=False)
+                self.log(f"[combined] Saved {comb_path.name}")
 
         # comp selection 저장
         if combined_raw:
@@ -3480,6 +4253,9 @@ class LightCurveBuilderWindow(StepWindowBase):
         if event.key() == Qt.Key_A:
             self._include_selected_frame()
             return
+        if event.key() == Qt.Key_R:
+            self.clear_frame_excludes()
+            return
         super().keyPressEvent(event)
 
     def validate_step(self) -> bool:
@@ -3488,6 +4264,30 @@ class LightCurveBuilderWindow(StepWindowBase):
     # ------------------------------------------------------------------
     # Multi-dataset helpers
     # ------------------------------------------------------------------
+
+    def _dataset_summary_text(self) -> str:
+        count = len(self.datasets)
+        if count <= 1:
+            return "현재 1개 폴더 사용 중"
+        return f"총 {count}개 폴더 사용 중"
+
+    def _update_dataset_summary(self) -> None:
+        if hasattr(self, "ds_summary_label"):
+            self.ds_summary_label.setText(self._dataset_summary_text())
+            dataset_names = ", ".join(label for label, _ in self.datasets)
+            self.ds_summary_label.setToolTip(dataset_names)
+
+    def _set_dataset_panel_expanded(self, expanded: bool, persist: bool = False) -> None:
+        self.dataset_panel_expanded = bool(expanded)
+        if hasattr(self, "btn_ds_toggle"):
+            self.btn_ds_toggle.blockSignals(True)
+            self.btn_ds_toggle.setChecked(self.dataset_panel_expanded)
+            self.btn_ds_toggle.setText("▼ 접기" if self.dataset_panel_expanded else "▶ 펼치기")
+            self.btn_ds_toggle.blockSignals(False)
+        if hasattr(self, "ds_container"):
+            self.ds_container.setVisible(self.dataset_panel_expanded)
+        if persist:
+            self.save_state()
 
     def _on_add_dataset(self):
         p = QFileDialog.getExistingDirectory(self, "추가 result 폴더 선택", str(self.params.P.result_dir))
@@ -3499,6 +4299,8 @@ class LightCurveBuilderWindow(StepWindowBase):
                 return
         self.datasets.append((p.name, p))
         self.ds_list_widget.addItem(p.name)
+        self._update_dataset_summary()
+        self.save_state()
 
     def _on_remove_dataset(self):
         row = self.ds_list_widget.currentRow()
@@ -3507,6 +4309,8 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.ds_list_widget.takeItem(row)
         if row < len(self.datasets):
             self.datasets.pop(row)
+        self._update_dataset_summary()
+        self.save_state()
 
     def save_state(self):
         state_data = {
@@ -3527,6 +4331,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             "period_max": self.period_max,
             "filter_visibility": self.filter_visibility,
             "filter_colors": self.filter_colors,
+            "dataset_panel_expanded": self.dataset_panel_expanded,
             "extra_result_dirs": [str(p) for _, p in self.datasets[1:]],
         }
         self.project_state.store_step_data("light_curve", state_data)
@@ -3552,6 +4357,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.phase_cycles = max(1.0, float(state_data.get("phase_cycles", 1.0)))
             self.period_min = float(state_data.get("period_min", 0.01))
             self.period_max = float(state_data.get("period_max", 10.0))
+            self.dataset_panel_expanded = bool(state_data.get("dataset_panel_expanded", False))
             self.filter_visibility = {
                 str(k): bool(v) for k, v in (state_data.get("filter_visibility", {}) or {}).items()
             }
@@ -3579,3 +4385,5 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.datasets.append((p.name, p))
                 if hasattr(self, "ds_list_widget"):
                     self.ds_list_widget.addItem(p.name)
+        self._update_dataset_summary()
+        self._set_dataset_panel_expanded(self.dataset_panel_expanded, persist=False)

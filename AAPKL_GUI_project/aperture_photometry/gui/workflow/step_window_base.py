@@ -109,8 +109,9 @@ class StepWindowBase(QMainWindow):
         self.btn_complete.clicked.connect(self.mark_complete)
         nav_layout.addWidget(self.btn_complete)
 
-        # Next button (RED when incomplete, GREEN when complete)
-        self.btn_next = QPushButton("Next Step →")
+        # Next / Exit button (RED when incomplete, GREEN when complete)
+        self._is_last_step = (self.step_index >= len(self.main_window.step_names) - 1)
+        self.btn_next = QPushButton("Exit ✕" if self._is_last_step else "Next Step →")
         self.btn_next.setMinimumHeight(40)
         self.btn_next.setFont(QFont("Arial", 10, QFont.Bold))
         self.btn_next.setEnabled(False)
@@ -300,11 +301,18 @@ class StepWindowBase(QMainWindow):
         # Update buttons
         self.update_navigation_buttons()
 
-        QMessageBox.information(
-            self, "Step Complete",
-            f"Step {self.step_index + 1} marked as complete!\n\n"
-            f"Click 'Next Step' to proceed or close this window to return to main menu."
-        )
+        if self._is_last_step:
+            QMessageBox.information(
+                self, "Step Complete",
+                f"Step {self.step_index + 1} marked as complete!\n\n"
+                f"All steps finished. Click 'Exit' to return to main menu."
+            )
+        else:
+            QMessageBox.information(
+                self, "Step Complete",
+                f"Step {self.step_index + 1} marked as complete!\n\n"
+                f"Click 'Next Step' to proceed or close this window to return to main menu."
+            )
 
     def go_previous(self):
         """Go to previous step"""
@@ -313,7 +321,7 @@ class StepWindowBase(QMainWindow):
             self.main_window.open_step(self.step_index - 1)
 
     def go_next(self):
-        """Go to next step"""
+        """Go to next step, or close (exit) if this is the last step."""
         if not self.project_state.is_step_completed(self.step_index):
             QMessageBox.warning(
                 self, "Step Not Complete",
@@ -322,7 +330,8 @@ class StepWindowBase(QMainWindow):
             return
 
         self.close()
-        self.main_window.open_step(self.step_index + 1)
+        if not self._is_last_step:
+            self.main_window.open_step(self.step_index + 1)
 
     def save_state(self):
         """

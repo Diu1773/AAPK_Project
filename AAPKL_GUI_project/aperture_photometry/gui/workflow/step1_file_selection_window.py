@@ -579,9 +579,12 @@ class FileSelectionWindow(StepWindowBase):
         self.params.P.data_dir = Path(path)
 
         self.params.P.result_dir = self.params.P.data_dir / "result"
-        self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
         self.params.P.cache_dir = self.params.P.result_dir / "cache"
-        self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
+            self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # Drive not connected; dirs created when user picks a valid path
 
         if hasattr(self, "file_count_label"):
             self.file_count_label.setText("Files: 0")

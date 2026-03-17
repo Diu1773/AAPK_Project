@@ -733,9 +733,15 @@ class Parameters:
         # Setup directory paths
         P.data_dir = Path(P.data_dir)
         P.result_dir = Path(P.result_dir) if P.result_dir else (P.data_dir / "result")
-        P.result_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            P.result_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # Drive not connected; will be created when data dir is set
         P.cache_dir = (P.result_dir / str(P.cache_dir))
-        P.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            P.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
         # FWHM seed (pixel-based legacy)
         pix_legacy = P.fwhm_pix_guess

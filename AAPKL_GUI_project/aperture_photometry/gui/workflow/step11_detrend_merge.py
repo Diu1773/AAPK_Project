@@ -5,6 +5,7 @@ Step 11: Detrend & Night Merge
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 import json
 import re
 
@@ -20,6 +21,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QPushButton,
     QLabel,
+    QDialog,
     QGroupBox,
     QLineEdit,
     QMessageBox,
@@ -40,13 +42,30 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QSplitter,
     QFrame,
-    QSizePolicy,
+    QTextBrowser,
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QFont
 
 from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
-from ...utils.step_paths import step1_dir, step8_dir, step9_dir, step10_dir, step11_dir, legacy_step11_zeropoint_dir
+from ...utils.step_paths import (
+    step1_dir,
+    step8_dir,
+    step9_dir,
+    step10_dir,
+    step11_dir,
+    step11_current_lc_path,
+    step11_current_params_path,
+    step11_current_summary_path,
+    step11_current_plot_path,
+    step11_current_meta_path,
+    step11_current_global_zp_path,
+    step11_current_global_mean_path,
+    step11_current_global_diag_path,
+    step11_history_dir,
+    legacy_step11_zeropoint_dir,
+)
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
 from ...utils.io_utils import (
     read_csv_int64_source_id,
@@ -92,6 +111,16 @@ def _parse_color_expr(expr: str | None) -> tuple[str, str] | None:
 
 def _load_headers_table(result_dir: Path) -> pd.DataFrame:
     return _load_headers_table_util(result_dir)
+
+
+def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
+    """Load check star CSV from step10 output for plotting. Returns (check_id, df_or_None)."""
+    try:
+        from .step10_light_curve_builder import _load_check_star_csv
+        check_id, df = _load_check_star_csv(result_dir, filt=filt)
+        return check_id, (df if not df.empty else None)
+    except Exception:
+        return None, None
 
 
 def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> dict[int, int]:
@@ -190,6 +219,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.setup_step_ui()
         self.restore_state()
         self._auto_load_ids()
+        self.load_raw_data(silent=True)
 
     def setup_step_ui(self):
         # Main horizontal splitter
@@ -235,11 +265,6 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.id_info_label.setWordWrap(True)
         data_layout.addWidget(self.id_info_label)
 
-        btn_load_raw = QPushButton("데이터 로드")
-        btn_load_raw.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 12px; }")
-        btn_load_raw.clicked.connect(self.load_raw_data)
-        data_layout.addWidget(btn_load_raw)
-
         # Date & Filter selection
         selection_row = QHBoxLayout()
 
@@ -283,7 +308,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         analysis_layout = QVBoxLayout(self.analysis_panel)
         analysis_layout.setSpacing(4)
 
-        self.analysis_text = QLabel("데이터를 로드하면 분석 결과가 표시됩니다.")
+        self.analysis_text = QLabel("Step 10 결과가 있으면 자동 로드되어 분석 결과가 표시됩니다.")
         self.analysis_text.setWordWrap(True)
         self.analysis_text.setStyleSheet(
             "QLabel { background-color: #FAFAFA; padding: 8px; border-radius: 4px; font-size: 9pt; }"
@@ -302,6 +327,23 @@ class DetrendNightMergeWindow(StepWindowBase):
         mode_group = QGroupBox("보정 모드 선택")
         mode_group_layout = QVBoxLayout(mode_group)
         mode_group_layout.setSpacing(6)
+
+        mode_header = QHBoxLayout()
+        mode_header.setSpacing(6)
+        mode_help_label = QLabel("각 모드의 입력 데이터, 보정식, 결과 설명")
+        mode_help_label.setStyleSheet("QLabel { color: #616161; font-size: 8pt; }")
+        mode_header.addWidget(mode_help_label)
+        mode_header.addStretch()
+        btn_mode_help = QPushButton("?")
+        btn_mode_help.setFixedSize(24, 24)
+        btn_mode_help.setToolTip("보정 모드 도움말")
+        btn_mode_help.setStyleSheet(
+            "QPushButton { font-weight: bold; border: 1px solid #90A4AE; "
+            "border-radius: 12px; background: white; }"
+        )
+        btn_mode_help.clicked.connect(self._show_mode_help_dialog)
+        mode_header.addWidget(btn_mode_help)
+        mode_group_layout.addLayout(mode_header)
 
         self.mode_group = QButtonGroup(self)
 
@@ -353,9 +395,9 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.mode_global.setStyleSheet("QRadioButton { font-weight: bold; }")
         global_layout.addWidget(self.mode_global)
         global_desc = QLabel(
-            "Δm_corr = m_target - Z_t\n"
+            "Δm_corr = (m_target - Z_t) - <M_comp>\n"
             "• 프레임별 Z_t를 전역 최소제곱으로 동시 추정\n"
-            "• 밤 경계/기준선 자동 정렬"
+            "• comparison ensemble 기준 차등광도 스케일 유지"
         )
         global_desc.setStyleSheet("QLabel { color: #616161; font-size: 8pt; margin-left: 16px; }")
         global_layout.addWidget(global_desc)
@@ -608,10 +650,137 @@ class DetrendNightMergeWindow(StepWindowBase):
     def log(self, msg: str):
         self.log_text.append(msg)
 
+    def _show_mode_help_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Step 11 보정 모드 도움말")
+        dialog.resize(780, 680)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        browser = QTextBrowser(dialog)
+        browser.setReadOnly(True)
+        browser.setOpenExternalLinks(False)
+        browser.setStyleSheet(
+            "QTextBrowser { background-color: #FAFAFA; border: 1px solid #D0D0D0; "
+            "padding: 8px; font-size: 9pt; }"
+        )
+        browser.setHtml(self._build_mode_help_html())
+        layout.addWidget(browser, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(dialog.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dialog.exec_()
+
+    def _build_mode_help_html(self) -> str:
+        return """
+<html>
+<body style="font-family:'Malgun Gothic'; font-size:9pt; line-height:1.45;">
+<h3 style="margin-top:0;">Step 11 도움말: 보정 모드 설명</h3>
+<p>
+Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입니다.
+모드에 따라 <b>Step 10 차등측광 결과</b>를 그대로 후처리하거나,
+<b>Step 9 개별 프레임 측광값</b>을 다시 읽어 전역 ensemble 해를 구합니다.
+</p>
+
+<h4>1. Offset Only (ZP₀)</h4>
+<p><b>입력 데이터</b></p>
+<ul>
+  <li><code>step10_lightcurve/lightcurve_ID*_raw.csv</code></li>
+  <li>주요 컬럼: <code>diff_mag_raw</code>, <code>diff_err</code>, <code>airmass</code>, <code>date/night</code></li>
+</ul>
+<p><b>무엇을 하나</b></p>
+<ul>
+  <li>각 밤/필터 그룹에서 <code>diff_mag_raw</code>의 가중평균을 <code>ZP₀</code>로 추정합니다.</li>
+  <li>기울기 없이 상수항만 제거합니다.</li>
+  <li>적용식: <code>Δm_corr = Δm_raw - ZP₀</code></li>
+</ul>
+<p><b>결과</b></p>
+<ul>
+  <li>출력은 baseline이 0 근처로 맞춰진 차등광도입니다.</li>
+  <li><code>ZP₀</code>는 절대측광 zero point가 아니라, 그 밤 차등광도의 baseline입니다.</li>
+  <li>저장 파일: <code>lightcurve_ID*_current.csv</code>, <code>params_ID*_current.csv</code>, <code>summary_ID*_current.txt</code> (모드는 CSV 내부 <code>correction_mode</code>와 <code>result_ID*_current.json</code>에 기록)</li>
+</ul>
+<p><b>권장 사용처 / 주의</b></p>
+<ul>
+  <li>빠른 위상 접기, exploratory plotting, baseline centering</li>
+  <li>target 자체의 밤평균 변화까지 같이 제거할 수 있으므로, 장기/저주파 변광 해석에는 주의</li>
+</ul>
+
+<h4>2. Color-dependent (ZP₀ + k''·ΔC·X)</h4>
+<p><b>입력 데이터</b></p>
+<ul>
+  <li><code>step10_lightcurve/lightcurve_ID*_raw.csv</code></li>
+  <li>주요 컬럼: <code>diff_mag_raw</code>, <code>diff_err</code>, <code>airmass</code></li>
+  <li>추가 정보: 필터별 <code>ΔC = target color - comparison ensemble color</code></li>
+</ul>
+<p><b>무엇을 하나</b></p>
+<ul>
+  <li><code>x = X · ΔC</code>를 만들고 차등광도를 선형 fit합니다.</li>
+  <li>적용식: <code>Δm_corr = Δm_raw - ZP₀ - k''·ΔC·X</code></li>
+  <li><code>Global k''</code>를 켜면 필터별 <code>k''</code>를 전체 선택 밤 데이터로 먼저 한 번 fit하고, 각 밤에서는 <code>ZP₀</code>만 다시 구합니다.</li>
+</ul>
+<p><b>결과</b></p>
+<ul>
+  <li>색차에 의한 잔여 소광 경향까지 제거한 차등광도입니다.</li>
+  <li>저장 파일: <code>lightcurve_ID*_current.csv</code>, <code>params_ID*_current.csv</code>, <code>summary_ID*_current.txt</code> (기존 top-level 결과는 <code>_history/</code>로 이동)</li>
+</ul>
+<p><b>권장 사용처 / 주의</b></p>
+<ul>
+  <li>target과 comparison ensemble의 색차가 크고, residual이 <code>X·ΔC</code>와 실제로 상관될 때</li>
+  <li>여전히 target differential curve를 직접 fit하므로, ΔX가 좁거나 데이터가 적으면 astrophysical trend를 흡수할 수 있음</li>
+  <li>check star가 있다면 보정 후 check curve가 더 flat해지는지 같이 확인 권장</li>
+</ul>
+
+<h4>3. Global Ensemble (Method C)</h4>
+<p><b>입력 데이터</b></p>
+<ul>
+  <li><code>step9_forced_photometry/photometry_index.csv</code>와 각 프레임의 <code>*_photometry.tsv</code></li>
+  <li>사용 별: Step 8/10에서 선택한 target + comparison ensemble</li>
+  <li>solver는 comparison stars만으로 frame-wise zero-point를 풉니다. target은 기준선 해를 구할 때 제외됩니다.</li>
+</ul>
+<p><b>무엇을 하나</b></p>
+<ul>
+  <li>모델: <code>mag_inst(i,t,f) = M_i,f + Z_t,f + ε</code></li>
+  <li>comparison ensemble 평균광도 <code>M_i</code>와 프레임별 zero-point <code>Z_t</code>를 전역 최소제곱으로 동시에 추정합니다.</li>
+  <li>outlier rejection, RMS가 큰 comparison 제거, frame sigma clipping을 같이 수행합니다.</li>
+</ul>
+<p><b>결과</b></p>
+<ul>
+  <li><code>diff_mag_raw</code>: 기존 방식의 <code>m_target - mean(comp)</code></li>
+  <li><code>mag_ensemble_corr</code>: <code>m_target - Z_t</code> (ensemble-corrected instrumental magnitude)</li>
+  <li><code>diff_mag_corr</code>: <code>(m_target - Z_t) - &lt;M_comp&gt;</code> 로 다시 차등광도 스케일에 맞춘 결과</li>
+  <li>추가 산출물: <code>global_zp_ID*_current.csv</code>, <code>global_mean_ID*_current.csv</code>, <code>global_diagnostics_ID*_current.json</code></li>
+  <li>저장 파일: <code>lightcurve_ID*_current.csv</code>, <code>params_ID*_current.csv</code>, <code>summary_ID*_current.txt</code></li>
+</ul>
+<p><b>권장 사용처 / 주의</b></p>
+<ul>
+  <li>멀티나잇 기준선을 comparison ensemble로 정의하고 싶을 때</li>
+  <li>target 신호를 기준선 정의에 직접 넣고 싶지 않을 때</li>
+  <li>현재 <code>Z_t</code>는 nightly가 아니라 <b>frame-wise</b>입니다.</li>
+  <li>comparison에 변광성이 섞이면 결과가 바로 무너집니다.</li>
+</ul>
+
+<h4>모드 선택 요약</h4>
+<ul>
+  <li><b>Offset</b>: 가장 단순한 중심 맞춤. 빠른 검사/위상 확인용.</li>
+  <li><b>Color</b>: 색차 소광이 실제로 보일 때만 선택.</li>
+  <li><b>Global</b>: comparison ensemble 기준의 문헌적인 접근이 필요할 때 가장 권장.</li>
+</ul>
+</body>
+</html>
+"""
+
     def _update_analysis_panel(self):
         """Update analysis panel with data statistics and recommendations."""
         if self.raw_df.empty:
-            self.analysis_text.setText("데이터를 로드하면 분석 결과가 표시됩니다.")
+            self.analysis_text.setText("Step 10 결과가 있으면 자동 로드되어 분석 결과가 표시됩니다.")
             self.recommendation_label.setText("")
             self.recommendation_label.setVisible(False)
             return
@@ -844,10 +1013,59 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.log(f"[Frame QC] {label}: {before} → {len(df)} (excluded {removed})")
         return df
 
-    def load_raw_data(self):
+    def _raw_lightcurve_candidates(self, result_dir: Path, target_id: int) -> list[Path]:
+        step10_path = step10_dir(result_dir)
+        return [
+            step10_path / f"lightcurve_ID{target_id}_raw.csv",
+            step10_path / f"lightcurve_combined_ID{target_id}_raw.csv",
+        ]
+
+    def _rebuild_step10_raw_outputs(self, target_id: int) -> bool:
         if not self.datasets:
-            QMessageBox.information(self, "Detrend", "데이터셋이 없습니다.")
-            return
+            return False
+
+        self._load_comp_selection()
+        comp_ids = self.comp_active_ids or self.comp_candidate_ids
+        comp_ids = [int(x) for x in comp_ids if str(x).strip()]
+        if not comp_ids:
+            self.log("[LOAD] Step 10 raw rebuild skipped: comparison IDs not found")
+            return False
+
+        self.log(f"[LOAD] Step 10 raw CSV missing. Rebuilding for target ID {target_id}...")
+        try:
+            from .step10_light_curve_builder import LightCurveBuilderWindow
+
+            builder = LightCurveBuilderWindow(
+                self.params,
+                self.file_manager,
+                self.project_state,
+                self.main_window,
+            )
+            builder.hide()
+            builder.show_log_window = lambda: None
+            builder.datasets = [(label, Path(path)) for label, path in self.datasets]
+            builder.target_edit.setText(str(target_id))
+            builder.comp_edit.setText(",".join(str(i) for i in comp_ids))
+            builder.comp_candidate_ids = list(comp_ids)
+            builder._update_comp_ids_from_input()
+            builder.build_light_curve()
+            builder.close()
+            builder.deleteLater()
+        except Exception as e:
+            self.log(f"[LOAD] Step 10 raw rebuild failed: {e}")
+            return False
+
+        for _label, result_dir in self.datasets:
+            result_dir = Path(result_dir)
+            if any(path.exists() for path in self._raw_lightcurve_candidates(result_dir, target_id)):
+                return True
+        return False
+
+    def load_raw_data(self, silent: bool = False) -> bool:
+        if not self.datasets:
+            if not silent:
+                QMessageBox.information(self, "Detrend", "데이터셋이 없습니다.")
+            return False
         target_text = self.target_edit.text().strip()
         if not target_text:
             base_dir = step10_dir(self.params.P.result_dir)
@@ -861,52 +1079,51 @@ class DetrendNightMergeWindow(StepWindowBase):
                     target_text = str(target_id)
                     self.log(f"[LOAD] Target ID from raw filename: {target_id}")
         if not target_text:
-            QMessageBox.information(self, "Detrend", "대상 ID가 필요합니다.")
-            return
+            if not silent:
+                QMessageBox.information(self, "Detrend", "대상 ID가 필요합니다.")
+            return False
         target_id = int(target_text)
 
         raw_frames = []
-        for label, result_dir in self.datasets:
-            result_dir = Path(result_dir)
-            step10_path = step10_dir(result_dir)
+        def _collect_raw_frames() -> list[pd.DataFrame]:
+            frames: list[pd.DataFrame] = []
+            for label, result_dir in self.datasets:
+                result_dir = Path(result_dir)
+                step10_path = step10_dir(result_dir)
+                raw_path = next((cand for cand in self._raw_lightcurve_candidates(result_dir, target_id) if cand.exists()), None)
 
-            # Try multiple possible filenames
-            candidates = [
-                step10_path / f"lightcurve_ID{target_id}_raw.csv",
-                step10_path / f"lightcurve_combined_ID{target_id}_raw.csv",
-            ]
-            raw_path = None
-            for cand in candidates:
-                if cand.exists():
-                    raw_path = cand
-                    break
+                if raw_path is None:
+                    self.log(f"[LOAD] Missing raw in {step10_path}")
+                    self.log(f"  Tried: lightcurve_ID{target_id}_raw.csv, lightcurve_combined_ID{target_id}_raw.csv")
+                    if step10_path.exists():
+                        available = list(step10_path.glob("lightcurve_*.csv"))
+                        if available:
+                            self.log(f"  Available: {[f.name for f in available[:5]]}")
+                    continue
 
-            if raw_path is None:
-                self.log(f"[LOAD] Missing raw in {step10_path}")
-                self.log(f"  Tried: lightcurve_ID{target_id}_raw.csv, lightcurve_combined_ID{target_id}_raw.csv")
-                # List available files
-                if step10_path.exists():
-                    available = list(step10_path.glob("lightcurve_*.csv"))
-                    if available:
-                        self.log(f"  Available: {[f.name for f in available[:5]]}")
-                continue
+                try:
+                    df = pd.read_csv(raw_path)
+                    self.log(f"[LOAD] Loaded: {raw_path.name} ({len(df)} rows)")
+                except Exception as e:
+                    self.log(f"[LOAD] Failed to read {raw_path.name}: {e}")
+                    continue
+                df = df.copy()
+                df["dataset"] = label
+                df = self._apply_frame_excludes(df, result_dir, str(label))
+                frames.append(df)
+            return frames
 
-            try:
-                df = pd.read_csv(raw_path)
-                self.log(f"[LOAD] Loaded: {raw_path.name} ({len(df)} rows)")
-            except Exception as e:
-                self.log(f"[LOAD] Failed to read {raw_path.name}: {e}")
-                continue
-            df = df.copy()
-            df["dataset"] = label
-            df = self._apply_frame_excludes(df, result_dir, str(label))
-            raw_frames.append(df)
+        raw_frames = _collect_raw_frames()
+        if not raw_frames and self._rebuild_step10_raw_outputs(target_id):
+            raw_frames = _collect_raw_frames()
 
         if not raw_frames:
             step10_path = step10_dir(self.params.P.result_dir)
             msg = f"Raw 데이터를 찾지 못했습니다.\n\n경로: {step10_path}\n\nStep 10에서 먼저 'Build Light Curve'를 실행하세요."
-            QMessageBox.information(self, "Detrend", msg)
-            return
+            self.log(f"[LOAD] {msg.replace(chr(10), ' ')}")
+            if not silent:
+                QMessageBox.information(self, "Detrend", msg)
+            return False
 
         self.raw_df = pd.concat(raw_frames, ignore_index=True)
         if "diff_mag_raw" not in self.raw_df.columns and "diff_mag" in self.raw_df.columns:
@@ -941,6 +1158,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         self._log_color_index_info()
         self._update_color_mode_enabled()
         self._update_analysis_panel()
+        return True
 
     def _load_global_ensemble_df(self) -> pd.DataFrame:
         if not self.datasets:
@@ -1112,43 +1330,63 @@ class DetrendNightMergeWindow(StepWindowBase):
 
     def _fill_night_id(self) -> None:
         """Fill night_id column from file_manager or disk, then overwrite date with 'Night N' labels."""
-        if self.raw_df.empty or "file" not in self.raw_df.columns:
+        if self.raw_df.empty:
             return
 
-        # Already filled from step10 output?
-        has_night_id = "night_id" in self.raw_df.columns and self.raw_df["night_id"].notna().any()
-        night_id_map: dict[str, int] = {}
+        def _apply_night_labels(nids: list) -> bool:
+            if not any(n > 0 for n in nids):
+                return False
+            date_col = self.raw_df["date"].astype(str).to_numpy(object)
+            for i, nid in enumerate(nids):
+                if nid > 0:
+                    date_col[i] = f"Night {nid}"
+            self.raw_df["date"] = date_col
+            self.raw_df["night_id"] = nids
+            n_labeled = sum(1 for n in nids if n > 0)
+            self.log(f"[NIGHT] {n_labeled}/{len(nids)} rows → 'Night N' 레이블 적용")
+            return True
 
-        if has_night_id:
-            # Use existing column from step10 series
-            for fn, nid in zip(self.raw_df["file"].astype(str), pd.to_numeric(self.raw_df["night_id"], errors="coerce")):
-                if not pd.isna(nid) and int(nid) > 0:
-                    night_id_map[fn] = int(nid)
+        # Case 1: night_id column already present with valid values (from step10 CSV)
+        if "night_id" in self.raw_df.columns:
+            nids = pd.to_numeric(self.raw_df["night_id"], errors="coerce").fillna(0).astype(int).tolist()
+            if _apply_night_labels(nids):
+                return
+            self.log("[NIGHT] night_id 컬럼 있으나 모두 0 → JSON fallback 시도")
+
+        # Case 2: load night_assignments from file_manager or disk JSON
+        if "file" not in self.raw_df.columns:
+            self.log("[NIGHT] 'file' 컬럼 없음 → Night 레이블 불가")
+            return
+
+        night_id_map: dict[str, int] = {}
+        fm = getattr(self, "file_manager", None)
+        if fm is not None:
+            night_id_map = {Path(k).name: v for k, v in getattr(fm, "night_assignments", {}).items()}
+            if night_id_map:
+                self.log(f"[NIGHT] file_manager에서 {len(night_id_map)}개 로드")
 
         if not night_id_map:
-            fm = getattr(self, "file_manager", None)
-            if fm is not None:
-                night_id_map = dict(getattr(fm, "night_assignments", {}))
-
-        if not night_id_map and self.datasets:
             for _label, rdir in self.datasets:
                 m = _load_night_assignments_from_disk(Path(rdir))
-                night_id_map.update(m)
+                if m:
+                    night_id_map.update({Path(k).name: v for k, v in m.items()})
+                    self.log(f"[NIGHT] disk JSON에서 {len(m)}개 로드: {rdir}")
 
         if not night_id_map:
+            m = _load_night_assignments_from_disk(Path(self.params.P.result_dir))
+            if m:
+                night_id_map.update({Path(k).name: v for k, v in m.items()})
+                self.log(f"[NIGHT] result_dir JSON에서 {len(m)}개 로드")
+
+        if not night_id_map:
+            self.log("[NIGHT] night_assignments.json 없음 → 원본 날짜 유지")
             return
 
         files = self.raw_df["file"].astype(str).tolist()
-        nids = [night_id_map.get(fn, 0) for fn in files]
-        self.raw_df["night_id"] = nids
-
-        # Overwrite date with "Night N" label for frames with a valid night_id
-        # so that cross-midnight observations stay in the same group
-        date_col = self.raw_df["date"].astype(str).to_numpy(object)
-        for i, nid in enumerate(nids):
-            if nid and int(nid) > 0:
-                date_col[i] = f"Night {int(nid)}"
-        self.raw_df["date"] = date_col
+        nids = [night_id_map.get(Path(fn).name, 0) for fn in files]
+        n_matched = sum(1 for n in nids if n > 0)
+        self.log(f"[NIGHT] 파일명 매칭: {n_matched}/{len(nids)} (샘플 file: {Path(files[0]).name if files else '-'})")
+        _apply_night_labels(nids)
 
     def _fill_airmass_from_headers(self) -> None:
         if self.raw_df.empty or "file" not in self.raw_df.columns:
@@ -1505,15 +1743,15 @@ class DetrendNightMergeWindow(StepWindowBase):
 
     def _populate_date_list(self):
         self.date_list.blockSignals(True)
-        selected_dates = self._selected_dates()
+        prev_selected = self._selected_dates()   # remember before clear
         self.date_list.clear()
-        dates = sorted({str(d) for d in self.raw_df.get("date", []) if str(d)})
-        if selected_dates:
-            dates = [d for d in dates if d in selected_dates]
+        dates = sorted({str(d) for d in self.raw_df.get("date", pd.Series([], dtype=str)) if str(d) and str(d) != "nan"})
         for d in dates:
             item = QListWidgetItem(d)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
+            # keep previous selection if available; otherwise check all
+            state = Qt.Checked if (not prev_selected or d in prev_selected) else Qt.Unchecked
+            item.setCheckState(state)
             self.date_list.addItem(item)
         self.date_list.blockSignals(False)
 
@@ -1883,6 +2121,9 @@ class DetrendNightMergeWindow(StepWindowBase):
         bjd_arr = compute_bjd_tdb_array(jd_arr, tgt_ra, tgt_dec, site_lat, site_lon, site_alt)
         valid = np.isfinite(bjd_arr)
         if valid.any():
+            if "BJD_TDB" not in self.raw_df.columns:
+                self.raw_df["BJD_TDB"] = np.nan
+            self.raw_df.loc[valid, "BJD_TDB"] = bjd_arr[valid]
             self.raw_df.loc[valid, "JD"] = bjd_arr[valid]
             delta = np.nanmedian(bjd_arr[valid] - jd_arr[valid]) * 86400
             self.log(f"[BJD] JD → BJD_TDB applied ({valid.sum()} pts, median correction {delta:+.1f}s)")
@@ -1960,6 +2201,8 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.raw_df = self.corrected_df.copy()
         self.global_diagnostics = result.get("diagnostics", {}) or {}
 
+        if "JD" not in self.corrected_df.columns and "jd" in self.corrected_df.columns:
+            self.corrected_df["JD"] = self.corrected_df["jd"]
         if "JD" not in self.raw_df.columns and "jd" in self.raw_df.columns:
             self.raw_df["JD"] = self.raw_df["jd"]
         if "JD" not in self.raw_df.columns:
@@ -1970,6 +2213,7 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.raw_df["date"] = "unknown"
         self._fill_date_from_jd()
         self._fill_night_id()
+        self.corrected_df = self.raw_df.copy()
 
         self._populate_date_list()
         self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
@@ -2223,16 +2467,19 @@ class DetrendNightMergeWindow(StepWindowBase):
                 self.result_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("chi2_red"))))
             return
 
-        self.result_table.setColumnCount(9)
         if self.mode == "color":
             is_global = self.params_df.get("global_k2", pd.Series([False])).iloc[0]
             slope_label = "k'' (global)" if is_global else "k'' (nightly)"
+            self.result_table.setColumnCount(9)
+            self.result_table.setHorizontalHeaderLabels(
+                ["Date", "Filter", "N", "ZP₀", "±σ(ZP)", slope_label, "±σ(k'')", "RMS전", "RMS후"]
+            )
         else:
-            slope_label = "-"
-
-        self.result_table.setHorizontalHeaderLabels(
-            ["Date", "Filter", "N", "ZP₀", "±σ(ZP)", slope_label, "±σ(k'')", "RMS전", "RMS후"]
-        )
+            # Offset mode: k'' columns are always 0 — hide them
+            self.result_table.setColumnCount(7)
+            self.result_table.setHorizontalHeaderLabels(
+                ["Date", "Filter", "N", "ZP₀", "±σ(ZP)", "RMS전", "RMS후"]
+            )
 
         for _, row in self.params_df.iterrows():
             r = self.result_table.rowCount()
@@ -2243,10 +2490,46 @@ class DetrendNightMergeWindow(StepWindowBase):
             self.result_table.setItem(r, 2, QTableWidgetItem(str(int(row.get("n_used", 0)))))
             self.result_table.setItem(r, 3, QTableWidgetItem(_fmt_float(row.get("zp_offset"))))
             self.result_table.setItem(r, 4, QTableWidgetItem(_fmt_float(row.get("zp_offset_err"))))
-            self.result_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("ext_slope"))))
-            self.result_table.setItem(r, 6, QTableWidgetItem(_fmt_float(row.get("ext_slope_err"))))
-            self.result_table.setItem(r, 7, QTableWidgetItem(_fmt_float(row.get("rms_before"))))
-            self.result_table.setItem(r, 8, QTableWidgetItem(_fmt_float(row.get("rms_after"))))
+            if self.mode == "color":
+                self.result_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("ext_slope"))))
+                self.result_table.setItem(r, 6, QTableWidgetItem(_fmt_float(row.get("ext_slope_err"))))
+                self.result_table.setItem(r, 7, QTableWidgetItem(_fmt_float(row.get("rms_before"))))
+                self.result_table.setItem(r, 8, QTableWidgetItem(_fmt_float(row.get("rms_after"))))
+            else:
+                self.result_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("rms_before"))))
+                self.result_table.setItem(r, 6, QTableWidgetItem(_fmt_float(row.get("rms_after"))))
+
+        # Summary rows: per-filter σ(ZP) across nights
+        summary_font = QFont()
+        summary_font.setBold(True)
+        summary_bg = QColor("#2a2a4a")
+        summary_fg = QColor("#ffffff")
+        ncols = self.result_table.columnCount()
+
+        filters_in_df = sorted(self.params_df["filter"].astype(str).unique()) if "filter" in self.params_df.columns else [""]
+        for fkey in filters_in_df:
+            fmask = self.params_df["filter"].astype(str) == fkey if "filter" in self.params_df.columns else pd.Series([True] * len(self.params_df))
+            sub = self.params_df[fmask]
+            zp_vals = pd.to_numeric(sub["zp_offset"], errors="coerce").dropna()
+            if len(zp_vals) < 2:
+                continue
+            sigma_nights = float(np.std(zp_vals, ddof=1))
+            mean_zp = float(np.mean(zp_vals))
+
+            r = self.result_table.rowCount()
+            self.result_table.insertRow(r)
+            labels = ["σ(nights)", fkey or "all", str(len(zp_vals)),
+                      _fmt_float(mean_zp), _fmt_float(sigma_nights)]
+            if self.mode == "color":
+                labels += ["", "", "", ""]
+            else:
+                labels += ["", ""]
+            for c, text in enumerate(labels[:ncols]):
+                item = QTableWidgetItem(text)
+                item.setFont(summary_font)
+                item.setBackground(summary_bg)
+                item.setForeground(summary_fg)
+                self.result_table.setItem(r, c, item)
 
     def _update_plots(self):
         self.ax_raw.clear()
@@ -2313,6 +2596,27 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.ax_raw.grid(True, alpha=0.3)
         self.ax_raw.tick_params(labelsize=8)
 
+        # Check star overlay on raw plot
+        try:
+            _rd = self.datasets[0][1] if self.datasets else Path(self.params.P.result_dir)
+            _ck_id, _ck_df = _load_check_star_for_plot(Path(_rd), filter_key)
+            if _ck_df is not None and not _ck_df.empty:
+                _y_col = next((c for c in ["diff_mag_raw", "diff_mag", "mag"] if c in _ck_df.columns), None)
+                if _y_col and "JD" in _ck_df.columns:
+                    if filter_key and "filter" in _ck_df.columns:
+                        _ck_df = _ck_df[_ck_df["filter"].astype(str).map(_normalize_filter_key) == filter_key].copy()
+                    _cy = pd.to_numeric(_ck_df[_y_col], errors="coerce").to_numpy(float)
+                    _cx, _cy = self._phase_xy(_ck_df, _cy)
+                    _m = np.isfinite(_cx) & np.isfinite(_cy)
+                    if _m.any():
+                        _ck_label = f"Check ID {_ck_id}" if _ck_id is not None else "Check"
+                        self.ax_raw.scatter(
+                            _cx[_m], _cy[_m], s=8, color="#FFD700", alpha=0.5, zorder=2,
+                            label=_ck_label, marker="^"
+                        )
+        except Exception:
+            pass
+
         corr = self.corrected_df if not self.corrected_df.empty else raw
         if filter_key and "filter" in corr.columns:
             corr = corr[corr["filter"].astype(str).map(_normalize_filter_key) == filter_key]
@@ -2365,10 +2669,12 @@ class DetrendNightMergeWindow(StepWindowBase):
 
         # Diagnostic plot
         diag = raw
+        has_airmass = "airmass" in diag.columns
+        diag_x_col = "airmass" if has_airmass else ("JD" if "JD" in diag.columns else None)
         if self.color_by == "Filter" and "filter" in diag.columns:
             for fkey, sub in diag.groupby(diag["filter"].astype(str).map(_normalize_filter_key)):
-                x = sub["airmass"].to_numpy(float)
-                y = sub["diff_mag_raw"].to_numpy(float)
+                x = pd.to_numeric(sub[diag_x_col], errors="coerce").to_numpy(float) if diag_x_col else np.full(len(sub), np.nan)
+                y = pd.to_numeric(sub["diff_mag_raw"], errors="coerce").to_numpy(float)
                 m = np.isfinite(x) & np.isfinite(y)
                 if np.any(m):
                     self.ax_diag.plot(
@@ -2378,8 +2684,8 @@ class DetrendNightMergeWindow(StepWindowBase):
         else:
             for d in dates:
                 sub = diag[diag["date"].astype(str) == str(d)]
-                x = sub["airmass"].to_numpy(float)
-                y = sub["diff_mag_raw"].to_numpy(float)
+                x = pd.to_numeric(sub[diag_x_col], errors="coerce").to_numpy(float) if diag_x_col else np.full(len(sub), np.nan)
+                y = pd.to_numeric(sub["diff_mag_raw"], errors="coerce").to_numpy(float)
                 m = np.isfinite(x) & np.isfinite(y)
                 if np.any(m):
                     self.ax_diag.plot(x[m], y[m], marker="o", linestyle="None", color=date_colors[d], markersize=3, alpha=0.7, label=d)
@@ -2396,7 +2702,7 @@ class DetrendNightMergeWindow(StepWindowBase):
                 sub = diag[diag["date"].astype(str) == date_val]
                 if fkey and "filter" in sub.columns:
                     sub = sub[sub["filter"].astype(str).map(_normalize_filter_key) == fkey]
-                xvals = pd.to_numeric(sub.get("airmass", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
+                xvals = pd.to_numeric(sub[diag_x_col], errors="coerce").to_numpy(float) if diag_x_col else np.array([])
                 xvals = xvals[np.isfinite(xvals)]
                 if xvals.size == 0:
                     continue
@@ -2419,8 +2725,9 @@ class DetrendNightMergeWindow(StepWindowBase):
                 line_color = date_colors.get(date_val, "#333333") if self.color_by == "Date" else self._filter_color(fkey)
                 self.ax_diag.plot(xline, yline, color=line_color, linestyle=linestyle, linewidth=1.5, alpha=0.9)
 
-        self.ax_diag.set_title("Δmag vs Airmass (diagnostics)", fontsize=10)
-        self.ax_diag.set_xlabel("Airmass", fontsize=9)
+        diag_xlabel = diag_x_col if diag_x_col else "Index"
+        self.ax_diag.set_title(f"Δmag vs {diag_xlabel} (diagnostics)", fontsize=10)
+        self.ax_diag.set_xlabel(diag_xlabel, fontsize=9)
         self.ax_diag.set_ylabel("Δmag", fontsize=9)
         self.ax_diag.invert_yaxis()
         self.ax_diag.grid(True, alpha=0.3)
@@ -2456,13 +2763,18 @@ class DetrendNightMergeWindow(StepWindowBase):
         if dates and "date" in diag_df.columns:
             diag_df = diag_df[diag_df["date"].astype(str).isin(dates)]
 
-        x = diag_df.get("JD", pd.Series([], dtype=float))
-        y = diag_df.get("Z", pd.Series([], dtype=float))
+        def _col(df, col):
+            """Safely extract a numeric column as float array; NaN-filled if missing."""
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+            return np.full(len(df), np.nan)
+
+        has_jd = "JD" in diag_df.columns
 
         if self.color_by == "Filter" and "filter" in diag_df.columns:
             for fkey, sub in diag_df.groupby(diag_df["filter"].astype(str).map(_normalize_filter_key)):
-                xs = pd.to_numeric(sub.get("JD", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
-                ys = pd.to_numeric(sub.get("Z", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
+                xs = _col(sub, "JD")
+                ys = _col(sub, "Z")
                 m = np.isfinite(xs) & np.isfinite(ys)
                 if np.any(m):
                     self.ax_diag.plot(
@@ -2472,16 +2784,24 @@ class DetrendNightMergeWindow(StepWindowBase):
         elif "date" in diag_df.columns:
             for d in sorted(diag_df["date"].astype(str).unique().tolist()):
                 sub = diag_df[diag_df["date"].astype(str) == str(d)]
-                xs = pd.to_numeric(sub.get("JD", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
-                ys = pd.to_numeric(sub.get("Z", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
+                xs = _col(sub, "JD")
+                ys = _col(sub, "Z")
                 m = np.isfinite(xs) & np.isfinite(ys)
                 if np.any(m):
                     self.ax_diag.plot(xs[m], ys[m], marker="o", linestyle="None", color=date_colors.get(d, "#333333"), markersize=3, alpha=0.7, label=d)
         else:
-            xs = pd.to_numeric(x, errors="coerce").to_numpy(float)
-            ys = pd.to_numeric(y, errors="coerce").to_numpy(float)
+            xs = _col(diag_df, "JD")
+            ys = _col(diag_df, "Z")
             m = np.isfinite(xs) & np.isfinite(ys)
             if np.any(m):
+                self.ax_diag.plot(xs[m], ys[m], marker="o", linestyle="None", color="#333333", markersize=3, alpha=0.7)
+
+        if not has_jd:
+            # Fall back to time_id on x-axis when JD is unavailable
+            xs = _col(diag_df, "time_id")
+            ys = _col(diag_df, "Z")
+            m = np.isfinite(xs) & np.isfinite(ys)
+            if np.any(m) and not self.ax_diag.lines:
                 self.ax_diag.plot(xs[m], ys[m], marker="o", linestyle="None", color="#333333", markersize=3, alpha=0.7)
 
         self.ax_diag.set_title("Global Z_t vs JD", fontsize=10)
@@ -2505,7 +2825,12 @@ class DetrendNightMergeWindow(StepWindowBase):
         out_dir = step11_dir(self.params.P.result_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         mode_tag = self.mode if self.mode in ("offset", "color") else "mode"
-
+        formula = "Δm_corr = Δm_raw - ZP₀" if self.mode == "offset" else "Δm_corr = Δm_raw - ZP₀ - k''·ΔC·X"
+        lc_path = step11_current_lc_path(self.params.P.result_dir, target_id)
+        params_path = step11_current_params_path(self.params.P.result_dir, target_id)
+        summary_path = step11_current_summary_path(self.params.P.result_dir, target_id)
+        plot_path = step11_current_plot_path(self.params.P.result_dir, target_id)
+        meta_path = step11_current_meta_path(self.params.P.result_dir, target_id)
         try:
             # ===== 1. Main corrected light curve with residuals =====
             out_df = self.corrected_df.copy()
@@ -2534,39 +2859,129 @@ class DetrendNightMergeWindow(StepWindowBase):
                 priority_cols.insert(3, "phase")
             other_cols = [c for c in out_df.columns if c not in priority_cols]
             out_df = out_df[[c for c in priority_cols if c in out_df.columns] + other_cols]
+            out_df = self._annotate_step11_output(out_df, mode_tag, formula)
 
-            lc_path = out_dir / f"lightcurve_ID{target_id}_{mode_tag}.csv"
             out_df.to_csv(lc_path, index=False)
-            self.log(f"[SAVE] Light curve: {lc_path.name}")
+            self.log(f"[SAVE] Current light curve: {lc_path.name}")
+            mode_lc_path = out_dir / f"lightcurve_ID{target_id}_{mode_tag}.csv"
+            out_df.to_csv(mode_lc_path, index=False)
+            self.log(f"[SAVE] Mode light curve: {mode_lc_path.name}")
 
             # ===== 2. Fit parameters by date/filter =====
+            params_saved = None
             if not self.params_df.empty:
                 params_out = self.params_df.copy()
-                # Add formula info
-                if self.mode == "offset":
-                    params_out["formula"] = "Δm_corr = Δm_raw - ZP₀"
-                else:
-                    params_out["formula"] = "Δm_corr = Δm_raw - ZP₀ - k''·ΔC·X"
-
-                params_path = out_dir / f"fit_params_ID{target_id}_{mode_tag}.csv"
+                params_out["correction_mode"] = mode_tag
+                params_out["formula"] = formula
                 params_out.to_csv(params_path, index=False)
-                self.log(f"[SAVE] Fit params: {params_path.name}")
+                params_saved = params_path
+                self.log(f"[SAVE] Current params: {params_path.name}")
+                mode_params_path = out_dir / f"fit_params_ID{target_id}_{mode_tag}.csv"
+                params_out.to_csv(mode_params_path, index=False)
+                self.log(f"[SAVE] Mode params: {mode_params_path.name}")
 
             # ===== 3. Summary report (text file) =====
-            summary_path = out_dir / f"summary_ID{target_id}_{mode_tag}.txt"
             self._write_summary_report(summary_path, out_df)
-            self.log(f"[SAVE] Summary: {summary_path.name}")
+            self.log(f"[SAVE] Current summary: {summary_path.name}")
+            mode_summary_path = out_dir / f"summary_ID{target_id}_{mode_tag}.txt"
+            self._write_summary_report(mode_summary_path, out_df)
+            self.log(f"[SAVE] Mode summary: {mode_summary_path.name}")
 
             # ===== 4. Save plot as PNG =====
-            plot_path = out_dir / f"plot_ID{target_id}_{mode_tag}.png"
             self.plot_canvas.figure.savefig(plot_path, dpi=150, bbox_inches="tight")
-            self.log(f"[SAVE] Plot: {plot_path.name}")
+            self.log(f"[SAVE] Current plot: {plot_path.name}")
+            mode_plot_path = out_dir / f"plot_ID{target_id}_{mode_tag}.png"
+            self.plot_canvas.figure.savefig(mode_plot_path, dpi=150, bbox_inches="tight")
+            self.log(f"[SAVE] Mode plot: {mode_plot_path.name}")
+            self._write_step11_current_meta(
+                target_id,
+                mode_tag,
+                formula,
+                lc_path,
+                params_path=params_saved,
+                summary_path=summary_path,
+                plot_path=plot_path,
+            )
 
             self.log(f"[SAVE] 모든 결과 저장 완료: {out_dir}")
 
         except Exception as e:
             self.log(f"[SAVE] Failed: {e}")
             QMessageBox.warning(self, "Save Error", f"저장 실패: {e}")
+
+    def _archive_step11_outputs(self, target_id: int, keep_names: set[str] | None = None) -> None:
+        keep_names = keep_names or set()
+        out_dir = step11_dir(self.params.P.result_dir)
+        if not out_dir.exists():
+            return
+
+        patterns = [
+            f"lightcurve_ID{target_id}_*.csv",
+            f"fit_params_ID{target_id}_*.csv",
+            f"params_ID{target_id}_*.csv",
+            f"summary_ID{target_id}_*.txt",
+            f"plot_ID{target_id}_*.png",
+            f"result_ID{target_id}_*.json",
+            f"global_zp_ID{target_id}_*.csv",
+            f"global_mean_ID{target_id}_*.csv",
+            f"global_diagnostics_ID{target_id}_*.json",
+        ]
+        existing: list[Path] = []
+        seen: set[Path] = set()
+        for pattern in patterns:
+            for path in out_dir.glob(pattern):
+                if path.name in keep_names or path.parent != out_dir or not path.is_file():
+                    continue
+                if path not in seen:
+                    seen.add(path)
+                    existing.append(path)
+
+        if not existing:
+            return
+
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
+        archive_dir = step11_history_dir(self.params.P.result_dir) / f"ID{target_id}" / stamp
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in existing:
+            try:
+                path.rename(archive_dir / path.name)
+            except Exception as e:
+                self.log(f"[SAVE] archive skipped for {path.name}: {e}")
+
+    def _annotate_step11_output(self, df: pd.DataFrame, mode_tag: str, formula: str) -> pd.DataFrame:
+        out = df.copy()
+        if "JD" in out.columns and "jd" in out.columns:
+            out = out.drop(columns=["jd"])
+        out = out.drop(columns=["diff_mag"], errors="ignore")
+        out["correction_mode"] = mode_tag
+        out["correction_formula"] = formula
+        return out
+
+    def _write_step11_current_meta(
+        self,
+        target_id: int,
+        mode_tag: str,
+        formula: str,
+        lc_path: Path,
+        params_path: Path | None = None,
+        summary_path: Path | None = None,
+        plot_path: Path | None = None,
+        extra_files: list[Path] | None = None,
+    ) -> None:
+        meta = {
+            "target_id": int(target_id),
+            "mode": str(mode_tag),
+            "formula": str(formula),
+            "saved_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "lightcurve_file": lc_path.name,
+            "params_file": params_path.name if params_path is not None else "",
+            "summary_file": summary_path.name if summary_path is not None else "",
+            "plot_file": plot_path.name if plot_path is not None else "",
+            "extra_files": [p.name for p in (extra_files or [])],
+        }
+        meta_path = step11_current_meta_path(self.params.P.result_dir, target_id)
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.log(f"[SAVE] Current meta: {meta_path.name}")
 
     def _save_global_results(self) -> None:
         if self.corrected_df.empty:
@@ -2577,29 +2992,58 @@ class DetrendNightMergeWindow(StepWindowBase):
         target_id = int(target_text)
         out_dir = step11_dir(self.params.P.result_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-
+        formula = "Δm_corr = (mag_inst_target - Z_t) - <M_comp>"
+        lc_path = step11_current_lc_path(self.params.P.result_dir, target_id)
+        params_path = step11_current_params_path(self.params.P.result_dir, target_id)
+        summary_path = step11_current_summary_path(self.params.P.result_dir, target_id)
+        plot_path = step11_current_plot_path(self.params.P.result_dir, target_id)
+        meta_path = step11_current_meta_path(self.params.P.result_dir, target_id)
+        zp_path = step11_current_global_zp_path(self.params.P.result_dir, target_id)
+        mean_path = step11_current_global_mean_path(self.params.P.result_dir, target_id)
+        diag_path = step11_current_global_diag_path(self.params.P.result_dir, target_id)
         try:
-            lc_path = out_dir / f"lightcurve_ID{target_id}_global.csv"
-            self.corrected_df.to_csv(lc_path, index=False)
-            self.log(f"[SAVE] Global light curve: {lc_path.name}")
+            out_df = self._annotate_step11_output(self.corrected_df, "global", formula)
+            out_df.to_csv(lc_path, index=False)
+            self.log(f"[SAVE] Current light curve: {lc_path.name}")
+            mode_lc_path = out_dir / f"lightcurve_ID{target_id}_global.csv"
+            out_df.to_csv(mode_lc_path, index=False)
+            self.log(f"[SAVE] Mode light curve: {mode_lc_path.name}")
 
+            params_saved = None
+            extra_files: list[Path] = []
             if not self.params_df.empty:
-                zp_path = out_dir / f"global_zp_ID{target_id}.csv"
+                params_out = self.params_df.copy()
+                params_out["correction_mode"] = "global"
+                params_out["formula"] = formula
+                params_out.to_csv(params_path, index=False)
+                params_saved = params_path
+                self.log(f"[SAVE] Current params: {params_path.name}")
+                mode_params_path = out_dir / f"fit_params_ID{target_id}_global.csv"
+                params_out.to_csv(mode_params_path, index=False)
+                self.log(f"[SAVE] Mode params: {mode_params_path.name}")
+
                 self.params_df.to_csv(zp_path, index=False)
                 self.log(f"[SAVE] Global ZP: {zp_path.name}")
+                extra_files.append(zp_path)
+                legacy_zp_path = out_dir / f"global_zp_ID{target_id}.csv"
+                self.params_df.to_csv(legacy_zp_path, index=False)
 
             if not self.global_mean_df.empty:
-                mean_path = out_dir / f"global_mean_ID{target_id}.csv"
                 self.global_mean_df.to_csv(mean_path, index=False)
                 self.log(f"[SAVE] Global mean: {mean_path.name}")
+                extra_files.append(mean_path)
+                legacy_mean_path = out_dir / f"global_mean_ID{target_id}.csv"
+                self.global_mean_df.to_csv(legacy_mean_path, index=False)
 
             if self.global_diagnostics:
-                diag_path = out_dir / f"global_diagnostics_ID{target_id}.json"
                 with open(diag_path, "w", encoding="utf-8") as f:
                     json.dump(self.global_diagnostics, f, indent=2)
                 self.log(f"[SAVE] Diagnostics: {diag_path.name}")
+                extra_files.append(diag_path)
+                legacy_diag_path = out_dir / f"global_diagnostics_ID{target_id}.json"
+                with open(legacy_diag_path, "w", encoding="utf-8") as f:
+                    json.dump(self.global_diagnostics, f, indent=2)
 
-            summary_path = out_dir / f"summary_ID{target_id}_global.txt"
             lines = [
                 "=" * 60,
                 "GLOBAL ENSEMBLE SUMMARY",
@@ -2608,13 +3052,32 @@ class DetrendNightMergeWindow(StepWindowBase):
                 "Mode: GLOBAL (method C)",
                 "Formula: mag_inst = M_i + Z_t",
                 "Target curve: m_corr = mag_inst_target - Z_t",
+                f"Differential output: {formula}",
                 "",
                 f"Target ID: {target_id}",
                 f"Frames: {len(self.params_df)}",
                 f"Points: {len(self.corrected_df)}",
             ]
             summary_path.write_text("\n".join(lines), encoding="utf-8")
-            self.log(f"[SAVE] Summary: {summary_path.name}")
+            self.log(f"[SAVE] Current summary: {summary_path.name}")
+            mode_summary_path = out_dir / f"summary_ID{target_id}_global.txt"
+            mode_summary_path.write_text("\n".join(lines), encoding="utf-8")
+            self.log(f"[SAVE] Mode summary: {mode_summary_path.name}")
+            self.plot_canvas.figure.savefig(plot_path, dpi=150, bbox_inches="tight")
+            self.log(f"[SAVE] Current plot: {plot_path.name}")
+            mode_plot_path = out_dir / f"plot_ID{target_id}_global.png"
+            self.plot_canvas.figure.savefig(mode_plot_path, dpi=150, bbox_inches="tight")
+            self.log(f"[SAVE] Mode plot: {mode_plot_path.name}")
+            self._write_step11_current_meta(
+                target_id,
+                "global",
+                formula,
+                lc_path,
+                params_path=params_saved,
+                summary_path=summary_path,
+                plot_path=plot_path,
+                extra_files=extra_files,
+            )
         except Exception as e:
             self.log(f"[SAVE] Global failed: {e}")
             QMessageBox.warning(self, "Save Error", f"저장 실패: {e}")

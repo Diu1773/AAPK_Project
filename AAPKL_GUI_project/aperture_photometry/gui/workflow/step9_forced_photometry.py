@@ -210,6 +210,7 @@ class ForcedPhotometryWorker(QThread):
             step8_dir = result_dir / "step8_selection"
             target_sids = {}  # filter -> target source_id
             comp_sids = {}    # filter -> set of comparison source_ids
+            check_sids = {}   # filter -> check source_id
             selected_sids_by_filter: dict[str, set[int]] = {}
             all_source_ids = set()
             final_id_maps: dict[str, dict[int, int]] = {}
@@ -243,23 +244,33 @@ class ForcedPhotometryWorker(QThread):
                             continue
                         tid = sel.get("target_source_id")
                         cids = sel.get("comparison_source_ids", [])
+                        check_sid = sel.get("check_source_id")
                         if tid is not None:
                             target_sids[flt] = int(tid)
                             all_source_ids.add(int(tid))
                         comp_sids[flt] = set(int(c) for c in cids if c is not None)
                         all_source_ids.update(comp_sids[flt])
+                        if check_sid is not None:
+                            check_sids[flt] = int(check_sid)
+                            all_source_ids.add(int(check_sid))
                         selected = set(comp_sids[flt])
                         if tid is not None:
                             selected.add(int(tid))
+                        if check_sid is not None:
+                            selected.add(int(check_sid))
                         if selected:
                             selected_sids_by_filter[flt] = selected
                     except Exception as e:
                         self._log(f"[WARN] Failed to load {sel_file.name}: {e}")
 
             if not all_source_ids:
-                raise RuntimeError("No targets/comparisons found. Complete Step 8 first.")
+                raise RuntimeError("No targets/comparisons/check stars found. Complete Step 8 first.")
 
-            self._log(f"Loaded {len(target_sids)} target(s), {sum(len(v) for v in comp_sids.values())} comparison(s) from Step 8")
+            self._log(
+                f"Loaded {len(target_sids)} target(s), "
+                f"{sum(len(v) for v in comp_sids.values())} comparison(s), "
+                f"{len(check_sids)} check star(s) from Step 8"
+            )
             self._log(f"Target source_ids: {target_sids}")
             self._log(f"All source_ids to photometer: {sorted(all_source_ids)}")
 
@@ -351,6 +362,40 @@ class ForcedPhotometryWorker(QThread):
             apcorr_path = output_dir / "apcorr_summary.csv" if (output_dir / "apcorr_summary.csv").exists() else apcorr_path
             df_ap = pd.read_csv(ap_path)
             apcorr_df = pd.read_csv(apcorr_path) if apcorr_path.exists() else None
+
+            # ── apcorr 요약 로그 ──────────────────────────────────────────────
+            if apcorr_df is not None and not apcorr_df.empty:
+                n_total = len(apcorr_df)
+                n_apply = int(apcorr_df["apply"].sum()) if "apply" in apcorr_df.columns else 0
+                n_reject = n_total - n_apply
+                self._log(f"[APCORR] 로드: {apcorr_path.name}  총 {n_total}프레임  apply=True:{n_apply}  False:{n_reject}")
+                if "apply_reason" in apcorr_df.columns:
+                    reason_counts = apcorr_df[apcorr_df["apply"] == False]["apply_reason"].value_counts()
+                    for reason, cnt in reason_counts.items():
+                        self._log(f"[APCORR]   거부 사유 '{reason}': {cnt}프레임")
+                if "apcorr" in apcorr_df.columns:
+                    vals = pd.to_numeric(apcorr_df["apcorr"], errors="coerce").dropna()
+                    if len(vals):
+                        self._log(f"[APCORR]   apcorr 분포: median={vals.median():.4f}×  "
+                                  f"min={vals.min():.4f}  max={vals.max():.4f}  "
+                                  f"(단위: flux ratio, ref/opt)")
+                        if vals.max() > 3.0:
+                            self._log(f"[APCORR]   ⚠ apcorr > 3× 프레임 있음 — isolation/background 문제 의심")
+                if "n_used" in apcorr_df.columns:
+                    nu = pd.to_numeric(apcorr_df["n_used"], errors="coerce").dropna()
+                    if len(nu):
+                        self._log(f"[APCORR]   n_used: median={nu.median():.0f}  min={nu.min():.0f}  max={nu.max():.0f}  "
+                                  f"(기준: apcorr_use_min_n={getattr(P, 'apcorr_use_min_n', 20)})")
+                if "mag_err_optimal" in apcorr_df.columns:
+                    me = pd.to_numeric(apcorr_df["mag_err_optimal"], errors="coerce").dropna()
+                    if len(me):
+                        self._log(f"[APCORR]   err_optimal: median={me.median():.4f}  "
+                                  f"(기준: apcorr_scatter_max={getattr(P, 'apcorr_scatter_max', 0.05)})")
+            elif apcorr_path.exists():
+                self._log("[APCORR] apcorr_summary.csv 비어있음")
+            else:
+                self._log(f"[APCORR] apcorr_summary.csv 없음 ({apcorr_path})")
+            # ─────────────────────────────────────────────────────────────────
 
             # source_id -> final ID 매핑 (Step 8 master 기반)
             df_frame_map = None  # Reference Build 없이 동작 - idmatch_df에서 직접 좌표 읽음
@@ -659,6 +704,22 @@ class ForcedPhotometryWorker(QThread):
                             c_apcorr = float(row_apc["apcorr"].values[0]) if "apcorr" in row_apc.columns else np.nan
                             rel_sc = float(row_apc["rel_scatter"].values[0]) if "rel_scatter" in row_apc.columns else np.nan
                             apply_flag = bool(row_apc["apply"].values[0]) if "apply" in row_apc.columns else False
+                            apply_reason = str(row_apc["apply_reason"].values[0]) if "apply_reason" in row_apc.columns else ""
+                            n_used_apc = int(row_apc["n_used"].values[0]) if "n_used" in row_apc.columns else -1
+                            err_opt_apc = float(row_apc["mag_err_optimal"].values[0]) if "mag_err_optimal" in row_apc.columns else np.nan
+                            if apply_flag:
+                                self._log(
+                                    f"[APCORR] {fname} apply=OK  "
+                                    f"apcorr={c_apcorr:.4f}× (flux ratio)  "
+                                    f"n={n_used_apc}  err_opt={err_opt_apc:.4f}"
+                                )
+                            else:
+                                self._log(
+                                    f"[APCORR] {fname} apply=X  사유={apply_reason}  "
+                                    f"apcorr={c_apcorr:.4f}×  n={n_used_apc}  err_opt={err_opt_apc:.4f}"
+                                )
+                        else:
+                            self._log(f"[APCORR] {fname} apcorr_summary에 항목 없음 → 미보정")
 
                     rows = []
                     frame_fail_rows = []
@@ -730,6 +791,7 @@ class ForcedPhotometryWorker(QThread):
                         flux_corr_e = flux_e
                         snr_corr = snr
                         if apply_flag and np.isfinite(c_apcorr) and c_apcorr > 0:
+                            # c_apcorr = flux(large_ref) / flux(optimal) — 플럭스 비율
                             flux_corr_e = flux_e * c_apcorr
                             sigma_corr_e = sigma_e * c_apcorr
                             snr_corr = float(flux_corr_e / sigma_corr_e) if sigma_corr_e > 0 else snr
@@ -887,7 +949,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.use_cropped = False
         self.log_window = None
         self._apcorr_summary_df = pd.DataFrame()
-        self._apcorr_candidates_df = pd.DataFrame()
+        self._growth_curve_df = pd.DataFrame()
 
         super().__init__(
             step_index=8,
@@ -1014,6 +1076,10 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.btn_apcorr_refresh.setStyleSheet("QPushButton { background-color: #607D8B; color: white; font-weight: bold; padding: 8px 12px; }")
         self.btn_apcorr_refresh.clicked.connect(self.refresh_apcorr_qc)
         apcorr_ctrl.addWidget(self.btn_apcorr_refresh)
+        btn_apcorr_log = QPushButton("Log")
+        btn_apcorr_log.setStyleSheet("QPushButton { background-color: #455A64; color: white; font-weight: bold; padding: 8px 12px; }")
+        btn_apcorr_log.clicked.connect(self.show_log_window)
+        apcorr_ctrl.addWidget(btn_apcorr_log)
         apcorr_layout.addLayout(apcorr_ctrl)
 
         apcorr_prog_row = QHBoxLayout()
@@ -1031,9 +1097,11 @@ class ForcedPhotometryWindow(StepWindowBase):
         # Left: plot
         plot_panel = QWidget()
         plot_layout = QVBoxLayout(plot_panel)
-        self.apcorr_fig = Figure(figsize=(6.6, 4.6))
+        self.apcorr_fig = Figure(figsize=(6.4, 5.6))
         self.apcorr_canvas = FigureCanvas(self.apcorr_fig)
-        self.apcorr_ax = self.apcorr_fig.add_subplot(111)
+        self.apcorr_ax_mag = self.apcorr_fig.add_subplot(211)
+        self.apcorr_ax_err = self.apcorr_fig.add_subplot(212)
+        self.apcorr_fig.subplots_adjust(hspace=0.35)
         plot_layout.addWidget(self.apcorr_canvas)
         self.apcorr_splitter.addWidget(plot_panel)
 
@@ -1045,17 +1113,16 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_file_list.currentTextChanged.connect(self._on_apcorr_file_changed)
         side_layout.addWidget(self.apcorr_file_list, stretch=1)
 
-        side_layout.addWidget(QLabel("Candidates (per selected frame)"))
-        self.apcorr_candidate_table = QTableWidget()
-        self.apcorr_candidate_table.setColumnCount(11)
-        self.apcorr_candidate_table.setHorizontalHeaderLabels(
-            ["small", "large", "r_small(px)", "r_large(px)", "apcorr", "dmag", "sig_mag", "rel_sc", "n_used", "apply", "selected"]
+        side_layout.addWidget(QLabel("Growth Curve (selected frame)"))
+        self.apcorr_file_cand_table = QTableWidget()
+        self.apcorr_file_cand_table.setColumnCount(7)
+        self.apcorr_file_cand_table.setHorizontalHeaderLabels(
+            ["scale", "r (px)", "med_mag", "med_mag_err", "med_SNR", "n_stars", "selected"]
         )
-        for col in range(11):
+        for col in range(7):
             mode = QHeaderView.Stretch if col in (0, 1) else QHeaderView.ResizeToContents
-            self.apcorr_candidate_table.horizontalHeader().setSectionResizeMode(col, mode)
-        self.apcorr_candidate_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        side_layout.addWidget(self.apcorr_candidate_table, stretch=2)
+            self.apcorr_file_cand_table.horizontalHeader().setSectionResizeMode(col, mode)
+        side_layout.addWidget(self.apcorr_file_cand_table, stretch=2)
         self.apcorr_splitter.addWidget(side_panel)
 
         self.apcorr_splitter.setStretchFactor(0, 3)
@@ -1067,7 +1134,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_sum_table = QTableWidget()
         self.apcorr_sum_table.setColumnCount(8)
         self.apcorr_sum_table.setHorizontalHeaderLabels(
-            ["Frame", "FWHM(px)", "r_small(px)", "r_large(px)", "Apcorr", "rel_scatter", "n_used", "apply"]
+            ["Frame", "FWHM(px)", "Opt r(px)", "Opt scale", "Apcorr", "SNR_opt", "mag_err_opt", "apply"]
         )
         self.apcorr_sum_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, 8):
@@ -1245,6 +1312,33 @@ class ForcedPhotometryWindow(StepWindowBase):
         scale_form.addRow("Annulus sigma clip:", self.param_sigma_clip)
 
         layout.addWidget(scale_group)
+
+        apcorr_group = QGroupBox("Aperture Correction (Apcorr)")
+        apcorr_form = QFormLayout(apcorr_group)
+
+        self.param_apcorr_scatter = QDoubleSpinBox()
+        self.param_apcorr_scatter.setRange(0.01, 0.50)
+        self.param_apcorr_scatter.setSingleStep(0.01)
+        self.param_apcorr_scatter.setDecimals(3)
+        self.param_apcorr_scatter.setValue(float(getattr(self.params.P, "apcorr_scatter_max", 0.05)))
+        self.param_apcorr_scatter.setToolTip("Max allowed rel_scatter (1.4826×MAD/apcorr). Raise to 0.10–0.20 for sparse fields.")
+        apcorr_form.addRow("Max rel_scatter:", self.param_apcorr_scatter)
+
+        self.param_apcorr_scale = QDoubleSpinBox()
+        self.param_apcorr_scale.setRange(1.5, 8.0)
+        self.param_apcorr_scale.setSingleStep(0.5)
+        self.param_apcorr_scale.setValue(float(getattr(self.params.P, "apcorr_large_ref_scale", 5.0)))
+        self.param_apcorr_scale.setToolTip("Large reference aperture size (×FWHM). Smaller = less PSF-wing noise but less encircled energy.")
+        apcorr_form.addRow("Large ref scale (×FWHM):", self.param_apcorr_scale)
+
+        self.param_apcorr_min_n = QSpinBox()
+        self.param_apcorr_min_n.setRange(3, 100)
+        self.param_apcorr_min_n.setValue(int(getattr(self.params.P, "apcorr_use_min_n", 20)))
+        self.param_apcorr_min_n.setToolTip("Minimum number of reference stars required to compute apcorr.")
+        apcorr_form.addRow("Min stars:", self.param_apcorr_min_n)
+
+        layout.addWidget(apcorr_group)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: self.save_parameters(dialog))
         buttons.rejected.connect(dialog.reject)
@@ -1262,6 +1356,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.params.P.fitsky_annulus_scale = self.param_ann_in.value()
         self.params.P.fitsky_dannulus_scale = self.param_ann_out.value()
         self.params.P.annulus_sigma_clip = self.param_sigma_clip.value()
+        self.params.P.apcorr_scatter_max = self.param_apcorr_scatter.value()
+        self.params.P.apcorr_large_ref_scale = self.param_apcorr_scale.value()
+        self.params.P.apcorr_use_min_n = self.param_apcorr_min_n.value()
         self.save_state()
         QMessageBox.information(dialog, "Success", "Parameters saved!")
         dialog.accept()
@@ -1295,6 +1392,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.apcorr_worker.progress.connect(self._on_apcorr_progress)
         self.apcorr_worker.finished.connect(self._on_apcorr_finished)
         self.apcorr_worker.error.connect(self._on_apcorr_error)
+        self.apcorr_worker.log.connect(self.log)
         self.btn_run_apcorr.setEnabled(False)
         self.btn_stop_apcorr.setEnabled(True)
         self.btn_run.setEnabled(False)
@@ -1326,7 +1424,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.btn_run_apcorr.setEnabled(True)
         self.btn_stop_apcorr.setEnabled(False)
         self.btn_run.setEnabled(True)
-        n = result.get("n_files", 0)
+        n = result.get("frames", result.get("total", 0))
         self.apcorr_status_label.setText(f"Apcorr complete: {n} frames")
         self.refresh_apcorr_qc()
 
@@ -1542,12 +1640,12 @@ class ForcedPhotometryWindow(StepWindowBase):
         result_dir = Path(self.params.P.result_dir)
         out_dir = step9_dir(result_dir)
         summary = out_dir / "apcorr_summary.csv"
-        cand = out_dir / "apcorr_candidates.csv"
+        gc = out_dir / "growth_curve.csv"
         if not summary.exists():
             summary = result_dir / "apcorr_summary.csv"
-        if not cand.exists():
-            cand = result_dir / "apcorr_candidates.csv"
-        return summary, cand
+        if not gc.exists():
+            gc = result_dir / "growth_curve.csv"
+        return summary, gc
 
     @staticmethod
     def _to_bool_value(v) -> bool:
@@ -1562,48 +1660,29 @@ class ForcedPhotometryWindow(StepWindowBase):
         if not hasattr(self, "apcorr_file_list"):
             return
 
-        summary_path, cand_path = self._resolve_apcorr_paths()
+        summary_path, gc_path = self._resolve_apcorr_paths()
         try:
             df_sum = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
         except Exception:
             df_sum = pd.DataFrame()
         try:
-            df_cand = pd.read_csv(cand_path) if cand_path.exists() else pd.DataFrame()
+            df_gc = pd.read_csv(gc_path) if gc_path.exists() else pd.DataFrame()
         except Exception:
-            df_cand = pd.DataFrame()
-
-        # If candidates are unavailable, synthesize one-point candidates from summary.
-        if df_cand.empty and (not df_sum.empty):
-            rows = []
-            for _, row in df_sum.iterrows():
-                rows.append(
-                    dict(
-                        file=str(row.get("file", "")),
-                        pair_index=0,
-                        small_scale=np.nan,
-                        large_scale=np.nan,
-                        r_small=row.get("r_small", np.nan),
-                        r_large=row.get("r_large", np.nan),
-                        n_used=row.get("n_used", np.nan),
-                        apcorr=row.get("apcorr", np.nan),
-                        rel_scatter=row.get("rel_scatter", np.nan),
-                        apply=row.get("apply", False),
-                        selected=True,
-                    )
-                )
-            df_cand = pd.DataFrame(rows)
+            df_gc = pd.DataFrame()
 
         self._apcorr_summary_df = df_sum
-        self._apcorr_candidates_df = df_cand
+        self._growth_curve_df = df_gc
 
         files = []
-        if not df_cand.empty and "file" in df_cand.columns:
-            files = sorted([str(x) for x in pd.unique(df_cand["file"].astype(str)) if str(x).strip()])
+        if not df_gc.empty and "file" in df_gc.columns:
+            files = sorted([str(x) for x in pd.unique(df_gc["file"].astype(str)) if str(x).strip()])
         elif not df_sum.empty and "file" in df_sum.columns:
             files = sorted([str(x) for x in pd.unique(df_sum["file"].astype(str)) if str(x).strip()])
 
+        self.apcorr_file_list.blockSignals(True)
         self.apcorr_file_list.clear()
         self.apcorr_file_list.addItems(files)
+        self.apcorr_file_list.blockSignals(False)
 
         if not df_sum.empty and "apply" in df_sum.columns:
             try:
@@ -1622,13 +1701,15 @@ class ForcedPhotometryWindow(StepWindowBase):
             self.apcorr_file_list.setCurrentRow(0)
             self._on_apcorr_file_changed(files[0])
         else:
-            self.apcorr_candidate_table.setRowCount(0)
-            self.apcorr_ax.clear()
-            self.apcorr_ax.text(0.5, 0.5, "No apcorr data", ha="center", va="center", transform=self.apcorr_ax.transAxes)
-            self.apcorr_ax.set_axis_off()
+            if hasattr(self, "apcorr_file_cand_table"):
+                self.apcorr_file_cand_table.setRowCount(0)
+            for ax in (self.apcorr_ax_mag, self.apcorr_ax_err):
+                ax.clear()
+                ax.text(0.5, 0.5, "No apcorr data", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="#888")
+                ax.set_axis_off()
             self.apcorr_canvas.draw_idle()
 
-        # Populate summary table
         self._refresh_apcorr_sum_table(df_sum)
 
     def _refresh_apcorr_sum_table(self, df_sum: pd.DataFrame):
@@ -1640,107 +1721,136 @@ class ForcedPhotometryWindow(StepWindowBase):
         for _, row in df_sum.iterrows():
             r = self.apcorr_sum_table.rowCount()
             self.apcorr_sum_table.insertRow(r)
-            def _f(v, fmt=".3f"):
-                try:
-                    fv = float(v)
-                    return f"{fv:{fmt}}" if np.isfinite(fv) else "—"
-                except Exception:
-                    return str(v) if v is not None else "—"
-            self.apcorr_sum_table.setItem(r, 0, QTableWidgetItem(str(row.get("file", ""))))
-            self.apcorr_sum_table.setItem(r, 1, QTableWidgetItem(_f(row.get("fwhm_med", row.get("fwhm_used", np.nan)), ".2f")))
-            self.apcorr_sum_table.setItem(r, 2, QTableWidgetItem(_f(row.get("r_small", row.get("r_ap", np.nan)), ".2f")))
-            self.apcorr_sum_table.setItem(r, 3, QTableWidgetItem(_f(row.get("r_large", np.nan), ".2f")))
-            self.apcorr_sum_table.setItem(r, 4, QTableWidgetItem(_f(row.get("apcorr", np.nan), ".4f")))
-            self.apcorr_sum_table.setItem(r, 5, QTableWidgetItem(_f(row.get("rel_scatter", row.get("rel_sc", np.nan)), ".4f")))
-            self.apcorr_sum_table.setItem(r, 6, QTableWidgetItem(str(int(row["n_used"])) if pd.notna(row.get("n_used")) else "—"))
-            apply_val = self._to_bool_value(row.get("apply", False))
-            self.apcorr_sum_table.setItem(r, 7, QTableWidgetItem("✓" if apply_val else "✗"))
+            vals = [
+                str(row.get("file", "")),
+                f"{float(row.get('fwhm_used', row.get('fwhm_med', np.nan))):.2f}"
+                    if np.isfinite(_safe_float(row.get("fwhm_used", row.get("fwhm_med")), np.nan)) else "",
+                f"{float(row.get('r_optimal', np.nan)):.2f}"
+                    if np.isfinite(_safe_float(row.get("r_optimal"), np.nan)) else "",
+                f"{float(row.get('optimal_scale', np.nan)):.2f}"
+                    if np.isfinite(_safe_float(row.get("optimal_scale"), np.nan)) else "",
+                f"{float(row.get('apcorr', np.nan)):.4f}"
+                    if np.isfinite(_safe_float(row.get("apcorr"), np.nan)) else "",
+                f"{float(row.get('snr_optimal', np.nan)):.1f}"
+                    if np.isfinite(_safe_float(row.get("snr_optimal"), np.nan)) else "",
+                f"{float(row.get('mag_err_optimal', np.nan)):.4f}"
+                    if np.isfinite(_safe_float(row.get("mag_err_optimal"), np.nan)) else "",
+                "✓" if self._to_bool_value(row.get("apply", False)) else "✗",
+            ]
+            for c, text in enumerate(vals):
+                self.apcorr_sum_table.setItem(r, c, QTableWidgetItem(text))
 
     def _on_apcorr_file_changed(self, filename: str):
-        if not filename:
+        if not filename or not hasattr(self, "apcorr_file_cand_table"):
             return
-        df = self._apcorr_candidates_df
-        if df is None or df.empty or "file" not in df.columns:
-            self.apcorr_candidate_table.setRowCount(0)
+        df_gc = getattr(self, "_growth_curve_df", None)
+        if df_gc is None or df_gc.empty or "file" not in df_gc.columns:
+            self.apcorr_file_cand_table.setRowCount(0)
+            for ax in (self.apcorr_ax_mag, self.apcorr_ax_err):
+                ax.clear()
+                ax.text(0.5, 0.5, "No growth curve data", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="#888")
+                ax.set_axis_off()
+            self.apcorr_canvas.draw_idle()
             return
 
-        sub = df[df["file"].astype(str) == str(filename)].copy()
+        sub = df_gc[df_gc["file"].astype(str) == str(filename)].copy()
         if sub.empty:
-            self.apcorr_candidate_table.setRowCount(0)
+            self.apcorr_file_cand_table.setRowCount(0)
+            for ax in (self.apcorr_ax_mag, self.apcorr_ax_err):
+                ax.clear()
+                ax.text(0.5, 0.5, "No data for this frame", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="#888")
+                ax.set_axis_off()
+            self.apcorr_canvas.draw_idle()
             return
 
-        x_col = "r_small"
-        x_label = "Aperture radius r_small (px)"
-        if "r_small" in sub.columns and "r_large" in sub.columns:
-            xs_probe = pd.to_numeric(sub["r_small"], errors="coerce")
-            xl_probe = pd.to_numeric(sub["r_large"], errors="coerce")
-            n_small = int(pd.Series(xs_probe[np.isfinite(xs_probe)]).nunique())
-            n_large = int(pd.Series(xl_probe[np.isfinite(xl_probe)]).nunique())
-            if n_large > n_small:
-                x_col = "r_large"
-                x_label = "Aperture radius r_large (px)"
-        if x_col in sub.columns:
-            sub["_ord"] = pd.to_numeric(sub[x_col], errors="coerce")
-            sub = sub.sort_values("_ord", kind="stable").drop(columns=["_ord"])
-
-        apcorr_vals = pd.to_numeric(sub.get("apcorr", np.nan), errors="coerce")
-        rel_vals = pd.to_numeric(sub.get("rel_scatter", np.nan), errors="coerce")
-        with np.errstate(divide="ignore", invalid="ignore"):
-            dmag = -2.5 * np.log10(apcorr_vals.to_numpy(float))
-        emag = 1.0857 * rel_vals.to_numpy(float)
-
-        self.apcorr_candidate_table.setRowCount(0)
-        for i, (_, row) in enumerate(sub.iterrows()):
-            r = self.apcorr_candidate_table.rowCount()
-            self.apcorr_candidate_table.insertRow(r)
+        sub = sub.sort_values("r_px", kind="stable")
+        self.apcorr_file_cand_table.setRowCount(0)
+        for _, row in sub.iterrows():
+            r = self.apcorr_file_cand_table.rowCount()
+            self.apcorr_file_cand_table.insertRow(r)
             vals = [
-                row.get("small_scale", np.nan),
-                row.get("large_scale", np.nan),
-                row.get("r_small", np.nan),
-                row.get("r_large", np.nan),
-                row.get("apcorr", np.nan),
-                dmag[i] if i < len(dmag) else np.nan,
-                emag[i] if i < len(emag) else np.nan,
-                row.get("rel_scatter", np.nan),
-                row.get("n_used", np.nan),
-                row.get("apply", False),
-                row.get("selected", False),
+                f"{_safe_float(row.get('scale'), np.nan):.2f}",
+                f"{_safe_float(row.get('r_px'), np.nan):.2f}",
+                f"{_safe_float(row.get('median_mag'), np.nan):.4f}",
+                f"{_safe_float(row.get('median_mag_err'), np.nan):.4f}",
+                f"{_safe_float(row.get('median_snr'), np.nan):.1f}",
+                str(int(_safe_float(row.get("n_stars", 0), 0))),
+                str(row.get("selected", False)),
             ]
-            for c, v in enumerate(vals):
-                if isinstance(v, (float, np.floating)) and np.isfinite(v):
-                    text = f"{v:.4f}" if c in (0, 1, 2, 3, 4, 5, 6, 7) else str(int(v))
-                else:
-                    text = str(v)
-                self.apcorr_candidate_table.setItem(r, c, QTableWidgetItem(text))
+            for c, text in enumerate(vals):
+                self.apcorr_file_cand_table.setItem(r, c, QTableWidgetItem(text))
 
-        self.apcorr_ax.clear()
-        x = pd.to_numeric(sub.get(x_col, np.nan), errors="coerce").to_numpy(float)
-        y = dmag
-        yerr = emag
-        m = np.isfinite(x) & np.isfinite(y)
+        # 2-panel growth curve plot
+        ax_mag = self.apcorr_ax_mag
+        ax_err = self.apcorr_ax_err
+        ax_mag.clear()
+        ax_err.clear()
 
-        if np.any(m):
-            xm, ym, em = x[m], y[m], yerr[m]
-            err_ok = np.isfinite(em)
-            if np.any(err_ok):
-                self.apcorr_ax.errorbar(
-                    xm[err_ok], ym[err_ok], yerr=em[err_ok],
-                    fmt="o-", color="#1f77b4", ecolor="#607D8B", capsize=3, linewidth=1.2
-                )
-                best_local = np.argmin(em[err_ok])
-                xb = xm[err_ok][best_local]
-                yb = ym[err_ok][best_local]
-                self.apcorr_ax.scatter([xb], [yb], c="#E53935", s=55, zorder=3, label="min sigma")
-            else:
-                self.apcorr_ax.plot(xm, ym, "o-", color="#1f77b4", linewidth=1.2)
-            self.apcorr_ax.set_xlabel(x_label)
-            self.apcorr_ax.set_ylabel("Apcorr (mag)")
-            self.apcorr_ax.set_title(str(filename))
-            self.apcorr_ax.grid(True, alpha=0.25)
-            self.apcorr_ax.legend(loc="best", fontsize=8, frameon=False)
-        else:
-            self.apcorr_ax.text(0.5, 0.5, "No finite candidate points", ha="center", va="center", transform=self.apcorr_ax.transAxes)
-            self.apcorr_ax.set_axis_off()
+        r_px = pd.to_numeric(sub["r_px"], errors="coerce").to_numpy(float)
+        med_mag = pd.to_numeric(sub.get("median_mag", np.nan), errors="coerce").to_numpy(float)
+        med_err = pd.to_numeric(sub.get("median_mag_err", np.nan), errors="coerce").to_numpy(float)
+
+        finite_mag = np.isfinite(r_px) & np.isfinite(med_mag)
+        finite_err = np.isfinite(r_px) & np.isfinite(med_err)
+
+        if not np.any(finite_mag) and not np.any(finite_err):
+            for ax in (ax_mag, ax_err):
+                ax.text(0.5, 0.5, "No finite growth curve points", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="#888")
+                ax.set_axis_off()
+            self.apcorr_canvas.draw_idle()
+            return
+
+        # Get summary info
+        df_sum = getattr(self, "_apcorr_summary_df", pd.DataFrame())
+        r_optimal = np.nan
+        fwhm_used = np.nan
+        apcorr_val = np.nan
+        apply_on = False
+        if not df_sum.empty and "file" in df_sum.columns:
+            row_s_df = df_sum[df_sum["file"].astype(str) == str(filename)]
+            if not row_s_df.empty:
+                row_s = row_s_df.iloc[0]
+                r_optimal = float(_safe_float(row_s.get("r_optimal"), np.nan))
+                fwhm_used = float(_safe_float(row_s.get("fwhm_used"), np.nan))
+                apcorr_val = float(_safe_float(row_s.get("apcorr"), np.nan))
+                apply_on = self._to_bool_value(row_s.get("apply", False))
+
+        color = "#1565C0"
+        if np.any(finite_mag):
+            ax_mag.plot(r_px[finite_mag], med_mag[finite_mag], "-o", color=color,
+                        linewidth=1.5, markersize=5, markeredgecolor="white", markeredgewidth=0.5)
+        if np.isfinite(r_optimal):
+            ax_mag.axvline(r_optimal, color="#E53935", linewidth=1.5, linestyle="--",
+                           alpha=0.8, label=f"opt r={r_optimal:.1f}px")
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            ax_mag.axvline(fwhm_used, color="#6D4C41", linewidth=1.2, linestyle=":",
+                           alpha=0.8, label=f"FWHM={fwhm_used:.2f}px")
+        ax_mag.invert_yaxis()
+        ax_mag.set_ylabel("Inst Magnitude", fontsize=9)
+        title = str(filename)
+        if np.isfinite(apcorr_val):
+            title += f" | apcorr={apcorr_val:.4f}"
+        title += f" | apply={'ON' if apply_on else 'OFF'}"
+        ax_mag.set_title(title, fontsize=9)
+        ax_mag.grid(True, alpha=0.25)
+        ax_mag.legend(fontsize=8, frameon=False)
+
+        if np.any(finite_err):
+            ax_err.plot(r_px[finite_err], med_err[finite_err], "-s", color="#E53935",
+                        linewidth=1.8, markersize=5, markeredgecolor="white", markeredgewidth=0.5)
+        if np.isfinite(r_optimal):
+            ax_err.axvline(r_optimal, color="#E53935", linewidth=1.5, linestyle="--", alpha=0.8)
+        if np.isfinite(fwhm_used) and fwhm_used > 0:
+            ax_err.axvline(fwhm_used, color="#6D4C41", linewidth=1.2, linestyle=":", alpha=0.8)
+        ax_err.set_xlabel("Aperture radius (px)", fontsize=9)
+        ax_err.set_ylabel("Median mag_err", fontsize=9)
+        ax_err.set_title("Error vs Aperture (U-shape)", fontsize=9)
+        ax_err.grid(True, alpha=0.25)
+
+        self.apcorr_fig.tight_layout()
         self.apcorr_canvas.draw_idle()
 
     def closeEvent(self, event):

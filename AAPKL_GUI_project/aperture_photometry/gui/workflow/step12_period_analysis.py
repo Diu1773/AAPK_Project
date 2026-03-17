@@ -1,16 +1,15 @@
 """
-Step 12: Period Analysis (Lomb-Scargle Periodogram)
+Step 12: Period Analysis (Lomb-Scargle / PDM / BLS)
 
-- Lomb-Scargle periodogram for period detection
-- Phase folded light curve plots
-- Support for both raw and corrected magnitudes
+Quick period scan.  Detailed analysis (refine, bootstrap, T₀, O-C,
+variable-star / transit / EB fitting) lives in the Tools menu.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,13 +26,11 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QLabel,
     QGroupBox,
-    QLineEdit,
     QCheckBox,
     QMessageBox,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
-    QFileDialog,
     QTextEdit,
     QWidget,
     QComboBox,
@@ -41,12 +38,86 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QSpinBox,
     QTabWidget,
-    QSplitter,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step8_dir, step10_dir, step11_dir, step12_period_dir
+from ...utils.step_paths import (
+    step8_dir,
+    step10_dir,
+    step12_period_dir,
+    find_best_lightcurve_csv,
+    load_detrend_preference,
+)
+
+
+def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
+    """Load check star CSV from step10 output for plotting. Returns (check_id, df_or_None)."""
+    try:
+        from .step10_light_curve_builder import _load_check_star_csv
+        check_id, df = _load_check_star_csv(result_dir, filt=filt)
+        return check_id, (df if not df.empty else None)
+    except Exception:
+        return None, None
+
+
+import re as _re
+
+_CORR_MODE_RE = _re.compile(r"lightcurve_.*?_(global|color|offset|raw)\b", _re.IGNORECASE)
+
+_CORR_MODE_LABELS = {
+    "global": "Global ensemble",
+    "color": "Color-dependent",
+    "offset": "Nightly offset",
+    "raw": "Raw (no correction)",
+}
+
+
+def _detect_corr_mode(filename: str) -> tuple[str, str]:
+    """Extract correction mode from lightcurve filename.
+
+    Returns (mode_key, human_label).  e.g. ("global", "Global ensemble")
+    Falls back to ("unknown", "Unknown") if not detected.
+    """
+    m = _CORR_MODE_RE.search(filename)
+    if m:
+        key = m.group(1).lower()
+        return key, _CORR_MODE_LABELS.get(key, key)
+    return "unknown", "Unknown"
+
+
+def _detect_corr_mode_from_df(df: pd.DataFrame, filename: str) -> tuple[str, str]:
+    if "correction_mode" in df.columns:
+        vals = df["correction_mode"].dropna().astype(str).str.strip().str.lower()
+        if not vals.empty:
+            key = vals.iloc[0]
+            if key:
+                return key, _CORR_MODE_LABELS.get(key, key)
+    return _detect_corr_mode(filename)
+
+
+def _compute_1day_aliases(period: float) -> list[float]:
+    """Compute 1-day sampling aliases of a period.
+
+    Formula: 1/f_alias = 1/f_true ± n/f_samp  (f_samp = 1 day⁻¹, n=1,2)
+    Returns list of alias periods (positive, finite only).
+    """
+    f = 1.0 / period
+    aliases = []
+    for n in (1, 2):
+        for sign in (+1, -1):
+            f_alias = f + sign * n
+            if f_alias > 0:
+                aliases.append(1.0 / f_alias)
+    return aliases
+
+
+def _is_1day_alias(p1: float, p2: float, tol: float = 0.005) -> bool:
+    """Check if two periods are related by 1-day sampling alias."""
+    for alias_p in _compute_1day_aliases(p1):
+        if abs(alias_p - p2) / p2 < tol:
+            return True
+    return False
 
 
 class PeriodAnalysisWorker(QThread):
@@ -154,38 +225,34 @@ class PeriodAnalysisWorker(QThread):
         else:
             ls = LombScargle(t, y)
 
-        min_freq = 1.0 / self.max_period
-        max_freq = 1.0 / self.min_period
-
         frequency, power = ls.autopower(
-            minimum_frequency=min_freq,
-            maximum_frequency=max_freq,
+            minimum_frequency=1.0 / self.max_period,
+            maximum_frequency=1.0 / self.min_period,
             samples_per_peak=self.samples_per_peak,
         )
 
         best_idx = np.argmax(power)
-        best_freq = frequency[best_idx]
-        best_power = power[best_idx]
-        best_period = 1.0 / best_freq if best_freq > 0 else np.nan
+        best_freq = float(frequency[best_idx])
+        best_period = 1.0 / best_freq
+        best_power = float(power[best_idx])
+
+        try:
+            fap = float(ls.false_alarm_probability(best_power))
+        except Exception:
+            fap = np.nan
 
         peak_indices, _ = find_peaks(power, height=0.1 * best_power)
         if len(peak_indices) == 0:
             peak_indices = [best_idx]
-
         sorted_peaks = sorted(peak_indices, key=lambda i: power[i], reverse=True)[:5]
-        top_periods = [1.0 / frequency[i] for i in sorted_peaks]
-        top_powers = [power[i] for i in sorted_peaks]
-
-        try:
-            fap = ls.false_alarm_probability(best_power)
-        except Exception:
-            fap = np.nan
+        top_periods = [1.0 / float(frequency[i]) for i in sorted_peaks]
+        top_powers = [float(power[i]) for i in sorted_peaks]
 
         return {
             "label": label, "method": "ls",
-            "frequency": frequency, "power": power,
-            "best_period": best_period, "best_power": best_power,
-            "best_freq": best_freq, "fap": fap,
+            "frequency": np.array(frequency, dtype=float),
+            "power": np.array(power, dtype=float),
+            "best_period": best_period, "best_power": best_power, "fap": fap,
             "top_periods": top_periods, "top_powers": top_powers,
             "n_points": len(t), "time": t, "mag": y, "mag_err": dy,
         }
@@ -197,11 +264,7 @@ class PeriodAnalysisWorker(QThread):
         mag_err: Optional[np.ndarray],
         label: str,
     ) -> dict:
-        """Phase Dispersion Minimization (Stellingwerf 1978).
-
-        Less susceptible to daily aliasing than Lomb-Scargle because
-        it measures phase-binned scatter rather than fitting sinusoids.
-        """
+        """Phase Dispersion Minimization (Stellingwerf 1978)."""
         t, y, dy = self._filter_valid(time, mag, mag_err)
 
         if len(t) < 10:
@@ -211,85 +274,46 @@ class PeriodAnalysisWorker(QThread):
                 "best_period": np.nan, "best_power": np.nan,
             }
 
-        total_var = np.var(y)
-        if total_var == 0:
+        baseline = t.max() - t.min()
+        n_trials = min(
+            50000,
+            int(self.samples_per_peak * baseline / self.min_period)
+        )
+        trial_periods = np.linspace(self.min_period, self.max_period, n_trials)
+
+        var_total = np.var(y)
+        if var_total == 0:
             return {
                 "label": label, "method": "pdm",
                 "error": "Zero variance in data",
                 "best_period": np.nan, "best_power": np.nan,
             }
 
-        # Build trial period grid (same density as LS)
-        baseline = t.max() - t.min()
-        n_trials = max(1000, int(self.samples_per_peak * baseline / self.min_period))
-        n_trials = min(n_trials, 50000)
-        trial_periods = np.linspace(self.min_period, self.max_period, n_trials)
-
+        theta = np.ones(n_trials)
         n_bins = self.pdm_n_bins
+        t_min = t.min()
+        dt = t - t_min
+        y2 = y * y
+        for i in range(n_trials):
+            phase = (dt / trial_periods[i]) % 1.0
+            bi = np.clip((phase * n_bins).astype(np.int32), 0, n_bins - 1)
+            counts = np.bincount(bi, minlength=n_bins)
+            sums = np.bincount(bi, weights=y, minlength=n_bins)
+            sum_sq = np.bincount(bi, weights=y2, minlength=n_bins)
+            good = counts >= 2
+            if good.any():
+                c_g = counts[good]
+                ss = sum_sq[good] - sums[good] ** 2 / c_g
+                dof = c_g - 1
+                theta[i] = ss.sum() / dof.sum() / var_total
 
-        # Weights (1/sigma^2) or uniform
-        if dy is not None and np.any(dy > 0):
-            w = 1.0 / (dy ** 2)
-        else:
-            w = np.ones(len(t), dtype=float)
-
-        t0 = t.min()
-
-        # --- Vectorized PDM: process periods in chunks ---
-        # Memory budget: ~100 MB per chunk → chunk_size = 100M / (N_obs * 8)
-        n_obs = len(t)
-        chunk_size = max(1, min(5000, 100_000_000 // max(n_obs * 8, 1)))
-        theta = np.ones(n_trials, dtype=float)
-
-        for start in range(0, n_trials, chunk_size):
-            end = min(start + chunk_size, n_trials)
-            periods_chunk = trial_periods[start:end]
-
-            # phases: (N_obs, n_chunk)
-            phases = ((t[:, None] - t0) / periods_chunk[None, :]) % 1.0
-            bin_idx = np.clip((phases * n_bins).astype(int), 0, n_bins - 1)
-
-            s2_accum = np.zeros(end - start, dtype=float)
-            n_bins_used = np.zeros(end - start, dtype=int)
-
-            for b in range(n_bins):
-                mask_b = bin_idx == b            # (N_obs, n_chunk)
-                nb = mask_b.sum(axis=0)          # (n_chunk,)
-                valid = nb >= 2
-
-                if not np.any(valid):
-                    continue
-
-                # Weighted sums for mean and variance
-                w_col = w[:, None]               # (N_obs, 1)
-                w_masked = w_col * mask_b        # (N_obs, n_chunk)
-                w_sum = w_masked.sum(axis=0)     # (n_chunk,)
-
-                wy_sum = (w_col * y[:, None] * mask_b).sum(axis=0)
-                wmean = np.where(w_sum > 0, wy_sum / w_sum, 0.0)
-
-                dev = (y[:, None] - wmean[None, :]) * mask_b
-                wdev2_sum = (w_col * dev * dev).sum(axis=0)
-                s2_bin = np.where(w_sum > 0, wdev2_sum / w_sum, 0.0)
-
-                s2_accum += np.where(valid, s2_bin, 0.0)
-                n_bins_used += valid.astype(int)
-
-            good = n_bins_used > 0
-            theta[start:end] = np.where(
-                good, (s2_accum / n_bins_used) / total_var, 1.0
-            )
-
-        # PDM: best period = minimum theta
-        # Convert to "power" = 1 - theta for consistent peak-finding
         power = 1.0 - theta
 
         best_idx = np.argmax(power)
-        best_period = trial_periods[best_idx]
-        best_power = power[best_idx]
-        best_theta = theta[best_idx]
+        best_period = float(trial_periods[best_idx])
+        best_power = float(power[best_idx])
+        best_theta = float(theta[best_idx])
 
-        # Find top peaks
         peak_indices, _ = find_peaks(power, height=0.1 * best_power)
         if len(peak_indices) == 0:
             peak_indices = [best_idx]
@@ -335,7 +359,6 @@ class PeriodAnalysisWorker(QThread):
             bls = BoxLeastSquares(t, y)
 
         baseline = t.max() - t.min()
-        # Duration must be strictly less than min_period
         max_dur = min(self.min_period * 0.5, self.max_period * 0.25, baseline * 0.25)
         min_dur = max(self.min_period * 0.01, max_dur * 0.05)
         if min_dur >= max_dur:
@@ -381,7 +404,7 @@ class PeriodAnalysisWorker(QThread):
 
 
 class PeriodAnalysisWindow(StepWindowBase):
-    """Step 12: Period Analysis with Lomb-Scargle Periodogram"""
+    """Step 12: Period Analysis — quick scan with Lomb-Scargle / PDM / BLS."""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -389,6 +412,7 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.results = {}
         self.lc_data = None
         self.current_filter = None
+        self._ui_ready = False
 
         super().__init__(
             step_index=11,
@@ -401,11 +425,12 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.setup_step_ui()
         self.restore_state()
         self._auto_load_target_id()
+        self._ui_ready = True
+        self._load_light_curve(silent=True)
 
     def _auto_load_target_id(self):
         """Step 10 → Step 8 per-filter 순서로 target ID 자동 로드."""
         rd = Path(self.params.P.result_dir)
-        # 1) Step 10 comp_selection.json
         sel_path = step10_dir(rd) / "comp_selection.json"
         if sel_path.exists():
             try:
@@ -417,7 +442,6 @@ class PeriodAnalysisWindow(StepWindowBase):
                     return
             except Exception:
                 pass
-        # 2) Step 8 per-filter selection_{filter}.json
         s8 = step8_dir(rd)
         if s8.exists():
             for sp in s8.glob("selection_*.json"):
@@ -435,7 +459,8 @@ class PeriodAnalysisWindow(StepWindowBase):
     def setup_step_ui(self):
         info = QLabel(
             "Period analysis: Lomb-Scargle, PDM, BLS.\n"
-            "Multiple methods reduce aliasing; consensus = true period."
+            "Multiple methods reduce aliasing; consensus = true period.\n"
+            "For detailed analysis (refine, bootstrap, O-C, transit fit) → Tools menu."
         )
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         info.setWordWrap(True)
@@ -445,16 +470,11 @@ class PeriodAnalysisWindow(StepWindowBase):
         data_group = QGroupBox("Data Selection")
         data_layout = QFormLayout(data_group)
 
-        # Filter selection
-        self.filter_combo = QComboBox()
-        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
-        data_layout.addRow("Filter:", self.filter_combo)
-
-        # Target ID (auto-loaded from Step 10 / Step 8)
         target_row = QHBoxLayout()
         self.target_id_spin = QSpinBox()
         self.target_id_spin.setRange(1, 99999)
         self.target_id_spin.setValue(1)
+        self.target_id_spin.valueChanged.connect(self._on_target_id_changed)
         target_row.addWidget(self.target_id_spin)
         self.target_hint = QLabel("")
         self.target_hint.setStyleSheet("QLabel { color: #388E3C; font-size: 8pt; }")
@@ -462,19 +482,17 @@ class PeriodAnalysisWindow(StepWindowBase):
         target_row.addStretch()
         data_layout.addRow("Target ID:", target_row)
 
-        # Load data button
-        load_row = QHBoxLayout()
-        self.btn_load = QPushButton("Load Light Curve")
-        self.btn_load.setStyleSheet(
-            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px 15px; }"
-        )
-        self.btn_load.clicked.connect(self._load_light_curve)
-        load_row.addWidget(self.btn_load)
+        self.source_label = QLabel("—")
+        self.source_label.setStyleSheet("QLabel { font-family: monospace; font-size: 9pt; }")
+        data_layout.addRow("Data source:", self.source_label)
 
-        self.data_status = QLabel("No data loaded")
-        load_row.addWidget(self.data_status)
-        load_row.addStretch()
-        data_layout.addRow("", load_row)
+        self.filter_combo = QComboBox()
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        data_layout.addRow("Filter:", self.filter_combo)
+
+        self.data_status = QLabel("Loading light curve data...")
+        self.data_status.setWordWrap(True)
+        data_layout.addRow("Status:", self.data_status)
 
         self.content_layout.addWidget(data_group)
 
@@ -501,7 +519,6 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.samples_spin.setValue(10)
         param_layout.addRow("Samples per peak:", self.samples_spin)
 
-        # Method selection
         method_row = QHBoxLayout()
         self.chk_ls = QCheckBox("Lomb-Scargle")
         self.chk_ls.setChecked(True)
@@ -544,6 +561,14 @@ class PeriodAnalysisWindow(StepWindowBase):
         periodogram_tab = QWidget()
         periodogram_layout = QVBoxLayout(periodogram_tab)
 
+        alias_row = QHBoxLayout()
+        self.chk_alias = QCheckBox("Show 1-day aliases of best period")
+        self.chk_alias.setChecked(True)
+        self.chk_alias.toggled.connect(self._update_periodogram_plot)
+        alias_row.addWidget(self.chk_alias)
+        alias_row.addStretch()
+        periodogram_layout.addLayout(alias_row)
+
         self.periodogram_canvas = FigureCanvas(Figure(figsize=(10, 5)))
         periodogram_layout.addWidget(self.periodogram_canvas)
 
@@ -553,7 +578,6 @@ class PeriodAnalysisWindow(StepWindowBase):
         phase_tab = QWidget()
         phase_layout = QVBoxLayout(phase_tab)
 
-        # Period selection for phase plot
         phase_control = QHBoxLayout()
         phase_control.addWidget(QLabel("Period for phase plot:"))
 
@@ -581,9 +605,9 @@ class PeriodAnalysisWindow(StepWindowBase):
         results_layout = QVBoxLayout(results_tab)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(6)
+        self.results_table.setColumnCount(7)
         self.results_table.setHorizontalHeaderLabels([
-            "Data", "Best Period (days)", "Power", "FAP", "N Points", "Top 3 Periods"
+            "Method", "Data", "Best Period (days)", "Power", "FAP", "Alias?", "Top 3 Periods"
         ])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.results_table.horizontalHeader().setStretchLastSection(True)
@@ -600,110 +624,99 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.log_text.setStyleSheet("QTextEdit { font-family: monospace; font-size: 9pt; }")
         self.content_layout.addWidget(self.log_text)
 
-        # Initialize
         self._scan_available_data()
 
+    # ------------------------------------------------------------------
+    # Data scanning / loading
+    # ------------------------------------------------------------------
+
     def _scan_available_data(self):
-        """Scan for available light curve data.
-
-        Step 10 outputs: lightcurve_ID{id}_raw.csv, lightcurve_combined_ID{id}_raw.csv
-        Step 11 outputs: lightcurve_ID{id}_{mode}.csv (mode=offset/color/global)
-        Filters are stored as a column inside the CSV, not in the filename.
-        """
-        self.filter_combo.clear()
-
+        """Auto-select best lightcurve and populate filter combo."""
         result_dir = Path(self.params.P.result_dir)
-        step10_out = step10_dir(result_dir)
-        step11_out = step11_dir(result_dir)
+        target_id = self.target_id_spin.value()
 
-        filters_found = set()
-        lc_file = self._find_best_lc_file(step10_out, step11_out, None)
+        lc_path = find_best_lightcurve_csv(result_dir, target_id)
+        self._auto_lc_path = lc_path
 
-        if lc_file is not None:
+        if lc_path and lc_path.exists():
+            mode_key, mode_label = _detect_corr_mode(lc_path.name)
+            pref = load_detrend_preference(result_dir, target_id)
+            if pref:
+                mode_label = _CORR_MODE_LABELS.get(pref, mode_label)
+            self.source_label.setText(mode_label)
+
+            # Scan filters
+            filters_found: set[str] = set()
             try:
-                df = pd.read_csv(lc_file, nrows=5000)
-                if "filter" in df.columns:
-                    for flt in df["filter"].dropna().astype(str).str.strip().str.lower().unique():
+                df_head = pd.read_csv(lc_path, nrows=500)
+                if "filter" in df_head.columns:
+                    for flt in df_head["filter"].dropna().astype(str).str.strip().str.lower().unique():
                         if flt and flt != "nan":
                             filters_found.add(flt)
             except Exception:
                 pass
+        else:
+            self.source_label.setText("No data")
+            filters_found = set()
 
-        # Fallback: scan all lightcurve CSVs for filter column
-        if not filters_found:
-            for d in [step11_out, step10_out]:
-                if not d.exists():
-                    continue
-                for f in d.glob("lightcurve_*.csv"):
-                    try:
-                        df_head = pd.read_csv(f, nrows=200)
-                        if "filter" in df_head.columns:
-                            for flt in df_head["filter"].dropna().astype(str).str.strip().str.lower().unique():
-                                if flt and flt != "nan":
-                                    filters_found.add(flt)
-                    except Exception:
-                        continue
-                if filters_found:
-                    break
-
+        self.filter_combo.blockSignals(True)
+        self.filter_combo.clear()
         if filters_found:
             self.filter_combo.addItems(sorted(filters_found))
         else:
             self.filter_combo.addItem("(no data)")
-
-    def _find_best_lc_file(
-        self,
-        step10_out: Path,
-        step11_out: Path,
-        target_id: Optional[int],
-    ) -> Optional[Path]:
-        """Find the best available light curve CSV, preferring Step 11 (detrended)."""
-        candidates: List[Path] = []
-
-        if target_id is not None:
-            # Step 11 outputs (detrended) - prefer global > color > offset
-            for mode in ["global", "color", "offset"]:
-                candidates.append(step11_out / f"lightcurve_ID{target_id}_{mode}.csv")
-            # Step 10 outputs (raw)
-            candidates.append(step10_out / f"lightcurve_combined_ID{target_id}_raw.csv")
-            candidates.append(step10_out / f"lightcurve_ID{target_id}_raw.csv")
-
-        # Glob fallbacks (any target ID)
-        for d in [step11_out, step10_out]:
-            if d.exists():
-                for f in sorted(d.glob("lightcurve_*.csv"), reverse=True):
-                    if f not in candidates:
-                        candidates.append(f)
-
-        for cand in candidates:
-            if cand.exists():
-                return cand
-        return None
+        self.filter_combo.blockSignals(False)
+        self.current_filter = self.filter_combo.currentText()
 
     def _on_filter_changed(self, index: int):
         self.current_filter = self.filter_combo.currentText()
+        if self._ui_ready:
+            self._load_light_curve(silent=True)
 
-    def _load_light_curve(self):
-        """Load light curve data for selected target and filter."""
-        result_dir = Path(self.params.P.result_dir)
+    def _on_target_id_changed(self, value: int):
+        if self._ui_ready:
+            # Re-scan sources for this target ID
+            self._scan_available_data()
+            self._load_light_curve(silent=True)
+
+    def _set_data_status(self, text: str, ok: bool = False):
+        color = "#1B5E20" if ok else "#B71C1C"
+        self.data_status.setText(text)
+        self.data_status.setStyleSheet(
+            f"color: {color}; font-family: monospace; font-size: 8pt;"
+        )
+
+    def _clear_analysis_results(self):
+        self.results = {}
+        self.results_table.setRowCount(0)
+        self.phase_period_combo.blockSignals(True)
+        self.phase_period_combo.clear()
+        self.phase_period_combo.blockSignals(False)
+        self.periodogram_canvas.figure.clear()
+        self.periodogram_canvas.draw_idle()
+        self.phase_canvas.figure.clear()
+        self.phase_canvas.draw_idle()
+        self.progress_label.setText("")
+
+    def _load_light_curve(self, silent: bool = False):
         target_id = self.target_id_spin.value()
         flt = self.filter_combo.currentText()
 
         if not flt or flt == "(no data)":
-            QMessageBox.warning(self, "No Data", "No light curve data available.")
+            self.lc_data = None
+            self.btn_run.setEnabled(False)
+            self._clear_analysis_results()
+            self._set_data_status("No light curve data available.", ok=False)
+            if not silent:
+                QMessageBox.warning(self, "No Data", "No light curve data available.")
             return
 
-        step10_out = step10_dir(result_dir)
-        step11_out = step11_dir(result_dir)
-
-        lc_file = self._find_best_lc_file(step10_out, step11_out, target_id)
-
-        if lc_file is None:
-            QMessageBox.warning(
-                self, "Not Found",
-                f"Could not find light curve data for ID {target_id}.\n"
-                "Run Step 10 (Light Curve Builder) first."
-            )
+        lc_file = getattr(self, "_auto_lc_path", None)
+        if not lc_file or not lc_file.exists():
+            self.lc_data = None
+            self.btn_run.setEnabled(False)
+            self._clear_analysis_results()
+            self._set_data_status("No data source found.", ok=False)
             return
 
         self.log(f"Loading: {lc_file}")
@@ -712,18 +725,21 @@ class PeriodAnalysisWindow(StepWindowBase):
             df = pd.read_csv(lc_file)
             self.log(f"Loaded {len(df)} rows, columns: {list(df.columns)}")
 
-            # Find time column
             time_col = None
-            for col in ["JD", "jd", "HJD", "hjd", "BJD", "bjd", "time", "rel_time_hr"]:
+            for col in ["BJD_TDB", "BJD", "bjd", "JD", "jd", "HJD", "hjd", "time", "rel_time_hr"]:
                 if col in df.columns:
                     time_col = col
                     break
 
             if time_col is None:
-                QMessageBox.warning(self, "Error", "No time column (JD/HJD/BJD) found.")
+                self.lc_data = None
+                self.btn_run.setEnabled(False)
+                self._clear_analysis_results()
+                self._set_data_status("No time column (JD/HJD/BJD) found.", ok=False)
+                if not silent:
+                    QMessageBox.warning(self, "Error", "No time column (JD/HJD/BJD) found.")
                 return
 
-            # Filter by filter column
             if "filter" in df.columns:
                 df_flt = df[df["filter"].astype(str).str.strip().str.lower() == flt.lower()].copy()
                 if df_flt.empty:
@@ -732,7 +748,6 @@ class PeriodAnalysisWindow(StepWindowBase):
             else:
                 df_flt = df
 
-            # Filter by target ID if ID column exists
             df_target = df_flt
             if "ID" in df_target.columns:
                 df_id = df_target[df_target["ID"] == target_id].copy()
@@ -741,7 +756,6 @@ class PeriodAnalysisWindow(StepWindowBase):
                 else:
                     df_target = df_id
 
-            # Find magnitude columns
             mag_raw_col = None
             mag_corr_col = None
             mag_err_col = None
@@ -756,7 +770,6 @@ class PeriodAnalysisWindow(StepWindowBase):
                     mag_corr_col = col
                     break
 
-            # If no raw, use corr as raw
             if mag_raw_col is None and mag_corr_col is not None:
                 mag_raw_col = mag_corr_col
                 mag_corr_col = None
@@ -767,11 +780,15 @@ class PeriodAnalysisWindow(StepWindowBase):
                     break
 
             if mag_raw_col is None:
-                QMessageBox.warning(
-                    self, "Error",
-                    f"No magnitude column found.\n"
-                    f"Available columns: {list(df_target.columns)}"
-                )
+                self.lc_data = None
+                self.btn_run.setEnabled(False)
+                self._clear_analysis_results()
+                self._set_data_status("No magnitude column found in light curve CSV.", ok=False)
+                if not silent:
+                    QMessageBox.warning(
+                        self, "Error",
+                        f"No magnitude column found.\nAvailable columns: {list(df_target.columns)}"
+                    )
                 return
 
             self.lc_data = {
@@ -782,22 +799,46 @@ class PeriodAnalysisWindow(StepWindowBase):
                 "filter": flt,
                 "target_id": target_id,
                 "source_file": str(lc_file),
+                "col_raw": mag_raw_col,
+                "col_corr": mag_corr_col,
+                "col_err": mag_err_col,
+                "col_time": time_col,
             }
+            self.current_filter = flt
+            self._clear_analysis_results()
+
+            corr_mode_key, corr_mode_label = _detect_corr_mode_from_df(df_target, lc_file.name)
+            self.lc_data["corr_mode"] = corr_mode_key
+            self.lc_data["corr_mode_label"] = corr_mode_label
 
             n_valid = np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag_raw"]))
-            self.data_status.setText(f"Loaded: {n_valid} points ({lc_file.name})")
-            self.data_status.setStyleSheet("color: green;")
+            corr_info = f"corr={mag_corr_col}" if mag_corr_col else "corr=없음"
+            err_info = f"err={mag_err_col}" if mag_err_col else "err=없음"
+            self._set_data_status(
+                f"{n_valid}점  [{lc_file.name}]\n"
+                f"Detrend: {corr_mode_label}  |  raw={mag_raw_col}  {corr_info}\n"
+                f"{err_info}  time={time_col}",
+                ok=True,
+            )
             self.btn_run.setEnabled(True)
 
             self.log(f"Time: {time_col}, Raw: {mag_raw_col}, Corr: {mag_corr_col}, Err: {mag_err_col}")
-            self.log(f"Filter: {flt}, Target ID: {target_id}, Valid points: {n_valid}")
+            self.log(f"Filter: {flt}, Target ID: {target_id}, Valid points: {n_valid}, Detrend: {corr_mode_label}")
 
         except Exception as e:
-            QMessageBox.warning(self, "Load Error", str(e))
+            self.lc_data = None
+            self.btn_run.setEnabled(False)
+            self._clear_analysis_results()
+            self._set_data_status(f"Load error: {e}", ok=False)
+            if not silent:
+                QMessageBox.warning(self, "Load Error", str(e))
             self.log(f"[ERROR] {e}")
 
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
     def _run_analysis(self):
-        """Run period analysis with selected methods."""
         if self.lc_data is None:
             QMessageBox.warning(self, "No Data", "Load light curve data first.")
             return
@@ -863,15 +904,14 @@ class PeriodAnalysisWindow(StepWindowBase):
         self._populate_phase_periods()
         self._update_phase_plot()
         self._save_results()
-
+        self._log_alias_warnings()
         self.log("Analysis complete")
 
-    def _update_periodogram_plot(self):
-        """Update periodogram plot.
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
 
-        Results are keyed as '{data}_{method}', e.g. 'raw_ls', 'corr_pdm'.
-        Layout: rows = methods, cols = data types (raw / corr).
-        """
+    def _update_periodogram_plot(self):
         fig = self.periodogram_canvas.figure
         fig.clear()
 
@@ -879,7 +919,6 @@ class PeriodAnalysisWindow(StepWindowBase):
             self.periodogram_canvas.draw_idle()
             return
 
-        # Determine grid layout
         method_labels = {"ls": "Lomb-Scargle", "pdm": "PDM (1-\u0398)", "bls": "BLS"}
         data_labels = {"raw": "Raw", "corr": "Corrected"}
         method_colors = {"ls": "#1E88E5", "pdm": "#E53935", "bls": "#FF9800"}
@@ -916,7 +955,6 @@ class PeriodAnalysisWindow(StepWindowBase):
                 best_period = data["best_period"]
                 best_power = data["best_power"]
 
-                # Determine x-axis (periods)
                 if "frequency" in data:
                     periods = 1.0 / data["frequency"]
                 elif "trial_periods" in data:
@@ -939,6 +977,16 @@ class PeriodAnalysisWindow(StepWindowBase):
                     f"P = {best_period:.6f} d"
                 )
                 ax.set_xscale("log")
+
+                # 1/day alias lines of the best period
+                if hasattr(self, "chk_alias") and self.chk_alias.isChecked():
+                    p_min = self.min_period_spin.value()
+                    p_max = self.max_period_spin.value()
+                    for k, ap in enumerate(_compute_1day_aliases(best_period)):
+                        if p_min <= ap <= p_max:
+                            ax.axvline(ap, color="orange", ls="--", lw=1.2, alpha=0.7,
+                                       label=f"1d-alias {ap:.4f}d" if k == 0 else f"{ap:.4f}d")
+
                 ax.legend(loc="upper right", fontsize=7)
                 ax.grid(True, alpha=0.3)
 
@@ -946,13 +994,6 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.periodogram_canvas.draw_idle()
 
     def _update_results_table(self):
-        """Update results summary table."""
-        self.results_table.setColumnCount(7)
-        self.results_table.setHorizontalHeaderLabels([
-            "Method", "Data", "Best Period (days)", "Power", "FAP", "N Points", "Top 3 Periods"
-        ])
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setRowCount(0)
 
         if not self.results:
@@ -960,6 +1001,16 @@ class PeriodAnalysisWindow(StepWindowBase):
 
         method_labels = {"ls": "Lomb-Scargle", "pdm": "PDM", "bls": "BLS"}
         data_labels = {"raw": "Raw", "corr": "Corrected"}
+
+        # Collect all best periods per data type for cross-method alias detection
+        best_periods_by_dtype: dict[str, dict[str, float]] = {}
+        for key, data in self.results.items():
+            if "error" in data:
+                continue
+            parts = key.split("_", 1)
+            if len(parts) == 2:
+                dt, mt = parts
+                best_periods_by_dtype.setdefault(dt, {})[mt] = data["best_period"]
 
         for key, data in self.results.items():
             row = self.results_table.rowCount()
@@ -983,14 +1034,28 @@ class PeriodAnalysisWindow(StepWindowBase):
             fap_str = f"{fap:.2e}" if np.isfinite(fap) else "-"
             self.results_table.setItem(row, 4, QTableWidgetItem(fap_str))
 
-            self.results_table.setItem(row, 5, QTableWidgetItem(str(data.get("n_points", 0))))
+            # Alias detection: check if this method's best period is a 1-day alias
+            # of another method's best period (same data type)
+            alias_tag = ""
+            bp = data["best_period"]
+            others = best_periods_by_dtype.get(dtype, {})
+            for other_method, other_p in others.items():
+                if other_method == method:
+                    continue
+                if _is_1day_alias(bp, other_p):
+                    oml = method_labels.get(other_method, other_method.upper())
+                    alias_tag = f"1d-alias of {oml} ({other_p:.4f}d)"
+                    break
+            item_alias = QTableWidgetItem(alias_tag)
+            if alias_tag:
+                item_alias.setForeground(Qt.red)
+            self.results_table.setItem(row, 5, item_alias)
 
             top_periods = data.get("top_periods", [])[:3]
             top_str = ", ".join(f"{p:.4f}" for p in top_periods)
             self.results_table.setItem(row, 6, QTableWidgetItem(top_str))
 
     def _populate_phase_periods(self):
-        """Populate phase period combo box with results from all methods."""
         self.phase_period_combo.blockSignals(True)
         self.phase_period_combo.clear()
 
@@ -1012,7 +1077,6 @@ class PeriodAnalysisWindow(StepWindowBase):
             if np.isfinite(best_p):
                 tag = f"{ml}/{dl}"
                 periods.append((f"{tag}: {best_p:.6f} d", best_p))
-                # Add x2 and /2 harmonics (de-duplicate)
                 p2 = round(best_p * 2, 8)
                 ph = round(best_p / 2, 8)
                 if p2 not in seen:
@@ -1031,29 +1095,23 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.phase_period_combo.blockSignals(False)
 
     def _update_phase_plot(self, index: int = 0):
-        """Update phase folded plot."""
         if self.phase_period_combo.count() == 0:
             return
-
         period = self.phase_period_combo.currentData()
         if period is None or not np.isfinite(period) or period <= 0:
             return
-
         self.phase_period_edit.blockSignals(True)
         self.phase_period_edit.setValue(period)
         self.phase_period_edit.blockSignals(False)
-
         self._draw_phase_plot(period)
 
     def _update_phase_plot_custom(self):
-        """Update phase plot with custom period."""
         period = self.phase_period_edit.value()
         if period <= 0:
             return
         self._draw_phase_plot(period)
 
     def _draw_phase_plot(self, period: float):
-        """Draw phase folded light curve for raw and corrected data."""
         fig = self.phase_canvas.figure
         fig.clear()
 
@@ -1065,9 +1123,13 @@ class PeriodAnalysisWindow(StepWindowBase):
 
         colors = {"raw": "#1E88E5", "corr": "#43A047"}
         markers = {"raw": "o", "corr": "s"}
-        labels_map = {"raw": "Raw", "corr": "Corrected"}
+        col_raw = self.lc_data.get("col_raw", "") if self.lc_data else ""
+        col_corr = self.lc_data.get("col_corr", "") if self.lc_data else ""
+        labels_map = {
+            "raw": f"Raw ({col_raw})" if col_raw else "Raw",
+            "corr": f"Corrected ({col_corr})" if col_corr else "Corrected",
+        }
 
-        # Collect one set of time/mag per data type (raw/corr), from any method
         plotted_dtypes = set()
         for key, data in self.results.items():
             if "error" in data:
@@ -1082,11 +1144,8 @@ class PeriodAnalysisWindow(StepWindowBase):
             mag = data["mag"]
             mag_err = data.get("mag_err")
 
-            # Compute phase
             t0 = np.nanmin(t)
             phase = ((t - t0) / period) % 1.0
-
-            # Plot two cycles for clarity
             phase_ext = np.concatenate([phase, phase + 1.0])
             mag_ext = np.concatenate([mag, mag])
 
@@ -1108,22 +1167,85 @@ class PeriodAnalysisWindow(StepWindowBase):
                     s=20, alpha=0.7, label=label
                 )
 
-        ax.invert_yaxis()  # Magnitudes are inverted
+        ax.invert_yaxis()
         ax.set_xlabel("Phase")
         ax.set_ylabel("Magnitude")
-        ax.set_title(f"Phase Folded Light Curve (P = {period:.6f} days)")
+        src_name = Path(self.lc_data.get("source_file", "")).name if self.lc_data else ""
+        ax.set_title(f"Phase Folded Light Curve  P = {period:.6f} d\n{src_name}", fontsize=9)
         ax.set_xlim(0, 2)
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
-
         ax.axvline(0, color="gray", ls=":", alpha=0.5)
         ax.axvline(1, color="gray", ls=":", alpha=0.5)
+
+        # Check star phase-folded overlay
+        try:
+            result_dir = Path(self.params.P.result_dir)
+            _flt = self.lc_data.get("filter", "") if self.lc_data else ""
+            _ck_id, _ck_df = _load_check_star_for_plot(result_dir, _flt)
+            if _ck_df is not None and not _ck_df.empty:
+                _t_col = next((c for c in ["BJD_TDB", "BJD", "bjd", "JD", "hjd", "time"] if c in _ck_df.columns), None)
+                _y_col = next((c for c in ["diff_mag_raw", "diff_mag", "mag"] if c in _ck_df.columns), None)
+                if _t_col and _y_col:
+                    if _flt and "filter" in _ck_df.columns:
+                        _ck_df = _ck_df[_ck_df["filter"].astype(str) == _flt]
+                    _ct = pd.to_numeric(_ck_df[_t_col], errors="coerce").to_numpy(float)
+                    _cm = pd.to_numeric(_ck_df[_y_col], errors="coerce").to_numpy(float)
+                    _mask = np.isfinite(_ct) & np.isfinite(_cm)
+                    if _mask.any():
+                        _ck_label = f"Check ID {_ck_id}" if _ck_id is not None else "Check"
+                        _t0 = np.nanmin(_ct[_mask])
+                        _phase = ((_ct[_mask] - _t0) / period) % 1.0
+                        _phase_ext = np.concatenate([_phase, _phase + 1.0])
+                        _mag_ext = np.concatenate([_cm[_mask], _cm[_mask]])
+                        ax.scatter(_phase_ext, _mag_ext, s=8, color="#FFD700", alpha=0.4,
+                                   zorder=2, label=_ck_label, marker="^")
+                        ax.legend(loc="upper right", fontsize=8)
+        except Exception:
+            pass
 
         fig.tight_layout()
         self.phase_canvas.draw_idle()
 
+    # ------------------------------------------------------------------
+    # Save / validate
+    # ------------------------------------------------------------------
+
+    def _log_alias_warnings(self):
+        """Log warnings when different methods disagree due to 1-day aliases."""
+        if not self.results:
+            return
+        # Group best periods by data type
+        by_dtype: dict[str, dict[str, float]] = {}
+        for key, data in self.results.items():
+            if "error" in data:
+                continue
+            parts = key.split("_", 1)
+            if len(parts) == 2:
+                dt, mt = parts
+                by_dtype.setdefault(dt, {})[mt] = data["best_period"]
+
+        method_labels = {"ls": "Lomb-Scargle", "pdm": "PDM", "bls": "BLS"}
+        for dtype, methods in by_dtype.items():
+            if len(methods) < 2:
+                continue
+            keys = list(methods.keys())
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    m1, m2 = keys[i], keys[j]
+                    p1, p2 = methods[m1], methods[m2]
+                    if abs(p1 - p2) / max(p1, p2) < 0.005:
+                        continue  # same period, no alias issue
+                    if _is_1day_alias(p1, p2):
+                        ml1 = method_labels.get(m1, m1.upper())
+                        ml2 = method_labels.get(m2, m2.upper())
+                        self.log(
+                            f"[ALIAS WARNING] {dtype}: {ml1}={p1:.6f}d ↔ "
+                            f"{ml2}={p2:.6f}d are 1-day aliases! "
+                            f"PDM is generally more reliable for ground-based data."
+                        )
+
     def _save_results(self):
-        """Save analysis results."""
         if not self.results or self.lc_data is None:
             return
 
@@ -1134,11 +1256,12 @@ class PeriodAnalysisWindow(StepWindowBase):
         flt = self.lc_data.get("filter", "unknown")
         target_id = self.lc_data.get("target_id", 0)
 
-        # Save summary JSON
         summary = {
             "filter": flt,
             "target_id": target_id,
             "source_file": self.lc_data.get("source_file", ""),
+            "corr_mode": self.lc_data.get("corr_mode", "unknown"),
+            "corr_mode_label": self.lc_data.get("corr_mode_label", "Unknown"),
             "min_period": self.min_period_spin.value(),
             "max_period": self.max_period_spin.value(),
             "results": {},
@@ -1164,11 +1287,9 @@ class PeriodAnalysisWindow(StepWindowBase):
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         self.log(f"Saved: {summary_path}")
 
-        # Save periodogram data as CSV
         for key, data in self.results.items():
             if "error" in data:
                 continue
-
             if "frequency" in data:
                 df = pd.DataFrame({
                     "frequency": data["frequency"],
@@ -1184,7 +1305,6 @@ class PeriodAnalysisWindow(StepWindowBase):
                     df["theta"] = data["theta"]
             else:
                 continue
-
             csv_path = out_dir / f"periodogram_{flt}_{key}_ID{target_id}.csv"
             df.to_csv(csv_path, index=False)
 
@@ -1206,6 +1326,7 @@ class PeriodAnalysisWindow(StepWindowBase):
             "use_ls": self.chk_ls.isChecked(),
             "use_pdm": self.chk_pdm.isChecked(),
             "use_bls": self.chk_bls.isChecked(),
+            "show_alias": self.chk_alias.isChecked(),
         }
         self.project_state.store_step_data("period_analysis", state)
 
@@ -1227,3 +1348,5 @@ class PeriodAnalysisWindow(StepWindowBase):
             self.chk_pdm.setChecked(bool(state["use_pdm"]))
         if "use_bls" in state:
             self.chk_bls.setChecked(bool(state["use_bls"]))
+        if "show_alias" in state:
+            self.chk_alias.setChecked(bool(state["show_alias"]))

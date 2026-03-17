@@ -35,6 +35,7 @@ from ...utils.photometry_utils import (
     MAD_TO_SIGMA,
 )
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+from ...utils.qc_utils import load_frame_excludes as _load_frame_excludes
 from ...utils.step_paths import (
     step2_cropped_dir,
     step4_dir,
@@ -596,6 +597,12 @@ class ExtinctionFitWorker(QThread):
                 except Exception:
                     pass
                 break
+
+        # Also apply step10 manual frame exclusions (frame_exclude.csv)
+        step10_excludes = _load_frame_excludes(result_dir)
+        if step10_excludes:
+            qc_exclude |= set(step10_excludes.keys())
+            self._log(f"Frame QC: {len(step10_excludes)} frame(s) excluded by step10 manual exclusion")
 
         cached_df = None
         cached_files: set[str] = set()
@@ -1514,6 +1521,13 @@ class ExtinctionFitWorker(QThread):
                 idx["filter"] = idx["FILTER"].astype(str).str.strip().str.lower()
             else:
                 idx["filter"] = ""
+
+            # Apply step10 manual frame exclusions
+            step10_excl = _load_frame_excludes(result_dir)
+            if step10_excl and "file" in idx.columns:
+                before = len(idx)
+                idx = idx[~idx["file"].astype(str).isin(set(step10_excl.keys()))].reset_index(drop=True)
+                self._log(f"Frame QC: {before - len(idx)} frame(s) excluded by step10 manual exclusion")
 
             rows = []
             total = len(idx)

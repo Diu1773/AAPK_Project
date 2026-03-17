@@ -244,6 +244,15 @@ class MainWindowWorkflow(QMainWindow):
         self._shortcut_router = ShortcutRouter(self)
         QApplication.instance().installEventFilter(self._shortcut_router)
 
+        if hasattr(self, "_offline_data_dir"):
+            QMessageBox.warning(
+                self, "이전 데이터 경로 접근 불가",
+                f"마지막으로 사용한 데이터 경로에 접근할 수 없습니다:\n\n"
+                f"  {self._offline_data_dir}\n\n"
+                "외장 드라이브가 연결되어 있지 않은 것 같습니다.\n"
+                "Step 1에서 데이터 경로를 다시 설정해 주세요."
+            )
+
     def _bootstrap_file_selection_state(self) -> None:
         """Restore multi-night/file selection context for downstream steps."""
         state_data = self.project_state.get_step_data("file_selection")
@@ -254,9 +263,13 @@ class MainWindowWorkflow(QMainWindow):
         if data_dir:
             self.params.P.data_dir = Path(data_dir)
             self.params.P.result_dir = self.params.P.data_dir / "result"
-            self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
             self.params.P.cache_dir = self.params.P.result_dir / "cache"
-            self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
+                self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # Drive not connected — warn after UI is fully initialized
+                self._offline_data_dir = str(data_dir)
 
         prefix = state_data.get("filename_prefix")
         if prefix:
@@ -437,6 +450,24 @@ class MainWindowWorkflow(QMainWindow):
         action_merger.setShortcut("Ctrl+M")
         action_merger.triggered.connect(self.open_multi_night_merger)
         tools_menu.addAction(action_merger)
+
+        tools_menu.addSeparator()
+
+        # Science analysis tools
+        action_varstar = QAction("Variable Star Analysis", self)
+        action_varstar.setShortcut("Ctrl+Shift+V")
+        action_varstar.triggered.connect(self.open_variable_star_tool)
+        tools_menu.addAction(action_varstar)
+
+        action_transit = QAction("Exoplanet Transit Analysis", self)
+        action_transit.setShortcut("Ctrl+Shift+T")
+        action_transit.triggered.connect(self.open_transit_tool)
+        tools_menu.addAction(action_transit)
+
+        action_eb = QAction("Eclipsing Binary Analysis", self)
+        action_eb.setShortcut("Ctrl+Shift+B")
+        action_eb.triggered.connect(self.open_eb_tool)
+        tools_menu.addAction(action_eb)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -950,6 +981,51 @@ class MainWindowWorkflow(QMainWindow):
         self.merger_window.raise_()
         self.merger_window.activateWindow()
         self.append_log("Opened Multi-Night Light Curve Merger")
+
+    def open_variable_star_tool(self):
+        """Open Variable Star Analysis tool window."""
+        from .tools.variable_star_tool import VariableStarToolWindow
+
+        self.varstar_window = VariableStarToolWindow(
+            self.params,
+            self.project_state,
+            parent=None,
+        )
+        self.varstar_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.varstar_window.show()
+        self.varstar_window.raise_()
+        self.varstar_window.activateWindow()
+        self.append_log("Opened Variable Star Analysis Tool")
+
+    def open_transit_tool(self):
+        """Open Exoplanet Transit Analysis tool window."""
+        from .tools.transit_tool import TransitToolWindow
+
+        self.transit_window = TransitToolWindow(
+            self.params,
+            self.project_state,
+            parent=None,
+        )
+        self.transit_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.transit_window.show()
+        self.transit_window.raise_()
+        self.transit_window.activateWindow()
+        self.append_log("Opened Exoplanet Transit Analysis Tool")
+
+    def open_eb_tool(self):
+        """Open Eclipsing Binary Analysis tool window."""
+        from .tools.eb_tool import EclipsingBinaryToolWindow
+
+        self.eb_window = EclipsingBinaryToolWindow(
+            self.params,
+            self.project_state,
+            parent=None,
+        )
+        self.eb_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.eb_window.show()
+        self.eb_window.raise_()
+        self.eb_window.activateWindow()
+        self.append_log("Opened Eclipsing Binary Analysis Tool")
 
     def _update_parameter_file(self, updates: dict):
         """

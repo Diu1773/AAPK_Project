@@ -126,6 +126,107 @@ def step12_period_dir(result_dir: Path) -> Path:
     return p
 
 
+def step11_current_lc_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"lightcurve_ID{int(target_id)}_current.csv"
+
+
+def step11_current_params_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"params_ID{int(target_id)}_current.csv"
+
+
+def step11_current_summary_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"summary_ID{int(target_id)}_current.txt"
+
+
+def step11_current_plot_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"plot_ID{int(target_id)}_current.png"
+
+
+def step11_current_meta_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"result_ID{int(target_id)}_current.json"
+
+
+def step11_current_global_zp_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"global_zp_ID{int(target_id)}_current.csv"
+
+
+def step11_current_global_mean_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"global_mean_ID{int(target_id)}_current.csv"
+
+
+def step11_current_global_diag_path(result_dir: Path, target_id: int) -> Path:
+    return step11_dir(result_dir) / f"global_diagnostics_ID{int(target_id)}_current.json"
+
+
+def step11_history_dir(result_dir: Path) -> Path:
+    return step11_dir(result_dir) / "_history"
+
+
+def load_detrend_preference(result_dir: Path, target_id: int | None = None) -> str | None:
+    """Read the adopted correction mode from step11 meta JSON.
+
+    Returns mode string ('global', 'color', 'offset') or None.
+    """
+    import json as _json
+    if target_id is not None:
+        meta = step11_current_meta_path(result_dir, target_id)
+        if meta.exists():
+            try:
+                data = _json.loads(meta.read_text(encoding="utf-8"))
+                return data.get("mode", "").lower() or None
+            except Exception:
+                pass
+    # Fallback: scan for any meta file
+    s11 = step11_dir(result_dir)
+    if s11.exists():
+        for mp in sorted(s11.glob("result_ID*_current.json")):
+            try:
+                data = _json.loads(mp.read_text(encoding="utf-8"))
+                return data.get("mode", "").lower() or None
+            except Exception:
+                continue
+    return None
+
+
+def find_best_lightcurve_csv(result_dir: Path, target_id: int | None = None) -> Path | None:
+    """Resolve the preferred light curve CSV for downstream analysis.
+
+    Preference order:
+    1. Step 11 current result
+    2. Legacy Step 11 mode-specific result (global > color > offset)
+    3. Step 10 raw combined/raw
+    """
+    step10_out = step10_dir(result_dir)
+    step11_out = step11_dir(result_dir)
+    candidates: list[Path] = []
+
+    if target_id is not None:
+        candidates.append(step11_current_lc_path(result_dir, target_id))
+        for mode in ("global", "color", "offset"):
+            candidates.append(step11_out / f"lightcurve_ID{int(target_id)}_{mode}.csv")
+        candidates.append(step10_out / f"lightcurve_combined_ID{int(target_id)}_raw.csv")
+        candidates.append(step10_out / f"lightcurve_ID{int(target_id)}_raw.csv")
+    else:
+        if step11_out.exists():
+            candidates.extend(sorted(step11_out.glob("lightcurve_ID*_current.csv"), reverse=True))
+            for mode in ("global", "color", "offset"):
+                candidates.extend(sorted(step11_out.glob(f"lightcurve_ID*_{mode}.csv"), reverse=True))
+        if step10_out.exists():
+            candidates.extend(sorted(step10_out.glob("lightcurve_combined_ID*_raw.csv"), reverse=True))
+            candidates.extend(sorted(step10_out.glob("lightcurve_ID*_raw.csv"), reverse=True))
+
+    for d in (step11_out, step10_out):
+        if d.exists():
+            for f in sorted(d.glob("lightcurve_*.csv"), reverse=True):
+                if f not in candidates:
+                    candidates.append(f)
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
+
+
 # Tool directory functions
 def tool_extinction_dir(result_dir: Path) -> Path:
     """Extinction & Zeropoint Tool output directory"""
@@ -147,5 +248,3 @@ def legacy_step11_extinction_dir(result_dir: Path) -> Path:
     # Fall back to legacy path
     legacy_path = legacy_step11_zeropoint_dir(result_dir) / "step11_extinction"
     return legacy_path
-
-

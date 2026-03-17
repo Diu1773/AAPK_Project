@@ -14,6 +14,10 @@ import time
 import json
 import re
 import threading
+import webbrowser
+import urllib.request
+import urllib.parse
+import io
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Set, Optional
@@ -33,9 +37,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
     QTextEdit, QDialog, QFormLayout, QDialogButtonBox, QCheckBox, QSpinBox,
     QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QWidget, QComboBox, QSlider, QTabWidget, QShortcut
+    QAbstractItemView, QWidget, QComboBox, QSlider, QTabWidget, QShortcut,
+    QColorDialog, QGridLayout, QScrollArea, QMenu, QAction
 )
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtGui import QKeySequence, QColor
 from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
@@ -142,6 +147,30 @@ class MasterIdEditorWindow(StepWindowBase):
         self._prefetch_lock = threading.Lock()
         self._prefetch_pending: Set[str] = set()
         self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        # Check star support
+        self.filter_check_stars: Dict[str, Optional[int]] = {}  # filter -> check star source_id
+        self._scat_check = None
+        # Image flip state
+        self._flip_x: bool = False
+        self._flip_y: bool = False
+
+        # SIMBAD type cache: source_id -> otype string (fetched async)
+        self._simbad_type_cache: Dict[int, str] = {}
+        self._simbad_fetch_thread: Optional[threading.Thread] = None
+
+        # Overlay color management
+        self._overlay_colors: dict = {
+            "matched_gaia": "#4CAF50",
+            "matched_no_gaia": "#00BCD4",
+            "ref_only": "#FFD54F",
+            "detection_only": "#FF9800",
+            "comparison": "#D32F2F",
+            "target": "#C62828",
+            "check": "#FFD700",
+        }
+        self._overlay_color_swatches: dict = {}
+        self._color_dialog = None
+
         # Scatter artist refs (reused for fast overlay)
         self._scat_matched_gaia = None
         self._scat_matched_no_gaia = None
@@ -259,6 +288,10 @@ class MasterIdEditorWindow(StepWindowBase):
         self.comparison_label.setStyleSheet("font-weight: bold; color: #D32F2F;")
         action_row1.addWidget(self.comparison_label)
 
+        self.check_label = QLabel("Check: (none)")
+        self.check_label.setStyleSheet("font-weight: bold; color: #FFD700;")
+        action_row1.addWidget(self.check_label)
+
         action_row1.addStretch()
 
         btn_set_target = QPushButton("Target (T)")
@@ -269,10 +302,20 @@ class MasterIdEditorWindow(StepWindowBase):
         btn_toggle_comp.clicked.connect(self.toggle_comparison_selected)
         action_row1.addWidget(btn_toggle_comp)
 
-        btn_simbad = QPushButton("SIMBAD")
-        btn_simbad.setToolTip("SIMBAD 좌표로 타겟 선택 (Step 1 좌표 사용)")
-        btn_simbad.clicked.connect(self.select_target_from_simbad)
+        btn_set_check = QPushButton("Check (K)")
+        btn_set_check.setToolTip("선택한 별을 check star로 지정 (K키)")
+        btn_set_check.clicked.connect(self.set_check_selected)
+        action_row1.addWidget(btn_set_check)
+
+        btn_simbad = QPushButton("Aladin")
+        btn_simbad.setToolTip("현재 화각을 Aladin Lite(SIMBAD)에서 열기 (브라우저)")
+        btn_simbad.clicked.connect(self.open_aladin_fov)
         action_row1.addWidget(btn_simbad)
+
+        btn_find_tgt = QPushButton("Find Tgt")
+        btn_find_tgt.setToolTip("SIMBAD 좌표로 타겟 선택 (Step 1 좌표 사용)")
+        btn_find_tgt.clicked.connect(self.select_target_from_simbad)
+        action_row1.addWidget(btn_find_tgt)
 
         self.content_layout.addLayout(action_row1)
 
@@ -308,6 +351,11 @@ class MasterIdEditorWindow(StepWindowBase):
         btn_copy_to_all.clicked.connect(self.copy_selection_to_all_filters)
         action_row2.addWidget(btn_copy_to_all)
 
+        self.btn_simbad_types = QPushButton("SIMBAD Types")
+        self.btn_simbad_types.setToolTip("현재 화각의 SIMBAD 오브젝트 타입 가져오기 (인터넷 필요)")
+        self.btn_simbad_types.clicked.connect(self.fetch_simbad_types)
+        action_row2.addWidget(self.btn_simbad_types)
+
         self.show_selected_only = QCheckBox("Selected only")
         self.show_selected_only.setToolTip("타겟/비교성만 오버레이에 표시")
         self.show_selected_only.stateChanged.connect(self.update_overlay)
@@ -333,11 +381,13 @@ class MasterIdEditorWindow(StepWindowBase):
             cb = QCheckBox()
             cb.setChecked(checked)
             cb.stateChanged.connect(self.update_overlay)
+            actual_color = self._overlay_colors.get(key, color)
             swatch = QLabel()
             swatch.setFixedSize(12, 12)
             swatch.setStyleSheet(
-                f"QLabel {{ background-color: {color}; border: 1px solid #555; }}"
+                f"QLabel {{ background-color: {actual_color}; border: 1px solid #555; }}"
             )
+            self._overlay_color_swatches[key] = swatch
             label = QLabel(text)
             row = QHBoxLayout()
             row.setSpacing(6)
@@ -355,8 +405,16 @@ class MasterIdEditorWindow(StepWindowBase):
         legend_layout.addWidget(_legend_item("detection_only", "#FF9800", "Unmatched"))
         legend_layout.addWidget(_legend_item("comparison", "#D32F2F", "Comparison"))
         legend_layout.addWidget(_legend_item("target", "#C62828", "Target"))
+        legend_layout.addWidget(_legend_item("check", "#FFD700", "Check Star"))
         legend_layout.addStretch()
-        self.content_layout.addWidget(legend_group)
+
+        btn_colors = QPushButton("Colors...")
+        btn_colors.setFixedWidth(70)
+        btn_colors.clicked.connect(self._open_color_dialog)
+        legend_layout.addWidget(btn_colors)
+
+        # legend_group은 레이아웃에 추가하지 않음 — Colors 다이얼로그에서 색상/on-off 관리
+        # overlay_toggles QCheckBox 객체들은 메모리에 유지되어 Colors 다이얼로그 sync 가능
 
         # ── Viewer + Table (메인 영역) ──
         main_layout = QHBoxLayout()
@@ -408,6 +466,20 @@ class MasterIdEditorWindow(StepWindowBase):
         btn_2d_plot.clicked.connect(self.open_stretch_plot)
         stretch_layout.addWidget(btn_2d_plot)
 
+        self.btn_flip_x = QPushButton("Flip X")
+        self.btn_flip_x.setFixedWidth(55)
+        self.btn_flip_x.setCheckable(True)
+        self.btn_flip_x.setToolTip("이미지 좌우 반전 (X축)")
+        self.btn_flip_x.clicked.connect(self._toggle_flip_x)
+        stretch_layout.addWidget(self.btn_flip_x)
+
+        self.btn_flip_y = QPushButton("Flip Y")
+        self.btn_flip_y.setFixedWidth(55)
+        self.btn_flip_y.setCheckable(True)
+        self.btn_flip_y.setToolTip("이미지 상하 반전 (Y축)")
+        self.btn_flip_y.clicked.connect(self._toggle_flip_y)
+        stretch_layout.addWidget(self.btn_flip_y)
+
         stretch_layout.addStretch()
         viewer_layout.addLayout(stretch_layout)
 
@@ -430,8 +502,8 @@ class MasterIdEditorWindow(StepWindowBase):
         table_layout = QVBoxLayout(table_group)
 
         self.master_table = QTableWidget()
-        self.master_table.setColumnCount(8)
-        self.master_table.setHorizontalHeaderLabels(["ID", "x", "y", "G mag", "BP-RP", "Gaia ID", "Status", "Role"])
+        self.master_table.setColumnCount(9)
+        self.master_table.setHorizontalHeaderLabels(["ID", "x", "y", "G mag", "BP-RP", "Gaia ID", "Status", "Role", "SIMBAD"])
         header = self.master_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
@@ -445,6 +517,10 @@ class MasterIdEditorWindow(StepWindowBase):
         self.master_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.master_table.setColumnHidden(5, True)
         self.master_table.itemSelectionChanged.connect(self.on_table_selection_changed)
+        self.master_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.master_table.customContextMenuRequested.connect(self._table_context_menu)
+        # SIMBAD col (8) is double-click editable
+        self.master_table.doubleClicked.connect(self._on_table_double_click)
         table_layout.addWidget(self.master_table)
 
         main_layout.addWidget(table_group, stretch=1)
@@ -634,6 +710,10 @@ class MasterIdEditorWindow(StepWindowBase):
 
                     comp_sids = data.get("comparison_source_ids", [])
                     self.filter_comparisons[flt] = set(int(s) for s in comp_sids if s is not None)
+
+                    check_sid = data.get("check_source_id")
+                    if check_sid is not None:
+                        self.filter_check_stars[flt] = int(check_sid)
 
                 except Exception as e:
                     self.log(f"Error loading selection for {flt}: {e}")
@@ -1715,6 +1795,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self.populate_file_list()
         self.update_master_table()
         self.update_target_labels()
+        self._update_check_label()
 
     def populate_file_list(self):
         """현재 필터의 파일 목록 로드"""
@@ -1967,6 +2048,11 @@ class MasterIdEditorWindow(StepWindowBase):
         if stretched is None:
             return
 
+        if self._flip_x:
+            stretched = np.fliplr(stretched)
+        if self._flip_y:
+            stretched = np.flipud(stretched)
+
         if self._imshow_obj is not None and not full_redraw:
             self._imshow_obj.set_data(stretched)
             self.ax.set_title(f"{self.current_filename} | {self.current_filter}")
@@ -1994,17 +2080,20 @@ class MasterIdEditorWindow(StepWindowBase):
 
         # Pre-create scatter artists for fast overlay reuse
         self._scat_detection_only = self.ax.scatter(
-            [], [], s=20, facecolors='none', edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+            [], [], s=20, facecolors='none', edgecolors=self._overlay_colors.get("detection_only", "#FF9800"), linewidths=0.8, alpha=0.7)
         self._scat_matched_no_gaia = self.ax.scatter(
-            [], [], s=26, facecolors='none', edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+            [], [], s=26, facecolors='none', edgecolors=self._overlay_colors.get("matched_no_gaia", "#00BCD4"), linewidths=1.0, alpha=0.8)
         self._scat_matched_gaia = self.ax.scatter(
-            [], [], s=28, facecolors='none', edgecolors='#4CAF50', linewidths=1.1, alpha=0.85)
+            [], [], s=28, facecolors='none', edgecolors=self._overlay_colors.get("matched_gaia", "#4CAF50"), linewidths=1.1, alpha=0.85)
         self._scat_comp = self.ax.scatter(
-            [], [], s=36, facecolors='none', edgecolors='#D32F2F', linewidths=1.5, alpha=0.9, marker='o')
+            [], [], s=36, facecolors='none', edgecolors=self._overlay_colors.get("comparison", "#D32F2F"), linewidths=1.5, alpha=0.9, marker='o')
         self._scat_target = self.ax.scatter(
-            [], [], s=46, facecolors='none', edgecolors='#C62828', linewidths=1.8, alpha=0.95, marker='s')
+            [], [], s=46, facecolors='none', edgecolors=self._overlay_colors.get("target", "#C62828"), linewidths=1.8, alpha=0.95, marker='s')
         self._scat_ref_only = self.ax.scatter(
-            [], [], s=18, facecolors='none', edgecolors='#FFD54F', linewidths=0.9, alpha=0.7)
+            [], [], s=18, facecolors='none', edgecolors=self._overlay_colors.get("ref_only", "#FFD54F"), linewidths=0.9, alpha=0.7)
+        self._scat_check = self.ax.scatter(
+            [], [], s=80, facecolors='none', edgecolors=self._overlay_colors.get("check", "#FFD700"),
+            linewidths=1.8, alpha=0.95, marker='*')
         self._scat_selected = self.ax.scatter(
             [], [], s=70, facecolors='none', edgecolors='red', linewidths=1.8, alpha=0.9)
 
@@ -2031,6 +2120,12 @@ class MasterIdEditorWindow(StepWindowBase):
 
         x = self.idmatch_df["x"].to_numpy(float)
         y = self.idmatch_df["y"].to_numpy(float)
+        if self.image_data is not None and (self._flip_x or self._flip_y):
+            _h, _w = self.image_data.shape[:2]
+            if self._flip_x:
+                x = (_w - 1) - x
+            if self._flip_y:
+                y = (_h - 1) - y
         sid_vals = coerce_int64_source_id(self.idmatch_df["source_id"])
         sids = sid_vals.fillna(-1).astype("int64").to_numpy()
 
@@ -2074,11 +2169,16 @@ class MasterIdEditorWindow(StepWindowBase):
         show_detection_only = _toggle_enabled("detection_only", True)
         show_comp = _toggle_enabled("comparison", True)
         show_target = _toggle_enabled("target", True)
+        show_check = _toggle_enabled("check", True)
+
+        # Check star
+        check_sid = self.filter_check_stars.get(self.current_filter) if self.current_filter else None
+        is_check = (check_sid is not None) & (sids == check_sid) if check_sid is not None else np.zeros(len(sids), dtype=bool)
 
         if len(x):
-            matched_gaia = is_matched & is_gaia_matched & ~is_comp & ~is_target
-            matched_no_gaia = is_matched & ~is_gaia_matched & ~is_comp & ~is_target
-            detection_only = (~is_matched) & ~is_comp & ~is_target
+            matched_gaia = is_matched & is_gaia_matched & ~is_comp & ~is_target & ~is_check
+            matched_no_gaia = is_matched & ~is_gaia_matched & ~is_comp & ~is_target & ~is_check
+            detection_only = (~is_matched) & ~is_comp & ~is_target & ~is_check
 
             if _have_artists:
                 # Fast path: update pre-created scatter artists via set_offsets()
@@ -2109,34 +2209,44 @@ class MasterIdEditorWindow(StepWindowBase):
                     self._safe_offsets(x[is_target], y[is_target]) if show_target
                     else np.empty((0, 2)))
                 self._scat_target.set_visible(show_target)
+
+                if self._scat_check is not None:
+                    self._scat_check.set_offsets(
+                        self._safe_offsets(x[is_check], y[is_check]) if show_check and np.any(is_check)
+                        else np.empty((0, 2)))
+                    self._scat_check.set_visible(show_check and np.any(is_check))
             else:
                 # Slow fallback: create new scatter objects
                 if not show_selected_only:
                     if show_detection_only:
                         self.ax.scatter(x[detection_only], y[detection_only], s=20, facecolors='none',
-                                        edgecolors='#FF9800', linewidths=0.8, alpha=0.7)
+                                        edgecolors=self._overlay_colors.get("detection_only", "#FF9800"), linewidths=0.8, alpha=0.7)
                     if show_matched_no_gaia:
                         self.ax.scatter(x[matched_no_gaia], y[matched_no_gaia], s=26, facecolors='none',
-                                        edgecolors='#00BCD4', linewidths=1.0, alpha=0.8)
+                                        edgecolors=self._overlay_colors.get("matched_no_gaia", "#00BCD4"), linewidths=1.0, alpha=0.8)
                     if show_matched_gaia:
                         self.ax.scatter(x[matched_gaia], y[matched_gaia],
-                                        s=28, facecolors='none', edgecolors='#4CAF50', linewidths=1.1, alpha=0.85)
+                                        s=28, facecolors='none', edgecolors=self._overlay_colors.get("matched_gaia", "#4CAF50"), linewidths=1.1, alpha=0.85)
                 if show_comp:
                     self.ax.scatter(x[is_comp], y[is_comp], s=36, facecolors='none',
-                                    edgecolors='#D32F2F', linewidths=1.5, alpha=0.9, marker='o')
+                                    edgecolors=self._overlay_colors.get("comparison", "#D32F2F"), linewidths=1.5, alpha=0.9, marker='o')
                 if show_target:
                     self.ax.scatter(x[is_target], y[is_target], s=46, facecolors='none',
-                                    edgecolors='#C62828', linewidths=1.8, alpha=0.95, marker='s')
+                                    edgecolors=self._overlay_colors.get("target", "#C62828"), linewidths=1.8, alpha=0.95, marker='s')
+                if show_check and np.any(is_check):
+                    self.ax.scatter(x[is_check], y[is_check], s=80, facecolors='none',
+                                    edgecolors=self._overlay_colors.get("check", "#FFD700"), linewidths=1.8, alpha=0.95, marker='*')
 
             label_mask = np.isfinite(x) & np.isfinite(y) & (sids != -1)
             if show_selected_only:
-                label_mask &= ((is_comp & show_comp) | (is_target & show_target))
+                label_mask &= ((is_comp & show_comp) | (is_target & show_target) | (is_check & show_check))
             else:
                 label_mask &= (
                     (matched_gaia & show_matched_gaia)
                     | (matched_no_gaia & show_matched_no_gaia)
                     | (is_comp & show_comp)
                     | (is_target & show_target)
+                    | (is_check & show_check)
                 )
             if np.any(label_mask):
                 label_offset = 4.0
@@ -2154,10 +2264,18 @@ class MasterIdEditorWindow(StepWindowBase):
                 for xi, yi, sid in zip(x[label_mask], y[label_mask], sids[label_mask]):
                     # Use stable_id (1, 2, 3...) instead of source_id (Gaia ID)
                     display_id = self.sid_to_id.get(int(sid), int(sid))
+                    sid_int = int(sid)
+                    suffix = ""
+                    if self.target_source_id is not None and sid_int == self.target_source_id:
+                        suffix = " T"
+                    elif check_sid is not None and sid_int == check_sid:
+                        suffix = " K"
+                    elif sid_int in self.comparison_ids:
+                        suffix = " C"
                     self.ax.text(
                         xi - label_offset,
                         yi + label_offset,
-                        str(display_id),
+                        f"{display_id}{suffix}",
                         **label_style,
                     )
 
@@ -2183,6 +2301,12 @@ class MasterIdEditorWindow(StepWindowBase):
                                 dec_vals[mask].to_numpy(float),
                                 0,
                             )
+                            if self.image_data is not None and (self._flip_x or self._flip_y):
+                                _h2, _w2 = self.image_data.shape[:2]
+                                if self._flip_x:
+                                    x_ref_all = (_w2 - 1) - x_ref_all
+                                if self._flip_y:
+                                    y_ref_all = (_h2 - 1) - y_ref_all
                             ref_label_data = list(zip(
                                 x_ref_all, y_ref_all,
                                 ref_sub.loc[mask, "source_id"].astype("int64")
@@ -2209,12 +2333,23 @@ class MasterIdEditorWindow(StepWindowBase):
                     self.ax.text(xi - label_offset, yi + label_offset, str(display_id), **label_style)
 
         # 선택된 소스 (현재 클릭한 것)
+        def _sel_disp_xy(df_sel):
+            sx = df_sel["x"].to_numpy(float)
+            sy = df_sel["y"].to_numpy(float)
+            if self.image_data is not None and (self._flip_x or self._flip_y):
+                _hs, _ws = self.image_data.shape[:2]
+                if self._flip_x:
+                    sx = (_ws - 1) - sx
+                if self._flip_y:
+                    sy = (_hs - 1) - sy
+            return sx, sy
+
         if _have_artists:
             if self.selected_source_id is not None:
                 sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
                 if len(sel):
-                    self._scat_selected.set_offsets(
-                        self._safe_offsets(sel["x"].to_numpy(float), sel["y"].to_numpy(float)))
+                    sx, sy = _sel_disp_xy(sel)
+                    self._scat_selected.set_offsets(self._safe_offsets(sx, sy))
                     self._scat_selected.set_visible(True)
                 else:
                     self._scat_selected.set_offsets(np.empty((0, 2)))
@@ -2226,7 +2361,8 @@ class MasterIdEditorWindow(StepWindowBase):
             if self.selected_source_id is not None:
                 sel = self.idmatch_df[self.idmatch_df["source_id"] == self.selected_source_id]
                 if len(sel):
-                    self.ax.scatter(sel["x"], sel["y"], s=70, facecolors='none',
+                    sx, sy = _sel_disp_xy(sel)
+                    self.ax.scatter(sx, sy, s=70, facecolors='none',
                                     edgecolors='red', linewidths=1.8, alpha=0.9)
 
         self.canvas.draw_idle()
@@ -2280,18 +2416,20 @@ class MasterIdEditorWindow(StepWindowBase):
             # BP-RP 색지수
             color_val = self._get_color_for_source(sid)
 
-            # Role 결정
+            # Role 결정 (K는 comp이기도 하면 K 우선 표시)
             role = ""
             if self.target_source_id is not None and sid == self.target_source_id:
                 role = "T"
+            elif self.current_filter and self.filter_check_stars.get(self.current_filter) == sid:
+                role = "K"
             elif sid in self.comparison_ids:
                 role = "C"
 
             rows.append((sid, x_pos, y_pos, g_mag, color_val, gaia_id_str, match_status, role))
 
-        # Role 우선 (Target, Comp), 그 다음 G mag 순으로 정렬
+        # Role 우선 (Target, Comp, Check), 그 다음 G mag 순으로 정렬
         def sort_key(r):
-            role_order = 0 if r[7] == "T" else (1 if r[7] == "C" else 2)
+            role_order = 0 if r[7] == "T" else (1 if r[7] == "C" else (2 if r[7] == "K" else 3))
             g_val = r[3] if np.isfinite(r[3]) else 999
             return (role_order, g_val)
 
@@ -2321,6 +2459,14 @@ class MasterIdEditorWindow(StepWindowBase):
             self.master_table.setItem(i, 5, QTableWidgetItem(gaia_id_str))
             self.master_table.setItem(i, 6, QTableWidgetItem(match_status))
             self.master_table.setItem(i, 7, QTableWidgetItem(role))
+            # SIMBAD type (col 8) — filled from cache if available
+            otype = self._simbad_type_cache.get(sid, "")
+            otype_item = QTableWidgetItem(otype)
+            if otype and otype not in ("*", ""):
+                from PyQt5.QtGui import QColor as _QColor
+                otype_item.setForeground(_QColor("#FFD700") if any(k in otype for k in ("V*", "EB", "RR", "Cep"))
+                                         else _QColor("#80DEEA"))
+            self.master_table.setItem(i, 8, otype_item)
             self._sid_to_row[int(sid)] = i
 
         self._toggle_gaia_id_column()
@@ -2367,6 +2513,14 @@ class MasterIdEditorWindow(StepWindowBase):
             return
         self.setFocus()
         self.last_click_xy = (x, y)
+
+        # Reverse flip transform to get original pixel coords
+        if self.image_data is not None and (self._flip_x or self._flip_y):
+            _hc, _wc = self.image_data.shape[:2]
+            if self._flip_x:
+                x = (_wc - 1) - x
+            if self._flip_y:
+                y = (_hc - 1) - y
 
         search_r = float(getattr(self.params.P, "search_radius_px", 7.0))
 
@@ -2578,19 +2732,158 @@ class MasterIdEditorWindow(StepWindowBase):
         if sid not in self.master_ids:
             self._add_to_master({sid}, reason="auto_add_comp")
 
+        flt = self.current_filter
+        is_check = flt and self.filter_check_stars.get(flt) == sid
+
         if sid in self.comparison_ids:
+            # 이미 C → 토글 해제
             self.comparison_ids.remove(sid)
             action = "removed"
         else:
             self.comparison_ids.add(sid)
             action = "added"
+            # K였으면 K 해제 (C로 전환)
+            if is_check:
+                self.filter_check_stars[flt] = None
+                self._update_check_label()
 
-        self.filter_comparisons[self.current_filter] = self.comparison_ids.copy()
+        if flt:
+            self.filter_comparisons[flt] = self.comparison_ids.copy()
         self.update_target_labels()
         self.save_selection()
         self.update_master_table()
         self.update_overlay()
         self.log(f"Comparison {action}: {sid}")
+
+    def set_check_selected(self):
+        if self.selected_source_id is None:
+            return
+        flt = self.current_filter
+        if flt is None:
+            return
+        prev = self.filter_check_stars.get(flt)
+        if prev == self.selected_source_id:
+            # Toggle off
+            self.filter_check_stars[flt] = None
+        else:
+            sid = int(self.selected_source_id)
+            self.filter_check_stars[flt] = sid
+            # Check star는 comp ensemble에서 제외
+            self.comparison_ids.discard(sid)
+            if flt in self.filter_comparisons:
+                self.filter_comparisons[flt].discard(sid)
+        self._update_check_label()
+        self.save_selection()
+        self.update_master_table()
+        self.update_overlay()
+        self.log(f"Check star set: {self.filter_check_stars.get(flt)}")
+
+    def _update_check_label(self):
+        flt = self.current_filter
+        if flt is None:
+            self.check_label.setText("Check: (none)")
+            return
+        check_sid = self.filter_check_stars.get(flt)
+        if check_sid is None:
+            self.check_label.setText("Check: (none)")
+        else:
+            disp_id = self.sid_to_id.get(int(check_sid), "?")
+            self.check_label.setText(f"Check: ID {disp_id}")
+
+    def _open_color_dialog(self):
+        if self._color_dialog is not None and self._color_dialog.isVisible():
+            self._color_dialog.raise_()
+            self._color_dialog.activateWindow()
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Overlay Colors")
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+        self._color_dialog = dlg
+
+        grid = QGridLayout(dlg)
+        grid.setSpacing(8)
+
+        key_labels = [
+            ("matched_gaia", "Gaia matched"),
+            ("matched_no_gaia", "ID matched"),
+            ("ref_only", "Ref only"),
+            ("detection_only", "Unmatched"),
+            ("comparison", "Comparison"),
+            ("target", "Target"),
+            ("check", "Check Star"),
+        ]
+
+        dlg_swatch_buttons: dict = {}
+
+        for row_i, (key, label_text) in enumerate(key_labels):
+            color = self._overlay_colors.get(key, "#FFFFFF")
+
+            btn_swatch = QPushButton()
+            btn_swatch.setFixedSize(24, 24)
+            btn_swatch.setStyleSheet(f"QPushButton {{ background-color: {color}; border: 1px solid #555; }}")
+            dlg_swatch_buttons[key] = btn_swatch
+
+            def _make_color_click(k, btn):
+                def _on_click():
+                    cur_color = self._overlay_colors.get(k, "#FFFFFF")
+                    chosen = QColorDialog.getColor(QColor(cur_color), dlg, f"Choose color for {k}")
+                    if not chosen.isValid():
+                        return
+                    hex_color = chosen.name()
+                    self._overlay_colors[k] = hex_color
+                    btn.setStyleSheet(f"QPushButton {{ background-color: {hex_color}; border: 1px solid #555; }}")
+                    # Update legend swatch
+                    if k in self._overlay_color_swatches:
+                        self._overlay_color_swatches[k].setStyleSheet(
+                            f"QLabel {{ background-color: {hex_color}; border: 1px solid #555; }}"
+                        )
+                    # Update scatter artist edgecolors
+                    scat_map = {
+                        "matched_gaia": "_scat_matched_gaia",
+                        "matched_no_gaia": "_scat_matched_no_gaia",
+                        "ref_only": "_scat_ref_only",
+                        "detection_only": "_scat_detection_only",
+                        "comparison": "_scat_comp",
+                        "target": "_scat_target",
+                        "check": "_scat_check",
+                    }
+                    attr = scat_map.get(k)
+                    if attr:
+                        scat = getattr(self, attr, None)
+                        if scat is not None:
+                            try:
+                                scat.set_edgecolors(hex_color)
+                            except Exception:
+                                pass
+                    self.canvas.draw_idle()
+                return _on_click
+
+            btn_swatch.clicked.connect(_make_color_click(key, btn_swatch))
+
+            grid.addWidget(btn_swatch, row_i, 0)
+            grid.addWidget(QLabel(label_text), row_i, 1)
+
+            # Visibility checkbox synced with overlay_toggles
+            vis_cb = QCheckBox("Show")
+            linked_cb = self.overlay_toggles.get(key)
+            if linked_cb is not None:
+                vis_cb.setChecked(linked_cb.isChecked())
+                def _make_sync(dst_cb, src_cb):
+                    def _on_toggled(state):
+                        dst_cb.blockSignals(True)
+                        dst_cb.setChecked(state == Qt.Checked)
+                        dst_cb.blockSignals(False)
+                        self.update_overlay()
+                    return _on_toggled
+                vis_cb.stateChanged.connect(_make_sync(linked_cb, vis_cb))
+            grid.addWidget(vis_cb, row_i, 2)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        grid.addWidget(close_btn, len(key_labels), 0, 1, 3)
+
+        dlg.show()
 
     def auto_select_comparisons(self):
         """비교성 자동 선택: 모든 프레임 공통 소스 중 밝은 등급 + 비슷한 색지수 우선"""
@@ -2617,6 +2910,8 @@ class MasterIdEditorWindow(StepWindowBase):
         # 후보 수집: 공통 source_id에 해당하는 것만
         candidates = []
         seen_sids = set()
+        # check star는 comp ensemble에서 제외
+        _check_sid = self.filter_check_stars.get(self.current_filter) if self.current_filter else None
 
         # idmatch_df에서 후보 수집 (공통 소스만)
         if self.idmatch_df is not None and not self.idmatch_df.empty:
@@ -2626,6 +2921,8 @@ class MasterIdEditorWindow(StepWindowBase):
                     continue
                 sid = int(sid_val)
                 if sid == self.target_source_id or sid in seen_sids:
+                    continue
+                if _check_sid is not None and sid == _check_sid:
                     continue
                 if sid not in common_sids:
                     continue
@@ -2662,6 +2959,8 @@ class MasterIdEditorWindow(StepWindowBase):
                     continue
                 sid = int(sid_val)
                 if sid == self.target_source_id or sid in seen_sids:
+                    continue
+                if _check_sid is not None and sid == _check_sid:
                     continue
                 if sid not in common_sids:
                     continue
@@ -2804,6 +3103,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         current_target = self.target_source_id
         current_comps = self.comparison_ids.copy()
+        current_check = self.filter_check_stars.get(self.current_filter)
 
         copied_filters = []
 
@@ -2815,17 +3115,22 @@ class MasterIdEditorWindow(StepWindowBase):
             # 동일 source_id가 다른 필터에서도 유효하다고 가정 (WCS 기반 매칭)
             self.filter_targets[flt] = current_target
             self.filter_comparisons[flt] = current_comps.copy()
+            self.filter_check_stars[flt] = current_check
 
             # 파일 저장
             self._save_selection_for_filter(flt, current_target, current_comps)
             copied_filters.append(f"{flt} ({len(current_comps)} comps)")
 
         # 결과 메시지
-        msg = f"Selection copied from '{self.current_filter}':\n\n"
+        check_disp = self.sid_to_id.get(current_check, current_check) if current_check else "none"
+        msg = (f"Selection copied from '{self.current_filter}':\n"
+               f"  Target: {self.sid_to_id.get(current_target, current_target)}\n"
+               f"  Comps: {len(current_comps)}\n"
+               f"  Check: {check_disp}\n\n")
         if copied_filters:
             msg += f"Copied to: {', '.join(copied_filters)}"
 
-        self.log(f"Copy selection: {len(copied_filters)} filters updated")
+        self.log(f"Copy selection: {len(copied_filters)} filters updated (check={current_check})")
         QMessageBox.information(self, "Copy Selection", msg)
 
     def _save_selection_for_filter(self, flt: str, target_sid: int, comp_sids: set):
@@ -2837,6 +3142,9 @@ class MasterIdEditorWindow(StepWindowBase):
         all_sids = {int(sid) for sid in comp_sids if sid is not None}
         if target_sid is not None:
             all_sids.add(int(target_sid))
+        check_sid = self.filter_check_stars.get(flt)
+        if check_sid is not None:
+            all_sids.add(int(check_sid))
         if flt not in self.filter_master_ids:
             self.filter_master_ids[flt] = set()
         self.filter_master_ids[flt].update(all_sids)
@@ -2853,12 +3161,18 @@ class MasterIdEditorWindow(StepWindowBase):
             if sid is not None and int(sid) in source_to_id
         ])
 
+        # Check star
+        check_sid = self.filter_check_stars.get(flt)
+        check_id_val = source_to_id.get(int(check_sid)) if check_sid is not None else None
+
         data = {
             "filter": flt,
             "target_id": target_id,
             "target_source_id": int(target_sid) if target_sid is not None else None,
             "comparison_ids": comp_ids,
             "comparison_source_ids": sorted([int(sid) for sid in comp_sids if sid is not None]),
+            "check_id": check_id_val,
+            "check_source_id": int(check_sid) if check_sid is not None else None,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -2866,7 +3180,7 @@ class MasterIdEditorWindow(StepWindowBase):
         with open(selection_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-        self.log(f"  Saved selection for {flt}: target={target_sid}, {len(comp_sids)} comps")
+        self.log(f"  Saved selection for {flt}: target={target_sid}, {len(comp_sids)} comps, check={check_sid}")
 
     def _load_source_to_id_map(self, flt: str) -> Dict[int, int]:
         """Load final source_id -> ID mapping for a filter from Step 8 outputs."""
@@ -2894,6 +3208,329 @@ class MasterIdEditorWindow(StepWindowBase):
                 if sid_int not in source_to_id:
                     source_to_id[sid_int] = int(id_val)
         return source_to_id
+
+    # ── SIMBAD type query ──────────────────────────────────────────────────────
+
+    def fetch_simbad_types(self):
+        """현재 화각의 모든 별에 대해 SIMBAD otype을 비동기로 가져온다."""
+        if self._simbad_fetch_thread and self._simbad_fetch_thread.is_alive():
+            self.log("[SIMBAD] 이미 조회 중...")
+            return
+        info = self._get_frame_center_radec()
+        if info is None:
+            self.log("[SIMBAD] WCS 없음 — 프레임을 먼저 로드하세요.")
+            return
+        ra_c, dec_c, fov_deg = info
+
+        # Collect all source RA/Dec from idmatch_df
+        if self.idmatch_df is None or self.idmatch_df.empty:
+            self.log("[SIMBAD] 검출 데이터 없음.")
+            return
+
+        # Build source_id → (ra, dec) map from idmatch
+        df = self.idmatch_df.copy()
+        ra_col = next((c for c in ["ra_gaia", "ra", "RA"] if c in df.columns), None)
+        dec_col = next((c for c in ["dec_gaia", "dec", "DEC"] if c in df.columns), None)
+        sid_col = next((c for c in ["source_id", "gaia_source_id"] if c in df.columns), None)
+
+        if ra_col is None or dec_col is None:
+            self.log("[SIMBAD] RA/Dec 컬럼 없음.")
+            return
+
+        src_radec: Dict[int, tuple] = {}
+        for _, row in df.iterrows():
+            ra_v = row.get(ra_col)
+            dec_v = row.get(dec_col)
+            if pd.isna(ra_v) or pd.isna(dec_v):
+                continue
+            sid = int(row[sid_col]) if sid_col and not pd.isna(row.get(sid_col, float('nan'))) else id(row)
+            src_radec[sid] = (float(ra_v), float(dec_v))
+
+        if not src_radec:
+            self.log("[SIMBAD] 유효한 좌표 없음.")
+            return
+
+        self.btn_simbad_types.setEnabled(False)
+        self.btn_simbad_types.setText("조회 중...")
+        self.log(f"[SIMBAD] FOV RA={ra_c:.4f} Dec={dec_c:.4f} r={fov_deg*60:.1f}′ 조회 시작...")
+
+        def _worker():
+            try:
+                results = self._query_simbad_tap(ra_c, dec_c, fov_deg + 0.05)
+                if results is None:
+                    return
+                # Match each source to nearest SIMBAD result within 5 arcsec
+                if results.empty:
+                    self.log("[SIMBAD] 결과 없음.")
+                    return
+
+                simbad_coords = SkyCoord(
+                    results["ra"].to_numpy(float) * u.deg,
+                    results["dec"].to_numpy(float) * u.deg,
+                    frame="icrs"
+                )
+                matched = 0
+                for sid, (ra_s, dec_s) in src_radec.items():
+                    sc = SkyCoord(ra_s * u.deg, dec_s * u.deg, frame="icrs")
+                    idx, sep, _ = sc.match_to_catalog_sky(simbad_coords)
+                    if float(sep.arcsec) <= 5.0:
+                        otype = str(results.iloc[int(idx)].get("otype", "")).strip()
+                        if otype:
+                            self._simbad_type_cache[sid] = otype
+                            matched += 1
+                self.log(f"[SIMBAD] {matched}/{len(src_radec)} 별 타입 매칭 완료")
+                # Update table on main thread via signal-safe method
+                self._simbad_types_ready = True
+            except Exception as e:
+                self.log(f"[SIMBAD] 오류: {e}")
+            finally:
+                # Re-enable button via Qt timer on main thread
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, self._on_simbad_fetch_done)
+
+        self._simbad_types_ready = False
+        self._simbad_fetch_thread = threading.Thread(target=_worker, daemon=True)
+        self._simbad_fetch_thread.start()
+
+    def _on_simbad_fetch_done(self):
+        self.btn_simbad_types.setEnabled(True)
+        self.btn_simbad_types.setText("SIMBAD Types")
+        if getattr(self, "_simbad_types_ready", False):
+            self._apply_simbad_types_to_table()
+
+    def _query_simbad_tap(self, ra_c: float, dec_c: float, radius_deg: float):
+        """SIMBAD TAP으로 원뿔 탐색 → DataFrame(ra, dec, otype, main_id) 반환."""
+        adql = (
+            f"SELECT main_id, otype, ra, dec "
+            f"FROM basic "
+            f"WHERE CONTAINS(POINT('ICRS', ra, dec), "
+            f"CIRCLE('ICRS', {ra_c:.6f}, {dec_c:.6f}, {radius_deg:.4f})) = 1"
+        )
+        params = urllib.parse.urlencode({
+            "REQUEST": "doQuery",
+            "LANG": "ADQL",
+            "FORMAT": "csv",
+            "QUERY": adql,
+        })
+        url = f"https://simbad.cds.unistra.fr/simbad/sim-tap/sync?{params}"
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+        df = pd.read_csv(io.StringIO(raw))
+        df.columns = [c.strip().lower() for c in df.columns]
+        for col in ["ra", "dec"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["ra", "dec"])
+        return df
+
+    def _apply_simbad_types_to_table(self):
+        """테이블 SIMBAD 컬럼(col 8) 업데이트."""
+        if not self._simbad_type_cache:
+            return
+        # Use _sid_to_row (source_id → table row index) populated in update_master_table
+        from PyQt5.QtGui import QColor as _QColor
+        for sid, otype in self._simbad_type_cache.items():
+            row = self._sid_to_row.get(int(sid), -1)
+            if row < 0:
+                continue
+            item = QTableWidgetItem(str(otype))
+            if otype and otype not in ("*", ""):
+                item.setForeground(_QColor("#FFD700") if any(k in otype for k in ("V*", "EB", "RR", "Cep"))
+                                   else _QColor("#80DEEA"))
+            self.master_table.setItem(row, 8, item)
+
+    # ── Aladin / browser helpers ───────────────────────────────────────────────
+
+    def _get_frame_center_radec(self):
+        """현재 프레임의 중심 RA/Dec(도) 및 FOV(arcmin)를 반환. 실패 시 None."""
+        hdr = self.header
+        if hdr is None:
+            return None
+        try:
+            from astropy.wcs import WCS
+            w = WCS(hdr, relax=True)
+            if not w.has_celestial:
+                return None
+            naxis1 = hdr.get("NAXIS1", 0)
+            naxis2 = hdr.get("NAXIS2", 0)
+            if naxis1 <= 0 or naxis2 <= 0:
+                return None
+            cx, cy = naxis1 / 2.0, naxis2 / 2.0
+            ra, dec = w.all_pix2world([[cx, cy]], 0)[0]
+            # FOV: diagonal of image in arcmin
+            corners = w.all_pix2world([[0, 0], [naxis1, naxis2]], 0)
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            sc0 = SkyCoord(corners[0][0]*u.deg, corners[0][1]*u.deg)
+            sc1 = SkyCoord(corners[1][0]*u.deg, corners[1][1]*u.deg)
+            fov_deg = float(sc0.separation(sc1).deg) * 0.7  # roughly half-diagonal
+            fov_deg = max(0.05, min(fov_deg, 3.0))
+            return float(ra), float(dec), float(fov_deg)
+        except Exception:
+            return None
+
+    def open_aladin_fov(self):
+        """현재 화각을 Aladin Lite(SIMBAD 오버레이)로 브라우저에서 열기."""
+        info = self._get_frame_center_radec()
+        if info is None:
+            # Fallback to step1 target coords
+            ra = getattr(self.params.P, "target_ra_deg", None)
+            dec = getattr(self.params.P, "target_dec_deg", None)
+            if ra is None or dec is None:
+                QMessageBox.information(self, "Aladin", "WCS 없음 - Step 1 타겟 좌표도 없습니다.")
+                return
+            try:
+                ra, dec = float(ra), float(dec)
+            except (TypeError, ValueError):
+                return
+            fov_deg = 0.3
+        else:
+            ra, dec, fov_deg = info
+
+        # Aladin Lite URL with DSS2 color + SIMBAD catalog
+        target_str = f"{ra:+.6f}{dec:+.6f}".replace("+", "%2B").replace("-", "%2D")
+        # Use simple RA+Dec format that Aladin accepts
+        url = (
+            f"https://aladin.cds.unistra.fr/AladinLite/"
+            f"?target={ra:.6f}%20{dec:+.6f}"
+            f"&fov={fov_deg:.3f}"
+            f"&survey=P%2FDSS2%2Fcolor"
+            f"&catName=SIMBAD"
+        )
+        webbrowser.open(url)
+        self.log(f"[Aladin] Opened FOV: RA={ra:.4f} Dec={dec:.4f} FOV={fov_deg*60:.1f}′")
+
+    def open_simbad_for_selected(self):
+        """선택된 별의 RA/Dec로 SIMBAD 페이지를 브라우저에서 열기."""
+        if self.selected_source_id is None:
+            QMessageBox.information(self, "SIMBAD", "별을 먼저 선택하세요.")
+            return
+        ra, dec = None, None
+        # Try idmatch_df
+        if self.idmatch_df is not None and not self.idmatch_df.empty:
+            sid = int(self.selected_source_id)
+            for sid_col in ["source_id", "gaia_source_id"]:
+                if sid_col in self.idmatch_df.columns:
+                    row = self.idmatch_df[self.idmatch_df[sid_col] == sid]
+                    if not row.empty:
+                        for rc in ["ra_gaia", "ra", "RA"]:
+                            if rc in row.columns and pd.notna(row.iloc[0].get(rc)):
+                                ra = float(row.iloc[0][rc])
+                                break
+                        for dc in ["dec_gaia", "dec", "DEC"]:
+                            if dc in row.columns and pd.notna(row.iloc[0].get(dc)):
+                                dec = float(row.iloc[0][dc])
+                                break
+                        break
+        if ra is None or dec is None:
+            # Try step6 radec map
+            entry = self._step6_radec_map.get(int(self.selected_source_id))
+            if entry:
+                ra, dec = entry
+        if ra is None or dec is None:
+            QMessageBox.information(self, "SIMBAD", "선택된 별의 좌표를 찾을 수 없습니다.")
+            return
+        url = (
+            f"https://simbad.cds.unistra.fr/simbad/sim-coo"
+            f"?Coord={ra:.6f}+{dec:+.6f}&CooSystem=ICRS"
+            f"&Radius=10&Radius.unit=arcsec&submit=submit+query"
+        )
+        webbrowser.open(url)
+        self.log(f"[SIMBAD] RA={ra:.5f} Dec={dec:.5f}")
+
+    def _table_context_menu(self, pos):
+        """테이블 우클릭 context menu."""
+        row = self.master_table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.master_table.selectRow(row)
+        # Select the corresponding source on canvas
+        id_item = self.master_table.item(row, 0)
+        if id_item:
+            try:
+                stable_id = int(id_item.text())
+                sid = self.id_to_sid.get(stable_id)
+                if sid is not None:
+                    self.selected_source_id = sid
+            except (ValueError, TypeError):
+                pass
+        menu = QMenu(self)
+        act_simbad = QAction("SIMBAD에서 보기", self)
+        act_simbad.triggered.connect(self.open_simbad_for_selected)
+        menu.addAction(act_simbad)
+        act_aladin = QAction("Aladin으로 화각 열기", self)
+        act_aladin.triggered.connect(self.open_aladin_fov)
+        menu.addAction(act_aladin)
+        menu.addSeparator()
+        act_clear_role = QAction("역할 제거 (T/C/K 해제)", self)
+        act_clear_role.triggered.connect(self.clear_role_selected)
+        menu.addAction(act_clear_role)
+        col = self.master_table.columnAt(pos.x())
+        if col == 8:
+            act_edit = QAction("SIMBAD 타입 직접 입력", self)
+            act_edit.triggered.connect(lambda: self._edit_simbad_type(row))
+            menu.insertAction(menu.actions()[0], act_edit)
+        menu.exec_(self.master_table.viewport().mapToGlobal(pos))
+
+    def clear_role_selected(self):
+        """선택된 별의 T/C/K 역할 모두 제거."""
+        if self.selected_source_id is None:
+            return
+        sid = int(self.selected_source_id)
+        flt = self.current_filter
+        changed = False
+        if self.target_source_id == sid:
+            self.target_source_id = None
+            if flt:
+                self.filter_targets[flt] = None
+            changed = True
+        if sid in self.comparison_ids:
+            self.comparison_ids.discard(sid)
+            if flt and flt in self.filter_comparisons:
+                self.filter_comparisons[flt].discard(sid)
+            changed = True
+        if flt and self.filter_check_stars.get(flt) == sid:
+            self.filter_check_stars[flt] = None
+            changed = True
+        if changed:
+            self._update_check_label()
+            self.update_target_labels()
+            self.save_selection()
+            self.update_master_table()
+            self.update_overlay()
+            self.log(f"역할 제거: ID {self.sid_to_id.get(sid, sid)}")
+
+    def _on_table_double_click(self, index):
+        """SIMBAD 컬럼(8) 더블클릭 시 직접 편집."""
+        if index.column() == 8:
+            self._edit_simbad_type(index.row())
+
+    def _edit_simbad_type(self, row: int):
+        """SIMBAD type 수동 입력 다이얼로그."""
+        from PyQt5.QtWidgets import QInputDialog
+        gaia_item = self.master_table.item(row, 5)
+        current = (self.master_table.item(row, 8) or QTableWidgetItem("")).text()
+        id_item = self.master_table.item(row, 0)
+        label = f"ID {id_item.text()}" if id_item else f"row {row}"
+        text, ok = QInputDialog.getText(
+            self, "SIMBAD 타입 입력",
+            f"{label} 오브젝트 타입 (예: V*, RG*, EB*, Em*, *):  ",
+            text=current,
+        )
+        if not ok:
+            return
+        text = text.strip()
+        # Update cache via _sid_to_row reverse map
+        for sid, r in self._sid_to_row.items():
+            if r == row:
+                self._simbad_type_cache[int(sid)] = text
+                break
+        from PyQt5.QtGui import QColor as _QColor
+        item = QTableWidgetItem(text)
+        if text and text not in ("*", ""):
+            item.setForeground(_QColor("#FFD700") if any(k in text for k in ("V*", "EB", "RR", "Cep"))
+                               else _QColor("#80DEEA"))
+        self.master_table.setItem(row, 8, item)
 
     def select_target_from_simbad(self):
         """SIMBAD 좌표로 타겟 선택 (Step 1에서 입력한 대상 좌표 사용)"""
@@ -3024,6 +3661,9 @@ class MasterIdEditorWindow(StepWindowBase):
         all_sids = {int(sid) for sid in self.comparison_ids if sid is not None}
         if self.target_source_id is not None:
             all_sids.add(int(self.target_source_id))
+        _check_sid = self.filter_check_stars.get(self.current_filter)
+        if _check_sid is not None:
+            all_sids.add(int(_check_sid))
         if self.current_filter not in self.filter_master_ids:
             self.filter_master_ids[self.current_filter] = set()
         self.filter_master_ids[self.current_filter].update(all_sids)
@@ -3041,6 +3681,10 @@ class MasterIdEditorWindow(StepWindowBase):
             if sid is not None and int(sid) in source_to_id
         ])
 
+        # Check star
+        check_sid = self.filter_check_stars.get(self.current_filter)
+        check_id_val = source_to_id.get(int(check_sid)) if check_sid is not None else None
+
         # 필터별 저장 (catalog 없이도 동작)
         data = {
             "filter": self.current_filter,
@@ -3048,6 +3692,8 @@ class MasterIdEditorWindow(StepWindowBase):
             "target_source_id": int(self.target_source_id) if self.target_source_id is not None else None,
             "comparison_ids": comp_ids,
             "comparison_source_ids": sorted([int(sid) for sid in self.comparison_ids]),
+            "check_id": check_id_val,
+            "check_source_id": int(check_sid) if check_sid is not None else None,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -3081,8 +3727,10 @@ class MasterIdEditorWindow(StepWindowBase):
             data = {
                 "target_source_id": self.filter_targets.get(first_filter) if first_filter else None,
                 "comparison_source_ids": sorted(self.filter_comparisons.get(first_filter, set())) if first_filter else [],
+                "check_source_id": self.filter_check_stars.get(first_filter) if first_filter else None,
                 "filter_targets": all_targets,
-                "filter_comparisons": {k: sorted(v) for k, v in all_comps.items()}
+                "filter_comparisons": {k: sorted(v) for k, v in all_comps.items()},
+                "filter_check_stars": {k: v for k, v in self.filter_check_stars.items() if v is not None},
             }
 
             step8_dir = self.params.P.result_dir / "step8_selection"
@@ -3118,7 +3766,9 @@ class MasterIdEditorWindow(StepWindowBase):
             "current_filter": self.current_filter,
             "filter_targets": {k: v for k, v in self.filter_targets.items() if v is not None},
             "filter_comparisons": {k: sorted(v) for k, v in self.filter_comparisons.items() if v},
-            "show_selected_only": self.show_selected_only.isChecked()
+            "filter_check_stars": {k: v for k, v in self.filter_check_stars.items() if v is not None},
+            "show_selected_only": self.show_selected_only.isChecked(),
+            "overlay_colors": dict(self._overlay_colors),
         }
         self.project_state.store_step_data("target_selection", state_data)
 
@@ -3134,6 +3784,18 @@ class MasterIdEditorWindow(StepWindowBase):
             # 체크박스 상태 복원
             if "show_selected_only" in state_data:
                 self.show_selected_only.setChecked(bool(state_data["show_selected_only"]))
+
+            # Check stars 복원
+            saved_checks = state_data.get("filter_check_stars", {})
+            for k, v in saved_checks.items():
+                if v is not None:
+                    self.filter_check_stars[k] = int(v)
+
+            # Overlay colors 복원 (merge)
+            saved_colors = state_data.get("overlay_colors", {})
+            for k, v in saved_colors.items():
+                if isinstance(v, str) and v.startswith("#"):
+                    self._overlay_colors[k] = v
 
     def show_log_window(self):
         self.log_window.show()
@@ -3180,6 +3842,9 @@ class MasterIdEditorWindow(StepWindowBase):
         if event.key() == Qt.Key_C:
             self.toggle_comparison_selected()
             return
+        if event.key() == Qt.Key_K:
+            self.set_check_selected()
+            return
         if event.key() == Qt.Key_G:
             self.show_radial_profile()
             return
@@ -3225,6 +3890,20 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def redisplay_image(self):
         self.display_image()
+
+    def _toggle_flip_x(self):
+        self._flip_x = self.btn_flip_x.isChecked()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
+        self.display_image()
+        self.update_overlay()
+
+    def _toggle_flip_y(self):
+        self._flip_y = self.btn_flip_y.isChecked()
+        self._display_cache.clear()
+        self._display_cache_order.clear()
+        self.display_image()
+        self.update_overlay()
 
     def open_stretch_plot(self):
         """Open stretch plot window showing histogram with draggable min/max markers"""
