@@ -379,8 +379,14 @@ class MultiNightMergerWindow(QMainWindow):
         btn_add.clicked.connect(self._on_add_folder)
         btn_remove = QPushButton("선택 제거")
         btn_remove.clicked.connect(self._on_remove_folder)
+        btn_up = QPushButton("위로")
+        btn_up.clicked.connect(lambda: self._move_selected_folder(-1))
+        btn_down = QPushButton("아래로")
+        btn_down.clicked.connect(lambda: self._move_selected_folder(+1))
         btn_row.addWidget(btn_add)
         btn_row.addWidget(btn_remove)
+        btn_row.addWidget(btn_up)
+        btn_row.addWidget(btn_down)
         btn_row.addStretch()
         grp_layout.addLayout(btn_row)
         layout.addWidget(grp)
@@ -571,7 +577,6 @@ class MultiNightMergerWindow(QMainWindow):
             item = QListWidgetItem(label)
             if i == 0:
                 item.setForeground(QColor("#1565C0"))
-                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
             self.folder_list.addItem(item)
 
     def _refresh_output_dir_default(self, force: bool = False):
@@ -603,10 +608,22 @@ class MultiNightMergerWindow(QMainWindow):
 
     def _on_remove_folder(self):
         row = self.folder_list.currentRow()
-        if row <= 0:
+        if row < 0:
             return
         self.folders.pop(row)
         self._refresh_folder_list()
+        self._refresh_output_dir_default(force=True)
+
+    def _move_selected_folder(self, delta: int):
+        row = self.folder_list.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= len(self.folders):
+            return
+        self.folders[row], self.folders[new_row] = self.folders[new_row], self.folders[row]
+        self._refresh_folder_list()
+        self.folder_list.setCurrentRow(new_row)
         self._refresh_output_dir_default(force=True)
 
     def _browse_output_dir(self):
