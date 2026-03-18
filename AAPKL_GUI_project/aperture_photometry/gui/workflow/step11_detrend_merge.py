@@ -17,6 +17,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from PyQt5.QtWidgets import (
+    QApplication,
     QVBoxLayout,
     QHBoxLayout,
     QPushButton,
@@ -43,6 +44,7 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QFrame,
     QTextBrowser,
+    QProgressBar,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
@@ -51,8 +53,8 @@ from .step_window_base import StepWindowBase
 from ...analysis.light_curve.global_ensemble import solve_global_ensemble
 from ...utils.step_paths import (
     step1_dir,
-    step8_dir,
-    step9_dir,
+    step5_photometry_dir,
+    step9_selection_dir,
     step10_dir,
     step11_dir,
     step11_current_lc_path,
@@ -73,6 +75,7 @@ from ...utils.io_utils import (
     load_night_assignments as _load_night_assignments_util,
     load_headers_table as _load_headers_table_util,
 )
+from ...utils.photometry_loader import load_frame_photometry
 from ...utils.qc_utils import load_frame_excludes
 from ...utils.astro_utils import compute_bjd_tdb_array
 
@@ -125,23 +128,23 @@ def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
 
 def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> dict[int, int]:
     """Load source_id -> final ID map from Step 8 outputs."""
-    step8_out = step8_dir(result_dir)
-    if not step8_out.exists():
+    step9_out = step9_selection_dir(result_dir)
+    if not step9_out.exists():
         return {}
     key = _normalize_filter_key(flt or "")
     candidates: list[tuple[Path, str]] = []
     if key:
         candidates.extend(
             [
-                (step8_out / f"master_catalog_{key}.tsv", "\t"),
-                (step8_out / f"id_mapping_{key}.csv", ","),
+                (step9_out / f"master_catalog_{key}.tsv", "\t"),
+                (step9_out / f"id_mapping_{key}.csv", ","),
             ]
         )
     candidates.extend(
-        [(p, "\t") for p in sorted(step8_out.glob("master_catalog_*.tsv"))]
+        [(p, "\t") for p in sorted(step9_out.glob("master_catalog_*.tsv"))]
     )
     candidates.extend(
-        [(p, ",") for p in sorted(step8_out.glob("id_mapping_*.csv"))]
+        [(p, ",") for p in sorted(step9_out.glob("id_mapping_*.csv"))]
     )
 
     mapping: dict[int, int] = {}
@@ -152,6 +155,8 @@ def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> di
             df = read_csv_int64_source_id(path, sep=sep)
         except Exception:
             continue
+        if "det_uid" in df.columns and "ID" not in df.columns:
+            df = df.rename(columns={"det_uid": "ID"})
         if not {"source_id", "ID"} <= set(df.columns):
             continue
         sid_vals = coerce_int64_source_id(df["source_id"])
@@ -163,6 +168,46 @@ def _load_step8_source_to_id_map(result_dir: Path, flt: str | None = None) -> di
             if sid_int not in mapping:
                 mapping[sid_int] = int(id_val)
     return mapping
+
+
+def _load_step9_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
+    """Load target/comp IDs from Step 9 selections, merging per-filter comp sets."""
+    s9 = step9_selection_dir(result_dir)
+    if not s9.exists():
+        return None, []
+
+    target_ids: set[int] = set()
+    comp_ids: set[int] = set()
+
+    for sp in sorted(s9.glob("selection_*.json")):
+        try:
+            data = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        flt = sp.stem.replace("selection_", "")
+        sid_map = _load_step8_source_to_id_map(result_dir, flt)
+
+        tid = data.get("target_id")
+        target_sid = data.get("target_source_id")
+        if tid is None and target_sid is not None and int(target_sid) in sid_map:
+            tid = int(sid_map[int(target_sid)])
+        if tid is not None:
+            target_ids.add(int(tid))
+
+        cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
+        comp_sids = [int(x) for x in data.get("comparison_source_ids", []) if x is not None]
+        if not cids and comp_sids:
+            cids = sorted({
+                int(sid_map[int(sid)])
+                for sid in comp_sids
+                if int(sid) in sid_map
+            })
+        comp_ids.update(int(cid) for cid in cids)
+
+    if len(target_ids) == 1:
+        return next(iter(target_ids)), sorted(comp_ids)
+    return None, sorted(comp_ids)
 
 
 class DetrendNightMergeWindow(StepWindowBase):
@@ -177,6 +222,9 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.global_mean_df = pd.DataFrame()
         self.global_diagnostics: dict = {}
         self.global_input_df = pd.DataFrame()
+        self._busy_active = False
+        self._busy_log_buffer: list[str] | None = None
+        self._busy_message = ""
 
         self.comp_active_ids: list[int] = []
         self.comp_candidate_ids: list[int] = []
@@ -599,18 +647,35 @@ class DetrendNightMergeWindow(StepWindowBase):
         btn_layout = QHBoxLayout(btn_group)
         btn_layout.setSpacing(8)
 
-        btn_apply = QPushButton("Fit && Apply (저장)")
-        btn_apply.setStyleSheet(
+        self.btn_apply = QPushButton("Fit && Apply (저장)")
+        self.btn_apply.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 16px; }"
         )
-        btn_apply.setToolTip("피팅 수행 후 종합 결과 파일 자동 저장")
-        btn_apply.clicked.connect(self.fit_and_apply)
-        btn_layout.addWidget(btn_apply)
+        self.btn_apply.setToolTip("피팅 수행 후 종합 결과 파일 자동 저장")
+        self.btn_apply.clicked.connect(self.fit_and_apply)
+        btn_layout.addWidget(self.btn_apply)
 
-        btn_revert = QPushButton("Revert")
-        btn_revert.setToolTip("보정 결과 초기화")
-        btn_revert.clicked.connect(self.revert_raw)
-        btn_layout.addWidget(btn_revert)
+        self.btn_revert = QPushButton("Revert")
+        self.btn_revert.setToolTip("보정 결과 초기화")
+        self.btn_revert.clicked.connect(self.revert_raw)
+        btn_layout.addWidget(self.btn_revert)
+
+        self.busy_status_label = QLabel("")
+        self.busy_status_label.setStyleSheet("QLabel { color: #546E7A; font-weight: bold; }")
+        self.busy_status_label.hide()
+        btn_layout.addWidget(self.busy_status_label)
+
+        self.busy_progress_bar = QProgressBar()
+        self.busy_progress_bar.setRange(0, 0)
+        self.busy_progress_bar.setMaximumWidth(140)
+        self.busy_progress_bar.setMaximumHeight(10)
+        self.busy_progress_bar.setTextVisible(False)
+        self.busy_progress_bar.setStyleSheet(
+            "QProgressBar { border: none; background-color: #CFD8DC; border-radius: 4px; }"
+            "QProgressBar::chunk { background-color: #4CAF50; border-radius: 4px; }"
+        )
+        self.busy_progress_bar.hide()
+        btn_layout.addWidget(self.busy_progress_bar)
 
         btn_layout.addStretch()
         left_layout.addWidget(btn_group)
@@ -648,7 +713,56 @@ class DetrendNightMergeWindow(StepWindowBase):
         main_splitter.setSizes([320, 680])
 
     def log(self, msg: str):
+        if self._busy_log_buffer is not None:
+            self._busy_log_buffer.append(str(msg))
+            return
         self.log_text.append(msg)
+
+    def _flush_busy_log_buffer(self) -> None:
+        if not self._busy_log_buffer:
+            return
+        self.log_text.append("\n".join(self._busy_log_buffer))
+        self._busy_log_buffer = []
+
+    def _set_busy_state(self, busy: bool, message: str = "") -> None:
+        if busy:
+            if self._busy_active:
+                self._set_busy_message(message)
+                return
+            self._busy_active = True
+            self._busy_log_buffer = []
+            self._busy_message = message or "Working..."
+            self.busy_status_label.setText(self._busy_message)
+            self.busy_status_label.show()
+            self.busy_progress_bar.show()
+            self.btn_apply.setEnabled(False)
+            self.btn_revert.setEnabled(False)
+            self.left_tabs.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
+            return
+
+        if not self._busy_active:
+            return
+        self._flush_busy_log_buffer()
+        self._busy_log_buffer = None
+        self._busy_active = False
+        self._busy_message = ""
+        self.busy_status_label.clear()
+        self.busy_status_label.hide()
+        self.busy_progress_bar.hide()
+        self.btn_apply.setEnabled(True)
+        self.btn_revert.setEnabled(True)
+        self.left_tabs.setEnabled(True)
+        QApplication.restoreOverrideCursor()
+        QApplication.processEvents()
+
+    def _set_busy_message(self, message: str) -> None:
+        if not self._busy_active:
+            return
+        self._busy_message = message or self._busy_message
+        self.busy_status_label.setText(self._busy_message)
+        QApplication.processEvents()
 
     def _show_mode_help_dialog(self):
         dialog = QDialog(self)
@@ -686,7 +800,7 @@ class DetrendNightMergeWindow(StepWindowBase):
 <p>
 Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입니다.
 모드에 따라 <b>Step 10 차등측광 결과</b>를 그대로 후처리하거나,
-<b>Step 9 개별 프레임 측광값</b>을 다시 읽어 전역 ensemble 해를 구합니다.
+<b>Step 5 개별 프레임 측광값</b>을 다시 읽어 전역 ensemble 해를 구합니다.
 </p>
 
 <h4>1. Offset Only (ZP₀)</h4>
@@ -741,8 +855,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
 <h4>3. Global Ensemble (Method C)</h4>
 <p><b>입력 데이터</b></p>
 <ul>
-  <li><code>step9_forced_photometry/photometry_index.csv</code>와 각 프레임의 <code>*_photometry.tsv</code></li>
-  <li>사용 별: Step 8/10에서 선택한 target + comparison ensemble</li>
+  <li><code>step5_photometry/photometry_index.csv</code>와 각 프레임의 <code>*_photometry.tsv</code></li>
+  <li>사용 별: Step 9/10에서 선택한 target + comparison ensemble</li>
   <li>solver는 comparison stars만으로 frame-wise zero-point를 풉니다. target은 기준선 해를 구할 때 제외됩니다.</li>
 </ul>
 <p><b>무엇을 하나</b></p>
@@ -913,7 +1027,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         return f"{mode_text}<br>{'<br>'.join('• ' + r for r in reasons)}"
 
     def _auto_load_ids(self):
-        """Step 10 comp_selection.json → Step 8 per-filter 순서로 자동 로드."""
+        """Step 10 comp_selection.json → Step 9 merged selection 순서로 자동 로드."""
         rd = Path(self.params.P.result_dir)
         # 1) Step 10 output (comp_selection.json)
         sel_path = step10_dir(rd) / "comp_selection.json"
@@ -929,34 +1043,16 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 return
             except Exception:
                 pass
-        # 2) Step 8 per-filter selection_{filter}.json
-        s8 = step8_dir(rd)
-        if s8.exists():
-            for sp in sorted(s8.glob("selection_*.json")):
-                try:
-                    data = json.loads(sp.read_text(encoding="utf-8"))
-                    tid = data.get("target_id")
-                    cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
-                    flt = sp.stem.replace("selection_", "")
-                    sid_map = _load_step8_source_to_id_map(rd, flt)
-                    target_sid = data.get("target_source_id")
-                    comp_sids = [int(x) for x in data.get("comparison_source_ids", []) if x is not None]
-                    if tid is None and target_sid is not None and int(target_sid) in sid_map:
-                        tid = int(sid_map[int(target_sid)])
-                    if not cids and comp_sids:
-                        cids = sorted({
-                            int(sid_map[int(sid)])
-                            for sid in comp_sids
-                            if int(sid) in sid_map
-                        })
-                    if tid is not None:
-                        self.target_edit.setText(str(int(tid)))
-                        self.comp_active_ids = cids
-                        self.comp_candidate_ids = cids
-                        self._update_id_info_label()
-                        return
-                except Exception:
-                    continue
+        # 2) Step 9 merged selection
+        tid, cids = _load_step9_selection_ids(rd)
+        if tid is not None:
+            self.target_edit.setText(str(int(tid)))
+        if cids:
+            self.comp_active_ids = list(cids)
+            self.comp_candidate_ids = list(cids)
+        if tid is not None or cids:
+            self._update_id_info_label()
+            return
         # 3) Fallback: parse target ID from raw filenames
         raw_paths = list(step10_dir(rd).glob("lightcurve_ID*_raw.csv"))
         if raw_paths:
@@ -1179,9 +1275,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         rows = []
         for label, result_dir in self.datasets:
             result_dir = Path(result_dir)
-            idx_path = step9_dir(result_dir) / "photometry_index.csv"
-            if not idx_path.exists():
-                idx_path = result_dir / "photometry_index.csv"
+            idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
             if not idx_path.exists():
                 self.log(f"[GLOBAL] photometry_index.csv missing: {result_dir}")
                 continue
@@ -1222,28 +1316,20 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 fname = str(row.get("file", "")).strip()
                 if not fname:
                     continue
-                rel_path = str(row.get("path", "") or "").strip()
-                if rel_path:
-                    tsv_path = step9_dir(result_dir) / rel_path
-                else:
-                    tsv_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-                if not tsv_path.exists():
-                    tsv_path = result_dir / tsv_path.name
-                if not tsv_path.exists():
+                phot = load_frame_photometry(result_dir, fname, str(row.get("filter", "") or ""))
+                if phot is None or phot.empty:
                     continue
 
-                try:
-                    phot = pd.read_csv(tsv_path, sep="\t")
-                except Exception:
-                    phot = pd.read_csv(tsv_path)
-
                 id_col = None
-                for cand in ("ID", "id"):
+                for cand in ("ID", "id", "det_uid"):
                     if cand in phot.columns:
                         id_col = cand
                         break
                 if not id_col:
                     continue
+                if id_col == "det_uid":
+                    phot = phot.rename(columns={"det_uid": "ID"})
+                    id_col = "ID"
 
                 phot[id_col] = pd.to_numeric(phot[id_col], errors="coerce").astype("Int64")
                 wanted = [target_id] + comp_ids
@@ -1440,38 +1526,16 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         self._update_id_info_label()
 
     def _load_comp_selection(self) -> None:
-        def _load_from_step8() -> bool:
+        def _load_from_step9() -> bool:
             rd = Path(self.params.P.result_dir)
-            s8 = step8_dir(rd)
-            if not s8.exists():
+            tid, cids = _load_step9_selection_ids(rd)
+            if tid is not None and not self.target_edit.text().strip():
+                self.target_edit.setText(str(int(tid)))
+            if not cids:
                 return False
-            for sp in sorted(s8.glob("selection_*.json")):
-                try:
-                    data = json.loads(sp.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                flt = sp.stem.replace("selection_", "")
-                sid_map = _load_step8_source_to_id_map(rd, flt)
-                cids = [int(x) for x in data.get("comparison_ids", []) if x is not None]
-                comp_sids = [int(x) for x in data.get("comparison_source_ids", []) if x is not None]
-                if not cids and comp_sids:
-                    cids = sorted({
-                        int(sid_map[int(sid)])
-                        for sid in comp_sids
-                        if int(sid) in sid_map
-                    })
-                if not cids:
-                    continue
-                tid = data.get("target_id")
-                target_sid = data.get("target_source_id")
-                if tid is None and target_sid is not None and int(target_sid) in sid_map:
-                    tid = int(sid_map[int(target_sid)])
-                if tid is not None and not self.target_edit.text().strip():
-                    self.target_edit.setText(str(int(tid)))
-                self.comp_active_ids = cids
-                self.comp_candidate_ids = cids
-                return True
-            return False
+            self.comp_active_ids = list(cids)
+            self.comp_candidate_ids = list(cids)
+            return True
 
         if not self.datasets:
             return
@@ -1480,7 +1544,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         if not sel_path.exists() and self.datasets:
             sel_path = step10_dir(self.datasets[0][1]) / "comp_selection.json"
         if not sel_path.exists():
-            if _load_from_step8():
+            if _load_from_step9():
                 self._update_comp_label()
             return
         try:
@@ -1490,7 +1554,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             if not self.comp_active_ids and self.comp_candidate_ids:
                 self.comp_active_ids = list(self.comp_candidate_ids)
             if not self.comp_active_ids and not self.comp_candidate_ids:
-                _load_from_step8()
+                _load_from_step9()
             self._update_comp_label()
         except Exception:
             return
@@ -1918,172 +1982,180 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 self.mode_offset.setChecked(True)
             else:
                 self.color_status_label.setText("")
+        self._set_busy_state(True, "Preparing fit...")
+        try:
+            fit_df = self.raw_df
+            use_global_k2 = self.chk_global_k2.isChecked()
 
-        fit_df = self.raw_df
-        use_global_k2 = self.chk_global_k2.isChecked()
+            # Color mode with global k'' fitting
+            global_k2_by_filter: dict[str, tuple[float, float]] = {}
 
-        # Color mode with global k'' fitting
-        global_k2_by_filter: dict[str, tuple[float, float]] = {}
+            if self.mode == "color" and use_global_k2:
+                self._set_busy_message("Fitting global k''...")
+                self.log("[FIT] Global k'' fitting mode enabled")
+                all_filters = [""]
+                if "filter" in fit_df.columns:
+                    all_filters = sorted({_normalize_filter_key(f) for f in fit_df["filter"].astype(str)})
 
-        if self.mode == "color" and use_global_k2:
-            self.log("[FIT] Global k'' fitting mode enabled")
-            all_filters = [""]
-            if "filter" in fit_df.columns:
-                all_filters = sorted({_normalize_filter_key(f) for f in fit_df["filter"].astype(str)})
+                for fkey in all_filters:
+                    sub = fit_df
+                    if fkey and "filter" in sub.columns:
+                        sub = fit_df[fit_df["filter"].astype(str).map(_normalize_filter_key) == fkey]
+                    if sub.empty:
+                        continue
 
-            for fkey in all_filters:
-                sub = fit_df
-                if fkey and "filter" in sub.columns:
-                    sub = fit_df[fit_df["filter"].astype(str).map(_normalize_filter_key) == fkey]
-                if sub.empty:
-                    continue
-
-                delta_c_const = self._delta_c_for_filter(fkey)
-                if not np.isfinite(delta_c_const):
-                    self.log(f"[FIT] Global k'' for {fkey or 'all'}: ΔC missing, skipped")
-                    continue
-
-                date_mask = sub["date"].astype(str).isin([str(d) for d in dates])
-                sub_all = sub[date_mask]
-                if sub_all.empty:
-                    continue
-
-                mask = self._mask_by_ranges(sub_all)
-                y = sub_all["diff_mag_raw"].to_numpy(float)
-                x_air = sub_all["airmass"].to_numpy(float)
-                x = x_air * float(delta_c_const)
-                err = sub_all.get("diff_err", pd.Series([np.nan] * len(sub_all))).to_numpy(float)
-                w = np.where(np.isfinite(err) & (err > 0), 1.0 / (err * err), 1.0)
-
-                base_mask = mask & np.isfinite(y) & np.isfinite(x)
-                if np.sum(base_mask) < 5:
-                    continue
-
-                zp, k2, zp_err, k2_err, _ = self._fit_linear(y, x, w, base_mask, fit_slope=True)
-                global_k2_by_filter[fkey] = (k2, k2_err)
-                self.log(f"[FIT] Global k'' ({fkey or 'all'}): {k2:.5f} ± {k2_err:.5f}")
-
-                # Warn if k'' is unreasonably large (typical: 0.02-0.05)
-                if abs(k2) > 0.15:
-                    x_range = np.ptp(x_air[base_mask])
-                    self.log(f"[WARNING] |k''| = {abs(k2):.3f} >> 0.05 (비정상)")
-                    self.log(f"  → Airmass 범위 ΔX = {x_range:.3f} (좁으면 피팅 불안정)")
-                    self.log(f"  → Offset 모드 권장 (k'' 피팅 불가)")
-
-        params_rows = []
-        for date_val in sorted(dates):
-            sub_date = fit_df[fit_df["date"].astype(str) == str(date_val)]
-            if sub_date.empty:
-                continue
-            filters = [""]
-            if "filter" in sub_date.columns:
-                filters = sorted({_normalize_filter_key(f) for f in sub_date["filter"].astype(str)})
-
-            for fkey in filters:
-                sub = sub_date
-                if fkey:
-                    sub = sub_date[sub_date["filter"].astype(str).map(_normalize_filter_key) == fkey]
-                if sub.empty:
-                    continue
-
-                mask = self._mask_by_ranges(sub)
-                y = sub["diff_mag_raw"].to_numpy(float)
-                x_air = sub["airmass"].to_numpy(float)
-                err = sub.get("diff_err", pd.Series([np.nan] * len(sub))).to_numpy(float)
-                w = np.where(np.isfinite(err) & (err > 0), 1.0 / (err * err), 1.0)
-
-                x = x_air
-                delta_c_const = np.nan
-                if self.mode == "color":
                     delta_c_const = self._delta_c_for_filter(fkey)
                     if not np.isfinite(delta_c_const):
-                        self.log(f"[FIT] {date_val}/{fkey or 'all'}: ΔC missing, skipped")
+                        self.log(f"[FIT] Global k'' for {fkey or 'all'}: ΔC missing, skipped")
                         continue
+
+                    date_mask = sub["date"].astype(str).isin([str(d) for d in dates])
+                    sub_all = sub[date_mask]
+                    if sub_all.empty:
+                        continue
+
+                    mask = self._mask_by_ranges(sub_all)
+                    y = sub_all["diff_mag_raw"].to_numpy(float)
+                    x_air = sub_all["airmass"].to_numpy(float)
                     x = x_air * float(delta_c_const)
+                    err = sub_all.get("diff_err", pd.Series([np.nan] * len(sub_all))).to_numpy(float)
+                    w = np.where(np.isfinite(err) & (err > 0), 1.0 / (err * err), 1.0)
 
-                base_mask = mask & np.isfinite(y)
-                if self.mode != "offset":
-                    base_mask = base_mask & np.isfinite(x)
-                if not np.any(base_mask):
-                    n_total = len(sub)
-                    n_y = int(np.sum(np.isfinite(y)))
-                    n_x = int(np.sum(np.isfinite(x)))
-                    n_mask = int(np.sum(mask))
-                    self.log(
-                        f"[FIT] {date_val}/{fkey or 'all'}: no valid points "
-                        f"(N={n_total}, y={n_y}, x={n_x}, mask={n_mask})"
-                    )
+                    base_mask = mask & np.isfinite(y) & np.isfinite(x)
+                    if np.sum(base_mask) < 5:
+                        continue
+
+                    zp, k2, zp_err, k2_err, _ = self._fit_linear(y, x, w, base_mask, fit_slope=True)
+                    global_k2_by_filter[fkey] = (k2, k2_err)
+                    self.log(f"[FIT] Global k'' ({fkey or 'all'}): {k2:.5f} ± {k2_err:.5f}")
+
+                    if abs(k2) > 0.15:
+                        x_range = np.ptp(x_air[base_mask])
+                        self.log(f"[WARNING] |k''| = {abs(k2):.3f} >> 0.05 (비정상)")
+                        self.log(f"  → Airmass 범위 ΔX = {x_range:.3f} (좁으면 피팅 불안정)")
+                        self.log(f"  → Offset 모드 권장 (k'' 피팅 불가)")
+
+            self._set_busy_message("Fitting nightly groups...")
+            params_rows = []
+            for date_val in sorted(dates):
+                sub_date = fit_df[fit_df["date"].astype(str) == str(date_val)]
+                if sub_date.empty:
                     continue
+                filters = [""]
+                if "filter" in sub_date.columns:
+                    filters = sorted({_normalize_filter_key(f) for f in sub_date["filter"].astype(str)})
 
-                if self.mode == "offset":
-                    zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
-                        y, x, w, base_mask, fit_slope=False
-                    )
-                elif self.mode == "color" and use_global_k2 and fkey in global_k2_by_filter:
-                    k2_global, k2_global_err = global_k2_by_filter[fkey]
-                    y_adjusted = y - k2_global * x
-                    zp, _, zp_err, _, used_mask = self._fit_linear(
-                        y_adjusted, x, w, base_mask, fit_slope=False
-                    )
-                    slope = k2_global
-                    slope_err = k2_global_err
-                elif self.mode == "color":
-                    zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
-                        y, x, w, base_mask, fit_slope=True
-                    )
-                else:
-                    zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
-                        y, x, w, base_mask, fit_slope=False
-                    )
+                for fkey in filters:
+                    sub = sub_date
+                    if fkey:
+                        sub = sub_date[sub_date["filter"].astype(str).map(_normalize_filter_key) == fkey]
+                    if sub.empty:
+                        continue
 
-                y_fit = zp + slope * x
-                rms_before = np.nanstd(y[base_mask])
-                rms_after = np.nanstd((y - y_fit)[used_mask]) if np.any(used_mask) else np.nan
+                    mask = self._mask_by_ranges(sub)
+                    y = sub["diff_mag_raw"].to_numpy(float)
+                    x_air = sub["airmass"].to_numpy(float)
+                    err = sub.get("diff_err", pd.Series([np.nan] * len(sub))).to_numpy(float)
+                    w = np.where(np.isfinite(err) & (err > 0), 1.0 / (err * err), 1.0)
 
-                # Per-night excess variance diagnostic
-                var_excess = np.nan
-                excess_ratio = np.nan
-                if np.any(used_mask) and np.isfinite(rms_after):
-                    err_used = err[used_mask]
-                    good_err = np.isfinite(err_used) & (err_used > 0)
-                    if np.any(good_err):
-                        median_var = float(np.nanmedian(err_used[good_err] ** 2))
-                        var_excess = float(max(0.0, rms_after ** 2 - median_var))
-                        if median_var > 0:
-                            excess_ratio = float(var_excess / median_var)
-                        if excess_ratio > 2.0:
-                            self.log(
-                                f"[WARN] {date_val}/{fkey or 'all'}: "
-                                f"excess variance {excess_ratio:.1f}x photometric noise"
-                            )
+                    x = x_air
+                    if self.mode == "color":
+                        delta_c_const = self._delta_c_for_filter(fkey)
+                        if not np.isfinite(delta_c_const):
+                            self.log(f"[FIT] {date_val}/{fkey or 'all'}: ΔC missing, skipped")
+                            continue
+                        x = x_air * float(delta_c_const)
 
-                params_rows.append({
-                    "date": date_val,
-                    "filter": fkey,
-                    "zp_offset": zp,
-                    "zp_offset_err": zp_err,
-                    "ext_slope": slope,
-                    "ext_slope_err": slope_err,
-                    "n_used": int(np.sum(used_mask)),
-                    "rms_before": rms_before,
-                    "rms_after": rms_after,
-                    "var_excess": var_excess,
-                    "excess_ratio": excess_ratio,
-                    "global_k2": use_global_k2 and self.mode == "color",
-                })
+                    base_mask = mask & np.isfinite(y)
+                    if self.mode != "offset":
+                        base_mask = base_mask & np.isfinite(x)
+                    if not np.any(base_mask):
+                        n_total = len(sub)
+                        n_y = int(np.sum(np.isfinite(y)))
+                        n_x = int(np.sum(np.isfinite(x)))
+                        n_mask = int(np.sum(mask))
+                        self.log(
+                            f"[FIT] {date_val}/{fkey or 'all'}: no valid points "
+                            f"(N={n_total}, y={n_y}, x={n_x}, mask={n_mask})"
+                        )
+                        continue
 
-        if not params_rows:
-            self.log("[FIT] No fit groups. Check airmass/ΔC/Date selection.")
-            QMessageBox.information(self, "Detrend", "피팅할 데이터가 없습니다.")
-            return
+                    if self.mode == "offset":
+                        zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
+                            y, x, w, base_mask, fit_slope=False
+                        )
+                    elif self.mode == "color" and use_global_k2 and fkey in global_k2_by_filter:
+                        k2_global, k2_global_err = global_k2_by_filter[fkey]
+                        y_adjusted = y - k2_global * x
+                        zp, _, zp_err, _, used_mask = self._fit_linear(
+                            y_adjusted, x, w, base_mask, fit_slope=False
+                        )
+                        slope = k2_global
+                        slope_err = k2_global_err
+                    elif self.mode == "color":
+                        zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
+                            y, x, w, base_mask, fit_slope=True
+                        )
+                    else:
+                        zp, slope, zp_err, slope_err, used_mask = self._fit_linear(
+                            y, x, w, base_mask, fit_slope=False
+                        )
 
-        self.params_df = pd.DataFrame(params_rows)
-        self.corrected_df = self._apply_params(self.raw_df, self.params_df)
-        self._update_results_table()
-        self._update_plots()
-        self.log(f"[FIT] Applied corrections for {len(self.params_df)} groups")
-        self._log_fit_summary()
-        self._save_comprehensive_results()
+                    y_fit = zp + slope * x
+                    rms_before = np.nanstd(y[base_mask])
+                    rms_after = np.nanstd((y - y_fit)[used_mask]) if np.any(used_mask) else np.nan
+
+                    var_excess = np.nan
+                    excess_ratio = np.nan
+                    if np.any(used_mask) and np.isfinite(rms_after):
+                        err_used = err[used_mask]
+                        good_err = np.isfinite(err_used) & (err_used > 0)
+                        if np.any(good_err):
+                            median_var = float(np.nanmedian(err_used[good_err] ** 2))
+                            var_excess = float(max(0.0, rms_after ** 2 - median_var))
+                            if median_var > 0:
+                                excess_ratio = float(var_excess / median_var)
+                            if excess_ratio > 2.0:
+                                self.log(
+                                    f"[WARN] {date_val}/{fkey or 'all'}: "
+                                    f"excess variance {excess_ratio:.1f}x photometric noise"
+                                )
+
+                    params_rows.append({
+                        "date": date_val,
+                        "filter": fkey,
+                        "zp_offset": zp,
+                        "zp_offset_err": zp_err,
+                        "ext_slope": slope,
+                        "ext_slope_err": slope_err,
+                        "n_used": int(np.sum(used_mask)),
+                        "rms_before": rms_before,
+                        "rms_after": rms_after,
+                        "var_excess": var_excess,
+                        "excess_ratio": excess_ratio,
+                        "global_k2": use_global_k2 and self.mode == "color",
+                    })
+
+            if not params_rows:
+                self.log("[FIT] No fit groups. Check airmass/ΔC/Date selection.")
+                QMessageBox.information(self, "Detrend", "피팅할 데이터가 없습니다.")
+                return
+
+            self._set_busy_message("Applying corrections...")
+            self.params_df = pd.DataFrame(params_rows)
+            self.corrected_df = self._apply_params(self.raw_df, self.params_df)
+
+            self._set_busy_message("Refreshing plots...")
+            self._update_results_table()
+            self._update_plots()
+            self._update_analysis_panel()
+            self.log(f"[FIT] Applied corrections for {len(self.params_df)} groups")
+            self._log_fit_summary()
+
+            self._set_busy_message("Saving outputs...")
+            self._save_comprehensive_results()
+        finally:
+            self._set_busy_state(False)
 
     def _apply_bjd_to_raw_df(self, target_id: int | None = None) -> None:
         """Convert raw_df["JD"] (plain JD_UTC) to BJD_TDB in-place when possible."""
@@ -2098,8 +2170,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         tgt_ra, tgt_dec = np.nan, np.nan
         if target_id is not None and self.datasets:
             result_dir = Path(self.datasets[0][1])
-            step8_out = step8_dir(result_dir)
-            for path in list(step8_out.glob("master_catalog_*.tsv")) + [step8_out / "master_catalog.tsv"]:
+            step9_out = step9_selection_dir(result_dir)
+            for path in list(step9_out.glob("master_catalog_*.tsv")) + [step9_out / "master_catalog.tsv"]:
                 if not path.exists():
                     continue
                 try:
@@ -2129,99 +2201,106 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             self.log(f"[BJD] JD → BJD_TDB applied ({valid.sum()} pts, median correction {delta:+.1f}s)")
 
     def _run_global_ensemble(self) -> None:
+        self._set_busy_state(True, "Loading Step 5 photometry...")
         try:
-            df_global = self._load_global_ensemble_df()
-        except Exception as e:
-            QMessageBox.warning(self, "Global Ensemble", str(e))
-            return
+            try:
+                df_global = self._load_global_ensemble_df()
+            except Exception as e:
+                QMessageBox.warning(self, "Global Ensemble", str(e))
+                return
 
-        target_text = self.target_edit.text().strip()
-        if not target_text:
-            QMessageBox.warning(self, "Global Ensemble", "Target ID가 필요합니다.")
-            return
-        target_id = int(target_text)
+            target_text = self.target_edit.text().strip()
+            if not target_text:
+                QMessageBox.warning(self, "Global Ensemble", "Target ID가 필요합니다.")
+                return
+            target_id = int(target_text)
 
-        comp_ids = self.comp_active_ids or self.comp_candidate_ids
-        comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
-        if not comp_ids:
-            QMessageBox.warning(self, "Global Ensemble", "비교성 ID가 필요합니다.")
-            return
+            comp_ids = self.comp_active_ids or self.comp_candidate_ids
+            comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
+            if not comp_ids:
+                QMessageBox.warning(self, "Global Ensemble", "비교성 ID가 필요합니다.")
+                return
 
-        self.global_min_comps = int(self.spin_global_min_comps.value())
-        self.global_sigma = float(self.spin_global_sigma.value())
-        self.global_iters = int(self.spin_global_iters.value())
-        self.global_rms_pct = float(self.spin_global_rms_pct.value())
-        self.global_rms_threshold = float(self.spin_global_rms_thr.value())
-        self.global_frame_sigma = float(self.spin_global_frame_sigma.value())
-        self.global_gauge = str(self.combo_global_gauge.currentText())
-        self.global_robust = bool(self.chk_global_robust.isChecked())
-        self.global_interp_missing = bool(self.chk_global_interp.isChecked())
-        self.global_normalize = bool(self.chk_global_normalize.isChecked())
-        self.global_rescale_errors = bool(self.chk_global_rescale_err.isChecked())
+            self.global_min_comps = int(self.spin_global_min_comps.value())
+            self.global_sigma = float(self.spin_global_sigma.value())
+            self.global_iters = int(self.spin_global_iters.value())
+            self.global_rms_pct = float(self.spin_global_rms_pct.value())
+            self.global_rms_threshold = float(self.spin_global_rms_thr.value())
+            self.global_frame_sigma = float(self.spin_global_frame_sigma.value())
+            self.global_gauge = str(self.combo_global_gauge.currentText())
+            self.global_robust = bool(self.chk_global_robust.isChecked())
+            self.global_interp_missing = bool(self.chk_global_interp.isChecked())
+            self.global_normalize = bool(self.chk_global_normalize.isChecked())
+            self.global_rescale_errors = bool(self.chk_global_rescale_err.isChecked())
 
-        self.log(
-            "[GLOBAL] min_comps={mc} sigma={sg} iters={it} rms_pct={rp} rms_thr={rt} frame_sigma={fs} gauge={g}".format(
-                mc=self.global_min_comps,
-                sg=self.global_sigma,
-                it=self.global_iters,
-                rp=self.global_rms_pct,
-                rt=self.global_rms_threshold,
-                fs=self.global_frame_sigma,
-                g=self.global_gauge,
+            self.log(
+                "[GLOBAL] min_comps={mc} sigma={sg} iters={it} rms_pct={rp} rms_thr={rt} frame_sigma={fs} gauge={g}".format(
+                    mc=self.global_min_comps,
+                    sg=self.global_sigma,
+                    it=self.global_iters,
+                    rp=self.global_rms_pct,
+                    rt=self.global_rms_threshold,
+                    fs=self.global_frame_sigma,
+                    g=self.global_gauge,
+                )
             )
-        )
 
-        try:
-            result = solve_global_ensemble(
-                df_global,
-                target_id=target_id,
-                comp_ids=comp_ids,
-                min_comps=self.global_min_comps,
-                sigma=self.global_sigma,
-                n_iter=self.global_iters,
-                gauge=self.global_gauge,
-                per_filter=True,
-                robust=self.global_robust,
-                rms_clip_pct=self.global_rms_pct,
-                rms_clip_threshold=self.global_rms_threshold if self.global_rms_threshold > 0 else None,
-                frame_sigma=self.global_frame_sigma,
-                interp_missing=self.global_interp_missing,
-                normalize_target=self.global_normalize,
-                rescale_errors=self.global_rescale_errors,
-                log=self.log,
-            )
-        except Exception as e:
-            QMessageBox.warning(self, "Global Ensemble", f"Fit failed: {e}")
-            return
+            self._set_busy_message("Solving global ensemble...")
+            try:
+                result = solve_global_ensemble(
+                    df_global,
+                    target_id=target_id,
+                    comp_ids=comp_ids,
+                    min_comps=self.global_min_comps,
+                    sigma=self.global_sigma,
+                    n_iter=self.global_iters,
+                    gauge=self.global_gauge,
+                    per_filter=True,
+                    robust=self.global_robust,
+                    rms_clip_pct=self.global_rms_pct,
+                    rms_clip_threshold=self.global_rms_threshold if self.global_rms_threshold > 0 else None,
+                    frame_sigma=self.global_frame_sigma,
+                    interp_missing=self.global_interp_missing,
+                    normalize_target=self.global_normalize,
+                    rescale_errors=self.global_rescale_errors,
+                    log=self.log,
+                )
+            except Exception as e:
+                QMessageBox.warning(self, "Global Ensemble", f"Fit failed: {e}")
+                return
 
-        self.global_input_df = df_global
-        self.params_df = result.get("zp_df", pd.DataFrame())
-        self.global_mean_df = result.get("mean_df", pd.DataFrame())
-        self.corrected_df = result.get("lc_df", pd.DataFrame())
-        self.raw_df = self.corrected_df.copy()
-        self.global_diagnostics = result.get("diagnostics", {}) or {}
+            self.global_input_df = df_global
+            self.params_df = result.get("zp_df", pd.DataFrame())
+            self.global_mean_df = result.get("mean_df", pd.DataFrame())
+            self.corrected_df = result.get("lc_df", pd.DataFrame())
+            self.raw_df = self.corrected_df.copy()
+            self.global_diagnostics = result.get("diagnostics", {}) or {}
 
-        if "JD" not in self.corrected_df.columns and "jd" in self.corrected_df.columns:
-            self.corrected_df["JD"] = self.corrected_df["jd"]
-        if "JD" not in self.raw_df.columns and "jd" in self.raw_df.columns:
-            self.raw_df["JD"] = self.raw_df["jd"]
-        if "JD" not in self.raw_df.columns:
-            self.raw_df["JD"] = np.nan
-        # BJD_TDB 보정 (global ensemble jd는 plain JD이므로 여기서 변환)
-        self._apply_bjd_to_raw_df(target_id)
-        if "date" not in self.raw_df.columns:
-            self.raw_df["date"] = "unknown"
-        self._fill_date_from_jd()
-        self._fill_night_id()
-        self.corrected_df = self.raw_df.copy()
+            if "JD" not in self.corrected_df.columns and "jd" in self.corrected_df.columns:
+                self.corrected_df["JD"] = self.corrected_df["jd"]
+            if "JD" not in self.raw_df.columns and "jd" in self.raw_df.columns:
+                self.raw_df["JD"] = self.raw_df["jd"]
+            if "JD" not in self.raw_df.columns:
+                self.raw_df["JD"] = np.nan
+            self._apply_bjd_to_raw_df(target_id)
+            if "date" not in self.raw_df.columns:
+                self.raw_df["date"] = "unknown"
+            self._fill_date_from_jd()
+            self._fill_night_id()
+            self.corrected_df = self.raw_df.copy()
 
-        self._populate_date_list()
-        self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
-        self._update_results_table()
-        self._update_plots()
-        self._update_analysis_panel()
-        self.log("[GLOBAL] Fit complete")
-        self._save_comprehensive_results()
+            self._set_busy_message("Refreshing plots...")
+            self._populate_date_list()
+            self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
+            self._update_results_table()
+            self._update_plots()
+            self._update_analysis_panel()
+            self.log("[GLOBAL] Fit complete")
+
+            self._set_busy_message("Saving outputs...")
+            self._save_comprehensive_results()
+        finally:
+            self._set_busy_state(False)
 
     def _log_fit_summary(self):
         """Log fit summary with astronomical interpretation."""
@@ -2446,8 +2525,13 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         return out
 
     def _update_results_table(self):
+        self.result_table.blockSignals(True)
+        self.result_table.setUpdatesEnabled(False)
+        self.result_table.clearContents()
         self.result_table.setRowCount(0)
         if self.params_df.empty:
+            self.result_table.setUpdatesEnabled(True)
+            self.result_table.blockSignals(False)
             return
 
         if self.mode == "global":
@@ -2465,6 +2549,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 self.result_table.setItem(r, 3, QTableWidgetItem(_fmt_float(row.get("Z"))))
                 self.result_table.setItem(r, 4, QTableWidgetItem(_fmt_float(row.get("Z_err"))))
                 self.result_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("chi2_red"))))
+            self.result_table.setUpdatesEnabled(True)
+            self.result_table.blockSignals(False)
             return
 
         if self.mode == "color":
@@ -2530,6 +2616,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 item.setBackground(summary_bg)
                 item.setForeground(summary_fg)
                 self.result_table.setItem(r, c, item)
+        self.result_table.setUpdatesEnabled(True)
+        self.result_table.blockSignals(False)
 
     def _update_plots(self):
         self.ax_raw.clear()
@@ -2537,7 +2625,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         self.ax_diag.clear()
 
         if self.raw_df.empty:
-            self.plot_canvas.draw()
+            self.plot_canvas.draw_idle()
             return
 
         selected_dates = self._selected_dates()
@@ -2664,7 +2752,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 if handles and len(handles) <= 8:
                     ax.legend(loc="best", fontsize=7, framealpha=0.8)
             self.plot_canvas.figure.tight_layout()
-            self.plot_canvas.draw()
+            self.plot_canvas.draw_idle()
             return
 
         # Diagnostic plot
@@ -2740,7 +2828,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 ax.legend(loc="best", fontsize=7, framealpha=0.8)
 
         self.plot_canvas.figure.tight_layout()
-        self.plot_canvas.draw()
+        self.plot_canvas.draw_idle()
 
     def _plot_global_diagnostics(self, dates, filter_key, date_colors) -> None:
         self.ax_diag.clear()

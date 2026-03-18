@@ -18,7 +18,7 @@ from ..config import Parameters
 from ..core import InstrumentConfig
 from ..core.file_manager import FileManager
 from ..core.project_state import ProjectState
-from ..utils.step_paths import step9_dir
+from ..utils.step_paths import step5_photometry_dir
 
 
 class StepButton(QPushButton):
@@ -216,11 +216,11 @@ class MainWindowWorkflow(QMainWindow):
             "Image Crop",
             "Sky Preview & QC",
             "Source Detection",
+            "Aperture Photometry",
             "WCS Plate Solving",
             "Reference Build",
             "Star ID Matching",
             "Target/Comparison Selection",
-            "Aperture Photometry",
             "Light Curve Builder",
             "Detrend & Night Merge",
             "Period Analysis",
@@ -532,28 +532,28 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 4:
-            from .workflow.step5_wcs_plate_solving import WcsPlateSolvingWindow
-            self.current_step_window = WcsPlateSolvingWindow(
+            from .workflow.step5_aperture_photometry import ForcedPhotometryWindow
+            self.current_step_window = ForcedPhotometryWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 5:
-            from .workflow.step6_ref_build import RefBuildWindow
-            self.current_step_window = RefBuildWindow(
+            from .workflow.step6_wcs_plate_solving import WcsPlateSolvingWindow
+            self.current_step_window = WcsPlateSolvingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 6:
-            from .workflow.step7_star_id_matching import StarIdMatchingWindow
-            self.current_step_window = StarIdMatchingWindow(
+            from .workflow.step7_ref_build import RefBuildWindow
+            self.current_step_window = RefBuildWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 7:
-            from .workflow.step8_master_id_editor import MasterIdEditorWindow
-            self.current_step_window = MasterIdEditorWindow(
+            from .workflow.step8_star_id_matching import StarIdMatchingWindow
+            self.current_step_window = StarIdMatchingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 8:
-            from .workflow.step9_forced_photometry import ForcedPhotometryWindow
-            self.current_step_window = ForcedPhotometryWindow(
+            from .workflow.step9_target_comparison_selection import TargetComparisonSelectionWindow
+            self.current_step_window = TargetComparisonSelectionWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 9:
@@ -887,9 +887,7 @@ class MainWindowWorkflow(QMainWindow):
             tab: Initial tab to show (0=Error Model, 1=Centroid, 2=Frame, 3=Background, 4=Publication)
         """
         # Check if photometry data exists
-        photometry_index = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-        if not photometry_index.exists():
-            photometry_index = self.params.P.result_dir / "photometry_index.csv"
+        photometry_index = step5_photometry_dir(self.params.P.result_dir) / "photometry_index.csv"
         if not photometry_index.exists():
             QMessageBox.warning(
                 self, "No Data",

@@ -26,7 +26,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 
 from .step_window_base import StepWindowBase
-from ...utils.step_paths import step1_dir, step2_cropped_dir, step9_dir, crop_is_active
+from ...utils.step_paths import step1_dir, step2_cropped_dir, step5_photometry_dir, crop_is_active
 
 
 class SkyPreviewWindow(StepWindowBase):
@@ -284,17 +284,12 @@ class SkyPreviewWindow(StepWindowBase):
         # Check for cropped files
         crop_active = crop_is_active(self.params.P.result_dir)
         cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-        legacy_cropped = self.params.P.result_dir / "cropped"
 
         if crop_active and cropped_dir.exists() and list(cropped_dir.glob("*.fit*")):
             # Use cropped files
             files = sorted([f.name for f in cropped_dir.glob("*.fit*")])
             self.use_cropped = True
             self.cropped_dir = cropped_dir
-        elif crop_active and legacy_cropped.exists() and list(legacy_cropped.glob("*.fit*")):
-            files = sorted([f.name for f in legacy_cropped.glob("*.fit*")])
-            self.use_cropped = True
-            self.cropped_dir = legacy_cropped
         else:
             # Use original files
             if not self.file_manager.filenames:
@@ -1248,9 +1243,7 @@ Mag:  {mag_str} ± {mag_err_str}
                 pass
 
         # 2) photometry_index.csv에서 보충 (Step 9 이후)
-        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(self.params.P.result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             return
         try:

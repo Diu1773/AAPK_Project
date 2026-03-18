@@ -1,212 +1,229 @@
 """
-Multi-Night Light Curve Merger
-Merges same-target observations processed in separate result folders,
-using Gaia source_id cross-matching to reconcile local star IDs.
+Multi-night merger workflow.
+
+Front steps are merger-specific:
+  1. Select existing result folders
+  2. Reconcile IDs across folders (Gaia first, positional fallback)
+  3. Choose merged target / comp / check set
+
+Back steps reuse the normal workflow on a materialized merged workspace:
+  4. Step 10 Light Curve Builder
+  5. Step 11 Detrend
+  6. Step 12 Period Analysis
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import copy
 import json
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from astropy.time import Time
-
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QGroupBox, QListWidget, QListWidgetItem,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
-    QFileDialog, QMessageBox, QSplitter, QSizePolicy,
-    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QFormLayout,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QGroupBox,
+    QListWidget,
+    QListWidgetItem,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QTextEdit,
+    QFileDialog,
+    QMessageBox,
+    QLineEdit,
     QComboBox,
+    QAbstractItemView,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QFont
 
-from ...utils.step_paths import step6_dir, step8_dir, step10_dir, step11_dir
-from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
-from ...utils.astro_utils import compute_bjd_tdb_array
+from ...core.project_state import ProjectState
+from ...utils.io_utils import (
+    read_csv_int64_source_id,
+    coerce_int64_source_id,
+    load_headers_table,
+    load_night_assignments,
+)
+from ...utils.photometry_loader import load_frame_photometry
+from ...utils.step_paths import (
+    step1_dir,
+    step5_photometry_dir,
+    step9_selection_dir,
+    step10_dir,
+    step11_dir,
+    step12_period_dir,
+)
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+def _normalize_filter_key(value) -> str:
+    return str(value or "").strip().lower() or "unknown"
 
-def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
-    """Return (ra_deg, dec_deg) for target_id from master_catalog, or (nan, nan)."""
-    s8 = step8_dir(result_dir)
-    candidates = list(s8.glob("master_catalog_*.tsv")) if s8.exists() else []
-    candidates += [s8 / "master_catalog.tsv"] if s8.exists() else []
-    for path in candidates:
-        if not path.exists():
-            continue
+
+def _folder_tag(index: int, folder: Path) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in folder.name)
+    return f"F{index + 1:02d}_{safe}"
+
+
+def _default_output_dir(base_folder: Path) -> Path:
+    return base_folder.parent / f"{base_folder.name}_merged"
+
+
+def _read_step5_index(result_dir: Path) -> pd.DataFrame:
+    idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
+    if not idx_path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(idx_path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_selection_payloads(result_dir: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    s9 = step9_selection_dir(result_dir)
+    if not s9.exists():
+        return out
+    for path in sorted(s9.glob("selection_*.json")):
         try:
-            df = read_csv_int64_source_id(path, sep="\t")
-            if "ID" not in df.columns:
-                continue
-            row = df[pd.to_numeric(df["ID"], errors="coerce") == int(target_id)]
-            if row.empty:
-                continue
-            ra = float(pd.to_numeric(row["ra_deg"].values[0], errors="coerce")) if "ra_deg" in df.columns else float("nan")
-            dec = float(pd.to_numeric(row["dec_deg"].values[0], errors="coerce")) if "dec_deg" in df.columns else float("nan")
-            if np.isfinite(ra) and np.isfinite(dec):
-                return ra, dec
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
+        flt = _normalize_filter_key(data.get("filter") or path.stem.replace("selection_", ""))
+        out[flt] = data
+    return out
+
+
+def _load_master_catalogs_by_filter(result_dir: Path) -> dict[str, pd.DataFrame]:
+    catalogs: dict[str, pd.DataFrame] = {}
+    s9 = step9_selection_dir(result_dir)
+    if not s9.exists():
+        return catalogs
+    for path in sorted(s9.glob("master_catalog_*.tsv")):
+        flt = _normalize_filter_key(path.stem.replace("master_catalog_", ""))
+        try:
+            df = read_csv_int64_source_id(path, sep="\t")
+        except Exception:
+            continue
+        if df is None or df.empty or "ID" not in df.columns:
+            continue
+        df = df.copy()
+        if "source_id" in df.columns:
+            df["source_id"] = coerce_int64_source_id(df["source_id"]).astype("Int64")
+        df["ID"] = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+        for col in ("ra_deg", "dec_deg", "gaia_G", "gaia_id"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        catalogs[flt] = df
+    return catalogs
+
+
+def _first_valid(series) -> float:
+    vals = pd.to_numeric(series, errors="coerce")
+    vals = vals[np.isfinite(vals)]
+    return float(vals.iloc[0]) if len(vals) else float("nan")
+
+
+def _extract_row_float(row: pd.Series, *cols: str) -> float:
+    for col in cols:
+        if col in row.index:
+            val = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+            if np.isfinite(val):
+                return float(val)
+    return float("nan")
+
+
+def _row_radec(row: pd.Series) -> tuple[float, float]:
+    return (
+        _extract_row_float(row, "ra_deg", "ra", "RA"),
+        _extract_row_float(row, "dec_deg", "dec", "DEC"),
+    )
+
+
+def _append_folder_tag(existing: str, tag: str) -> str:
+    parts = [p for p in str(existing or "").split(",") if p]
+    if tag not in parts:
+        parts.append(tag)
+    return ",".join(parts)
+
+
+def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
+    catalogs = _load_master_catalogs_by_filter(result_dir)
+    for df in catalogs.values():
+        row = df[pd.to_numeric(df["ID"], errors="coerce") == int(target_id)]
+        if row.empty:
+            continue
+        ra = _first_valid(row["ra_deg"]) if "ra_deg" in row.columns else float("nan")
+        dec = _first_valid(row["dec_deg"]) if "dec_deg" in row.columns else float("nan")
+        if np.isfinite(ra) and np.isfinite(dec):
+            return ra, dec
     return float("nan"), float("nan")
 
 
-def _load_master_catalog(result_dir: Path) -> pd.DataFrame:
-    """Load master_catalog from step8 (preferred) or step6."""
-    for base_dir in (step8_dir(result_dir), step6_dir(result_dir)):
-        if not base_dir.exists():
-            continue
-        candidates = sorted(base_dir.glob("master_catalog*.tsv"))
-        for p in candidates:
-            try:
-                df = read_csv_int64_source_id(p, sep="\t")
-                if {"source_id", "ID"} <= set(df.columns):
-                    return df
-            except Exception:
-                continue
-    return pd.DataFrame()
+class _MergedParamsProxy:
+    """Read-only-ish params wrapper for merged runtime windows."""
+
+    def __init__(self, base_params, merged_result_dir: Path):
+        self._base = base_params
+        self.P = copy.deepcopy(base_params.P)
+        self.P.result_dir = Path(merged_result_dir)
+        self.P.cache_dir = Path(merged_result_dir) / "cache"
+        if not hasattr(self.P, "file_path_map"):
+            self.P.file_path_map = {}
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def save_toml(self):
+        return False
 
 
-def _build_id_to_source_map(catalog: pd.DataFrame) -> dict[int, int]:
-    """ID → Gaia source_id"""
-    if not {"source_id", "ID"} <= set(catalog.columns):
-        return {}
-    sid_vals = coerce_int64_source_id(catalog["source_id"])
-    id_vals = pd.to_numeric(catalog["ID"], errors="coerce").astype("Int64")
-    out: dict[int, int] = {}
-    for id_val, sid_val in zip(id_vals, sid_vals):
-        if pd.isna(id_val) or pd.isna(sid_val):
-            continue
-        out[int(id_val)] = int(sid_val)
-    return out
+class _MergedFileManagerProxy:
+    def __init__(self, filenames: list[str], night_assignments: dict[str, int], path_map: dict[str, str] | None = None):
+        self.filenames = list(filenames)
+        self.night_assignments = dict(night_assignments)
+        self.path_map = dict(path_map or {})
 
+    def get_file_path(self, filename: str) -> Path | None:
+        p = self.path_map.get(filename)
+        return Path(p) if p else None
 
-def _build_source_to_id_map(catalog: pd.DataFrame) -> dict[int, int]:
-    """Gaia source_id → local ID"""
-    if not {"source_id", "ID"} <= set(catalog.columns):
-        return {}
-    sid_vals = coerce_int64_source_id(catalog["source_id"])
-    id_vals = pd.to_numeric(catalog["ID"], errors="coerce").astype("Int64")
-    out: dict[int, int] = {}
-    for sid_val, id_val in zip(sid_vals, id_vals):
-        if pd.isna(sid_val) or pd.isna(id_val):
-            continue
-        if int(sid_val) not in out:
-            out[int(sid_val)] = int(id_val)
-    return out
-
-
-def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
-    """Load target_id and comp_ids from step8 selection files."""
-    s8 = step8_dir(result_dir)
-    # per-filter selection_{filter}.json
-    for sel_file in sorted(s8.glob("selection_*.json")):
-        try:
-            data = json.loads(sel_file.read_text(encoding="utf-8"))
-            tid = data.get("target_id")
-            cids = data.get("comparison_ids", [])
-            if tid is not None:
-                return int(tid), [int(c) for c in cids if c is not None]
-        except Exception:
-            continue
-    # legacy target_selection.json
-    for p in (s8 / "target_selection.json", result_dir / "target_selection.json"):
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                tid = data.get("target_id")
-                cids = data.get("comparison_ids", [])
-                if tid is not None:
-                    return int(tid), [int(c) for c in cids if c is not None]
-            except Exception:
-                continue
-    return None, []
-
-
-def _load_raw_csv(result_dir: Path, local_target_id: int) -> pd.DataFrame | None:
-    """Load cached lightcurve_ID{id}_raw.csv from step10_dir."""
-    out_dir = step10_dir(result_dir)
-    candidates = list(out_dir.glob(f"lightcurve_ID{local_target_id}_*_raw.csv"))
-    if not candidates:
-        candidates = list(out_dir.glob(f"lightcurve_ID{local_target_id}_raw.csv"))
-    if not candidates:
-        return None
-    dfs = []
-    for p in sorted(candidates):
-        try:
-            dfs.append(pd.read_csv(p))
-        except Exception:
-            continue
-    return pd.concat(dfs, ignore_index=True) if dfs else None
-
-
-# ─────────────────────────────────────────────
-# Build worker
-# ─────────────────────────────────────────────
-
-class MergerBuildWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(pd.DataFrame, str)   # merged_df, error_msg
-
-    def __init__(self, folders: list[Path], id_mapping: list[dict]):
-        super().__init__()
-        self.folders = folders
-        self.id_mapping = id_mapping  # [{folder, target_id, comp_ids, status}]
-
-    def run(self):
-        frames = []
-        errors = []
-        for entry in self.id_mapping:
-            folder: Path = entry["folder"]
-            tid: int | None = entry.get("target_id")
-            status: str = entry.get("status", "")
-            if tid is None or "fail" in status.lower():
-                errors.append(f"{folder.name}: ID 매핑 실패, 건너뜀")
-                self.progress.emit(f"[SKIP] {folder.name}: no valid target_id")
-                continue
-            self.progress.emit(f"[LOAD] {folder.name} target_id={tid}")
-            df = _load_raw_csv(folder, tid)
-            if df is None:
-                errors.append(f"{folder.name}: lightcurve_ID{tid}_raw.csv 없음 — Step 10 먼저 실행하세요")
-                self.progress.emit(f"[ERR] {folder.name}: no raw CSV for ID {tid}")
-                continue
-            df = df.copy()
-            df["_source_folder"] = folder.name
-            frames.append(df)
-            self.progress.emit(f"[OK]  {folder.name}: {len(df)} rows")
-
-        if not frames:
-            self.finished.emit(pd.DataFrame(), "\n".join(errors) if errors else "로드된 데이터 없음")
-            return
-
-        merged = pd.concat(frames, ignore_index=True)
-        if "JD" in merged.columns:
-            merged = merged.sort_values("JD").reset_index(drop=True)
-        err_str = "\n".join(errors) if errors else ""
-        self.finished.emit(merged, err_str)
-
-
-# ─────────────────────────────────────────────
-# Main window
-# ─────────────────────────────────────────────
 
 class MultiNightMergerWindow(QMainWindow):
-    """Standalone window for merging multi-night light curves."""
+    """Merger workflow for previously processed result folders."""
 
     STEP_TITLES = [
         "Step 1  폴더 선택",
         "Step 2  ID 매칭",
-        "Step 3  빌드 & 병합",
-        "Step 4  디트렌드 & 플롯",
+        "Step 3  선택",
+        "Step 4  Light Curve",
+        "Step 5  Detrend",
+        "Step 6  Period",
+    ]
+
+    # For StepWindowBase child reuse.
+    step_names = [
+        "File Selection",
+        "Crop",
+        "Sky Preview",
+        "Source Detection",
+        "Photometry",
+        "WCS",
+        "Ref Build",
+        "ID Match",
+        "Selection",
+        "Light Curve",
+        "Detrend",
+        "Period Analysis",
     ]
 
     def __init__(self, params, project_state, main_window):
@@ -214,18 +231,34 @@ class MultiNightMergerWindow(QMainWindow):
         self.params = params
         self.project_state = project_state
         self.main_window = main_window
+        self.current_step_window = None
 
         self.folders: list[Path] = [Path(params.P.result_dir)]
-        self.id_mapping: list[dict] = []   # populated in step 2
-        self.merged_df: pd.DataFrame = pd.DataFrame()
-        self.corrected_df: pd.DataFrame = pd.DataFrame()
-        self._build_worker: MergerBuildWorker | None = None
+        self.folder_tags: dict[str, str] = {}
+        self.folder_scan_rows: list[dict] = []
 
-        self.setWindowTitle("Multi-Night Light Curve Merger")
-        self.resize(1100, 750)
+        self.match_summary_rows: list[dict] = []
+        self.match_records: list[dict] = []
+        self.merged_catalogs: dict[str, pd.DataFrame] = {}
+        self.local_id_maps: dict[str, dict[str, dict[int, dict[str, int]]]] = {}
+        self.base_selection_by_filter: dict[str, dict] = {}
+
+        self.selection_target_by_filter: dict[str, int | None] = {}
+        self.selection_comp_by_filter: dict[str, set[int]] = {}
+        self.selection_check_by_filter: dict[str, int | None] = {}
+        self._selection_row_to_sid: dict[int, int] = {}
+        self._selection_filter_ready = False
+
+        self.merged_result_dir: Path | None = None
+        self.merged_runtime_params = None
+        self.merged_runtime_project_state: ProjectState | None = None
+        self.merged_runtime_file_manager = None
+
+        self.setWindowTitle("Multi-Night Merger Workflow")
+        self.resize(1200, 820)
         self._setup_ui()
 
-    # ── UI construction ──────────────────────────────
+    # ───────────────────────── UI ─────────────────────────
 
     def _setup_ui(self):
         central = QWidget()
@@ -234,33 +267,24 @@ class MultiNightMergerWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # ── Header bar ──
         header = QHBoxLayout()
         btn_back = QPushButton("← 메인으로")
         btn_back.setFixedWidth(110)
-        btn_back.setStyleSheet(
-            "QPushButton { background:#607D8B; color:white; font-weight:bold; "
-            "padding:4px 10px; border-radius:4px; }"
-            "QPushButton:hover { background:#455A64; }"
-        )
         btn_back.clicked.connect(self._go_back)
         header.addWidget(btn_back)
 
-        title = QLabel("Multi-Night Light Curve Merger")
+        title = QLabel("Multi-Night Merger Workflow")
         title.setFont(QFont("Arial", 14, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         header.addWidget(title, 1)
-
-        # Placeholder to balance layout
         header.addSpacing(110)
         root.addLayout(header)
 
-        # ── Step navigation bar ──
         step_bar = QHBoxLayout()
         step_bar.setSpacing(2)
         self._step_btns: list[QPushButton] = []
-        for i, title_text in enumerate(self.STEP_TITLES):
-            btn = QPushButton(title_text)
+        for i, text in enumerate(self.STEP_TITLES):
+            btn = QPushButton(text)
             btn.setCheckable(True)
             btn.setMinimumHeight(30)
             btn.clicked.connect(lambda checked, idx=i: self._go_to_step(idx))
@@ -268,12 +292,14 @@ class MultiNightMergerWindow(QMainWindow):
             self._step_btns.append(btn)
         root.addLayout(step_bar)
 
-        # ── Step pages (manual show/hide) ──
-        self._pages: list[QWidget] = []
-        self._pages.append(self._make_step1())
-        self._pages.append(self._make_step2())
-        self._pages.append(self._make_step3())
-        self._pages.append(self._make_step4())
+        self._pages: list[QWidget] = [
+            self._make_step1(),
+            self._make_step2(),
+            self._make_step3(),
+            self._make_step4(),
+            self._make_step5(),
+            self._make_step6(),
+        ]
 
         self._page_container = QWidget()
         self._page_layout = QVBoxLayout(self._page_container)
@@ -283,50 +309,48 @@ class MultiNightMergerWindow(QMainWindow):
             page.hide()
         root.addWidget(self._page_container, 1)
 
-        # ── Bottom nav ──
         nav = QHBoxLayout()
         self.btn_prev = QPushButton("◀ 이전")
         self.btn_prev.clicked.connect(self._prev_step)
         self.btn_next = QPushButton("다음 ▶")
+        self.btn_next.clicked.connect(self._next_step)
         self.btn_next.setStyleSheet(
             "QPushButton { background:#1565C0; color:white; font-weight:bold; padding:4px 16px; }"
             "QPushButton:hover { background:#0D47A1; }"
         )
-        self.btn_next.clicked.connect(self._next_step)
         nav.addWidget(self.btn_prev)
         nav.addStretch()
         nav.addWidget(self.btn_next)
         root.addLayout(nav)
 
         self._current_step = 0
+        self.output_dir_edit.setText(str(_default_output_dir(self.folders[0])))
+        self._refresh_folder_list()
         self._go_to_step(0)
 
-    # ── Step 1: Folder Selection ──────────────────────
+    def _make_info_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("QLabel { background:#E3F2FD; padding:8px; border-radius:4px; }")
+        return label
 
     def _make_step1(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(8)
 
-        info = QLabel(
-            "같은 타겟을 여러 날 밤 처리한 result 폴더들을 추가하세요.\n"
-            "현재 프로젝트 폴더는 자동으로 포함됩니다."
-        )
-        info.setStyleSheet("QLabel { background:#E3F2FD; padding:8px; border-radius:4px; }")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        layout.addWidget(self._make_info_label(
+            "Step 10까지 처리된 result 폴더들을 선택합니다.\n"
+            "이후 머저용 merged workspace를 별도 결과 폴더에 생성합니다."
+        ))
 
-        grp = QGroupBox("Result 폴더 목록")
+        grp = QGroupBox("입력 result 폴더")
         grp_layout = QVBoxLayout(grp)
-
         self.folder_list = QListWidget()
-        self.folder_list.setMinimumHeight(200)
-        self._refresh_folder_list()
+        self.folder_list.setMinimumHeight(180)
         grp_layout.addWidget(self.folder_list)
 
         btn_row = QHBoxLayout()
         btn_add = QPushButton("폴더 추가")
-        btn_add.setStyleSheet("background:#4CAF50; color:white; font-weight:bold; padding:4px 12px;")
         btn_add.clicked.connect(self._on_add_folder)
         btn_remove = QPushButton("선택 제거")
         btn_remove.clicked.connect(self._on_remove_folder)
@@ -336,16 +360,23 @@ class MultiNightMergerWindow(QMainWindow):
         grp_layout.addLayout(btn_row)
         layout.addWidget(grp)
 
-        # Folder info table
-        info_grp = QGroupBox("폴더별 정보")
-        info_layout = QVBoxLayout(info_grp)
-        self.folder_info_table = QTableWidget(0, 4)
-        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "프레임 수", "필터", "Step 10 캐시"])
-        self.folder_info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.folder_info_table.setMaximumHeight(160)
-        self.folder_info_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        info_layout.addWidget(self.folder_info_table)
+        out_grp = QGroupBox("출력 merged result 폴더")
+        out_layout = QHBoxLayout(out_grp)
+        self.output_dir_edit = QLineEdit()
+        btn_browse_out = QPushButton("찾기...")
+        btn_browse_out.clicked.connect(self._browse_output_dir)
+        out_layout.addWidget(self.output_dir_edit, 1)
+        out_layout.addWidget(btn_browse_out)
+        layout.addWidget(out_grp)
 
+        info_grp = QGroupBox("폴더 스캔")
+        info_layout = QVBoxLayout(info_grp)
+        self.folder_info_table = QTableWidget(0, 5)
+        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Step 5", "Step 9", "Step 10", "필터"])
+        self.folder_info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.folder_info_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.folder_info_table.setMinimumHeight(180)
+        info_layout.addWidget(self.folder_info_table)
         btn_scan = QPushButton("폴더 스캔")
         btn_scan.clicked.connect(self._scan_folders)
         info_layout.addWidget(btn_scan)
@@ -353,10 +384,165 @@ class MultiNightMergerWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    def _make_step2(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        layout.addWidget(self._make_info_label(
+            "base 폴더의 selection / master catalog를 기준으로 canonical merged ID를 만듭니다.\n"
+            "매칭 우선순위는 Gaia source_id → 기존 canonical source_id → 좌표 근접 매칭입니다."
+        ))
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Position match radius (arcsec):"))
+        self.match_radius_combo = QComboBox()
+        for value in ("1.0", "1.5", "2.0", "3.0", "5.0"):
+            self.match_radius_combo.addItem(value)
+        self.match_radius_combo.setCurrentText("2.0")
+        top.addWidget(self.match_radius_combo)
+        top.addStretch()
+        btn_match = QPushButton("ID 매칭 실행")
+        btn_match.clicked.connect(self._run_id_match)
+        top.addWidget(btn_match)
+        layout.addLayout(top)
+
+        self.match_status_label = QLabel("매칭 결과: 아직 실행 안 됨")
+        self.match_status_label.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(self.match_status_label)
+
+        self.match_table = QTableWidget(0, 7)
+        self.match_table.setHorizontalHeaderLabels(
+            ["폴더", "필터", "Exact SID", "Positional", "New", "총 rows", "상태"]
+        )
+        self.match_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.match_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.match_table.setMinimumHeight(240)
+        layout.addWidget(self.match_table)
+
+        self.match_log = QTextEdit()
+        self.match_log.setReadOnly(True)
+        self.match_log.setMinimumHeight(160)
+        self.match_log.setStyleSheet("font-size:8pt; font-family:monospace;")
+        layout.addWidget(self.match_log)
+        return page
+
+    def _make_step3(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        layout.addWidget(self._make_info_label(
+            "merged canonical catalog에서 target / comparison / check를 다시 선택합니다.\n"
+            "기본값은 base 폴더 selection을 가져오고, 저장 시 merged workspace가 materialize 됩니다."
+        ))
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Filter:"))
+        self.selection_filter_combo = QComboBox()
+        self.selection_filter_combo.currentIndexChanged.connect(self._on_selection_filter_changed)
+        top.addWidget(self.selection_filter_combo)
+        top.addStretch()
+
+        btn_load_base = QPushButton("Base Selection 불러오기")
+        btn_load_base.clicked.connect(self._load_selection_defaults_from_base)
+        top.addWidget(btn_load_base)
+
+        btn_build_workspace = QPushButton("Merged Workspace 생성")
+        btn_build_workspace.setStyleSheet(
+            "QPushButton { background:#4CAF50; color:white; font-weight:bold; padding:4px 12px; }"
+            "QPushButton:hover { background:#388E3C; }"
+        )
+        btn_build_workspace.clicked.connect(self._build_merged_workspace)
+        top.addWidget(btn_build_workspace)
+        layout.addLayout(top)
+
+        self.selection_status_label = QLabel("선택 상태: 아직 merged catalog 없음")
+        self.selection_status_label.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(self.selection_status_label)
+
+        role_row = QHBoxLayout()
+        btn_t = QPushButton("Target")
+        btn_t.clicked.connect(self._set_selection_target)
+        btn_c = QPushButton("Comp")
+        btn_c.clicked.connect(self._toggle_selection_comp)
+        btn_k = QPushButton("Check")
+        btn_k.clicked.connect(self._set_selection_check)
+        btn_clear = QPushButton("Clear All")
+        btn_clear.clicked.connect(self._clear_selection_roles)
+        role_row.addWidget(btn_t)
+        role_row.addWidget(btn_c)
+        role_row.addWidget(btn_k)
+        role_row.addWidget(btn_clear)
+        role_row.addStretch()
+        layout.addLayout(role_row)
+
+        self.selection_table = QTableWidget(0, 7)
+        self.selection_table.setHorizontalHeaderLabels(
+            ["ID", "source_id", "Gaia", "Gmag", "folders", "role", "note"]
+        )
+        self.selection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.selection_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.selection_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.selection_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.selection_table.setMinimumHeight(300)
+        layout.addWidget(self.selection_table)
+
+        self.selection_log = QTextEdit()
+        self.selection_log.setReadOnly(True)
+        self.selection_log.setMinimumHeight(140)
+        self.selection_log.setStyleSheet("font-size:8pt; font-family:monospace;")
+        layout.addWidget(self.selection_log)
+        return page
+
+    def _make_child_step_page(self, title: str, button_text: str, callback):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._make_info_label(title))
+        status = QLabel("준비 안 됨")
+        status.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(status)
+        btn = QPushButton(button_text)
+        btn.clicked.connect(callback)
+        btn.setStyleSheet(
+            "QPushButton { background:#1565C0; color:white; font-weight:bold; padding:6px 18px; }"
+            "QPushButton:hover { background:#0D47A1; }"
+        )
+        layout.addWidget(btn)
+        layout.addStretch()
+        return page, status
+
+    def _make_step4(self) -> QWidget:
+        page, label = self._make_child_step_page(
+            "Merged workspace의 Step 10 Light Curve Builder를 엽니다.",
+            "Step 10 열기",
+            lambda: self.open_step(9),
+        )
+        self.step10_status_label = label
+        return page
+
+    def _make_step5(self) -> QWidget:
+        page, label = self._make_child_step_page(
+            "Merged workspace의 Step 11 Detrend window를 엽니다.",
+            "Step 11 열기",
+            lambda: self.open_step(10),
+        )
+        self.step11_status_label = label
+        return page
+
+    def _make_step6(self) -> QWidget:
+        page, label = self._make_child_step_page(
+            "Merged workspace의 Step 12 Period Analysis window를 엽니다.",
+            "Step 12 열기",
+            lambda: self.open_step(11),
+        )
+        self.step12_status_label = label
+        return page
+
+    # ───────────────────────── folder scan ─────────────────────────
+
     def _refresh_folder_list(self):
         self.folder_list.clear()
         for i, p in enumerate(self.folders):
-            label = f"[현재]  {p}" if i == 0 else str(p)
+            label = f"[BASE] {p}" if i == 0 else str(p)
             item = QListWidgetItem(label)
             if i == 0:
                 item.setForeground(QColor("#1565C0"))
@@ -364,13 +550,11 @@ class MultiNightMergerWindow(QMainWindow):
             self.folder_list.addItem(item)
 
     def _on_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "result 폴더 선택", str(self.folders[0].parent)
-        )
+        folder = QFileDialog.getExistingDirectory(self, "result 폴더 선택", str(self.folders[0].parent))
         if not folder:
             return
         p = Path(folder)
-        if any(f.resolve() == p.resolve() for f in self.folders):
+        if any(existing.resolve() == p.resolve() for existing in self.folders):
             return
         self.folders.append(p)
         self._refresh_folder_list()
@@ -382,486 +566,825 @@ class MultiNightMergerWindow(QMainWindow):
         self.folders.pop(row)
         self._refresh_folder_list()
 
+    def _browse_output_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "merged result 폴더 선택",
+            str(Path(self.output_dir_edit.text()).parent if self.output_dir_edit.text().strip() else _default_output_dir(self.folders[0]).parent),
+        )
+        if path:
+            self.output_dir_edit.setText(path)
+
     def _scan_folders(self):
+        self.folder_scan_rows = []
         self.folder_info_table.setRowCount(0)
         for folder in self.folders:
+            idx = _read_step5_index(folder)
+            catalogs = _load_master_catalogs_by_filter(folder)
+            selection_payloads = _load_selection_payloads(folder)
+            s10 = step10_dir(folder)
+            has_step10 = bool(list(s10.glob("lightcurve_ID*_raw.csv"))) or bool(list(s10.glob("lightcurve_combined_ID*_raw.csv")))
+
+            filters = sorted(set(catalogs) | set(selection_payloads))
+            row_info = {
+                "folder": folder,
+                "has_step5": not idx.empty,
+                "has_step9": bool(catalogs),
+                "has_step10": has_step10,
+                "filters": filters,
+            }
+            self.folder_scan_rows.append(row_info)
+
             row = self.folder_info_table.rowCount()
             self.folder_info_table.insertRow(row)
             self.folder_info_table.setItem(row, 0, QTableWidgetItem(folder.name))
+            for col_idx, key in enumerate(("has_step5", "has_step9", "has_step10"), start=1):
+                ok = bool(row_info[key])
+                item = QTableWidgetItem("OK" if ok else "없음")
+                item.setForeground(QColor("#2E7D32") if ok else QColor("#C62828"))
+                self.folder_info_table.setItem(row, col_idx, item)
+            self.folder_info_table.setItem(row, 4, QTableWidgetItem(", ".join(filters) if filters else "—"))
 
-            idx_path = folder / "step9_photometry" / "photometry_index.csv"
-            if not idx_path.exists():
-                idx_path = folder / "photometry_index.csv"
-            n_frames = ""
-            filters = ""
-            if idx_path.exists():
-                try:
-                    idx = pd.read_csv(idx_path)
-                    n_frames = str(len(idx))
-                    if "filter" in idx.columns:
-                        filters = ", ".join(sorted(idx["filter"].dropna().unique()))
-                except Exception:
-                    pass
-            self.folder_info_table.setItem(row, 1, QTableWidgetItem(n_frames))
-            self.folder_info_table.setItem(row, 2, QTableWidgetItem(filters))
+    # ───────────────────────── Step 2: ID match ─────────────────────────
 
-            cached = list((folder / "step10_lightcurve").glob("lightcurve_ID*_raw.csv")) if (folder / "step10_lightcurve").exists() else []
-            cache_str = f"{len(cached)}개" if cached else "없음"
-            item = QTableWidgetItem(cache_str)
-            item.setForeground(QColor("#2E7D32") if cached else QColor("#C62828"))
-            self.folder_info_table.setItem(row, 3, item)
+    def _next_generated_negative_source_id(self, current_catalogs: dict[str, pd.DataFrame]) -> int:
+        min_sid = 0
+        for df in current_catalogs.values():
+            if df is None or df.empty or "source_id" not in df.columns:
+                continue
+            sid_vals = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
+            if not sid_vals.empty:
+                min_sid = min(min_sid, int(sid_vals.min()))
+        return min_sid - 1 if min_sid <= 0 else -1
 
-    # ── Step 2: ID Matching ───────────────────────────
+    def _best_positional_match(self, row: pd.Series, canonical_df: pd.DataFrame, tol_arcsec: float) -> tuple[int | None, float]:
+        ra, dec = _row_radec(row)
+        if not (np.isfinite(ra) and np.isfinite(dec)):
+            return None, float("nan")
+        if canonical_df is None or canonical_df.empty or "ra_deg" not in canonical_df.columns or "dec_deg" not in canonical_df.columns:
+            return None, float("nan")
 
-    def _make_step2(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setSpacing(8)
+        cand = canonical_df.copy()
+        cand_ra = pd.to_numeric(cand["ra_deg"], errors="coerce")
+        cand_dec = pd.to_numeric(cand["dec_deg"], errors="coerce")
+        mask = cand_ra.notna() & cand_dec.notna()
+        if not mask.any():
+            return None, float("nan")
 
-        info = QLabel(
-            "base 폴더의 target/comp ID를 Gaia source_id 기준으로 각 폴더의 local ID와 매칭합니다."
-        )
-        info.setStyleSheet("QLabel { background:#E3F2FD; padding:8px; border-radius:4px; }")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        sc = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+        csc = SkyCoord(cand_ra[mask].to_numpy(float) * u.deg, cand_dec[mask].to_numpy(float) * u.deg, frame="icrs")
+        sep = sc.separation(csc).arcsec
+        if len(sep) == 0:
+            return None, float("nan")
+        best_i = int(np.argmin(sep))
+        best_sep = float(sep[best_i])
+        if not np.isfinite(best_sep) or best_sep > tol_arcsec:
+            return None, best_sep
+        best_rows = cand.loc[mask].reset_index(drop=True)
+        return int(pd.to_numeric(best_rows.loc[best_i, "source_id"], errors="coerce")), best_sep
 
-        self.match_status_label = QLabel("매칭 결과: (아직 실행 안 됨)")
-        self.match_status_label.setStyleSheet(
-            "QLabel { background:#FAFAFA; padding:6px; border-radius:4px; font-size:9pt; }"
-        )
-        layout.addWidget(self.match_status_label)
-
-        # Matching table
-        grp = QGroupBox("ID 매핑 테이블")
-        grp_layout = QVBoxLayout(grp)
-        self.match_table = QTableWidget(0, 5)
-        self.match_table.setHorizontalHeaderLabels(
-            ["폴더", "target_id (local)", "Gaia source_id", "comp_ids (local)", "상태"]
-        )
-        self.match_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.match_table.setMinimumHeight(200)
-        self.match_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        grp_layout.addWidget(self.match_table)
-
-        btn_row = QHBoxLayout()
-        btn_run = QPushButton("ID 매칭 실행")
-        btn_run.setStyleSheet("background:#1565C0; color:white; font-weight:bold; padding:4px 16px;")
-        btn_run.clicked.connect(self._run_id_match)
-        btn_row.addWidget(btn_run)
-        btn_row.addStretch()
-        grp_layout.addLayout(btn_row)
-        layout.addWidget(grp)
-
-        # Log
-        self.match_log = QTextEdit()
-        self.match_log.setReadOnly(True)
-        self.match_log.setMaximumHeight(120)
-        self.match_log.setStyleSheet("font-size:8pt; font-family:monospace;")
-        layout.addWidget(self.match_log)
-        layout.addStretch()
-        return page
+    def _canonicalize_catalog_row(
+        self,
+        row: pd.Series,
+        merged_id: int,
+        merged_source_id: int,
+        folder_tag: str,
+    ) -> dict:
+        data = row.to_dict()
+        data["ID"] = int(merged_id)
+        data["source_id"] = int(merged_source_id)
+        data["gaia_id"] = int(merged_source_id) if int(merged_source_id) > 0 else np.nan
+        data["match_status"] = "matched" if int(merged_source_id) > 0 else "no_gaia_match"
+        data["folder_count"] = 1
+        data["folder_tags"] = folder_tag
+        return data
 
     def _run_id_match(self):
         self.match_log.clear()
-        self.id_mapping = []
+        self.match_table.setRowCount(0)
+        self.match_summary_rows = []
+        self.match_records = []
+        self.merged_catalogs = {}
+        self.local_id_maps = {}
+        self.base_selection_by_filter = {}
 
-        if len(self.folders) < 1:
-            self.match_log.append("폴더를 먼저 추가하세요.")
+        if not self.folder_scan_rows:
+            self._scan_folders()
+        if not self.folders:
+            QMessageBox.information(self, "ID Match", "No folders selected.")
             return
 
         base_folder = self.folders[0]
-        base_tid, base_cids = _load_selection_ids(base_folder)
-        if base_tid is None:
-            self.match_log.append(f"[ERR] base 폴더({base_folder.name})에서 target ID를 찾을 수 없습니다.")
-            self.match_log.append("      Step 8 (Master ID Editor)를 완료했는지 확인하세요.")
+        self.base_selection_by_filter = _load_selection_payloads(base_folder)
+        catalogs_by_folder = {str(folder): _load_master_catalogs_by_filter(folder) for folder in self.folders}
+        self.folder_tags = {str(folder): _folder_tag(i, folder) for i, folder in enumerate(self.folders)}
+
+        all_filters = sorted({
+            flt for folder in self.folders
+            for flt in catalogs_by_folder.get(str(folder), {}).keys()
+        })
+        if not all_filters:
+            self.match_status_label.setText("매칭 실패: master_catalog 없음")
+            self.match_log.append("[ERR] 어떤 폴더에서도 master_catalog_*.tsv 를 찾지 못했습니다.")
             return
 
-        self.match_log.append(f"[BASE] {base_folder.name}: target_id={base_tid}, comp_ids={base_cids}")
+        pos_tol = float(self.match_radius_combo.currentText())
+        next_negative_sid = self._next_generated_negative_source_id({})
+        canonical_by_filter: dict[str, pd.DataFrame] = {}
+        next_id_by_filter: dict[str, int] = {}
 
-        # Get Gaia source_ids from base catalog
-        base_catalog = _load_master_catalog(base_folder)
-        if base_catalog.empty:
-            self.match_log.append(f"[ERR] base 폴더 master_catalog 없음.")
-            return
-
-        id2src = _build_id_to_source_map(base_catalog)
-        base_target_src = id2src.get(base_tid)
-        base_comp_srcs = [id2src.get(c) for c in base_cids]
-
-        self.match_log.append(f"      Gaia source_id: target={base_target_src}, comp={base_comp_srcs}")
-
-        self.match_table.setRowCount(0)
-        n_ok = 0
         for folder in self.folders:
-            if folder.resolve() == base_folder.resolve():
-                # base folder uses IDs as-is
-                tid_local = base_tid
-                cids_local = base_cids
-                status = "base"
-            else:
-                catalog = _load_master_catalog(folder)
-                if catalog.empty:
-                    self.match_log.append(f"[WARN] {folder.name}: master_catalog 없음, 건너뜀")
-                    tid_local = None
-                    cids_local = []
-                    status = "fail: catalog 없음"
-                else:
-                    src2id = _build_source_to_id_map(catalog)
-                    tid_local = src2id.get(base_target_src) if base_target_src is not None else None
-                    cids_local = [src2id.get(s) for s in base_comp_srcs if s is not None and s in src2id]
-                    if tid_local is None:
-                        status = "fail: target Gaia 미발견"
-                        self.match_log.append(f"[WARN] {folder.name}: target Gaia ID {base_target_src} 미발견")
+            folder_key = str(folder)
+            folder_tag = self.folder_tags[folder_key]
+            self.local_id_maps.setdefault(folder_key, {})
+            filter_catalogs = catalogs_by_folder.get(folder_key, {})
+
+            for flt in all_filters:
+                df = filter_catalogs.get(flt)
+                if df is None or df.empty:
+                    continue
+
+                if flt not in canonical_by_filter:
+                    canonical_by_filter[flt] = pd.DataFrame()
+                    next_id_by_filter[flt] = 1
+
+                canon = canonical_by_filter[flt].copy()
+                local_map: dict[int, dict[str, int]] = {}
+                n_exact = 0
+                n_pos = 0
+                n_new = 0
+
+                # Base folder seeds the canonical catalog and preserves its IDs/source_ids when possible.
+                if folder == base_folder and canon.empty:
+                    seeded_rows = []
+                    max_id = 0
+                    for _, row in df.iterrows():
+                        local_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
+                        if not np.isfinite(local_id):
+                            continue
+                        sid_val = coerce_int64_source_id(pd.Series([row.get("source_id")])).iloc[0]
+                        if pd.isna(sid_val):
+                            sid = next_negative_sid
+                            next_negative_sid -= 1
+                        else:
+                            sid = int(sid_val)
+                        merged_id = int(local_id)
+                        max_id = max(max_id, merged_id)
+                        seeded_rows.append(self._canonicalize_catalog_row(row, merged_id, sid, folder_tag))
+                        local_map[int(local_id)] = {
+                            "merged_id": merged_id,
+                            "merged_source_id": sid,
+                        }
+                        self.match_records.append({
+                            "folder": folder.name,
+                            "folder_tag": folder_tag,
+                            "filter": flt,
+                            "local_id": int(local_id),
+                            "local_source_id": None if pd.isna(sid_val) else int(sid_val),
+                            "merged_id": merged_id,
+                            "merged_source_id": sid,
+                            "method": "base",
+                            "sep_arcsec": np.nan,
+                            "status": "base",
+                        })
+                    canon = pd.DataFrame(seeded_rows)
+                    next_id_by_filter[flt] = max_id + 1 if max_id > 0 else 1
+                    canonical_by_filter[flt] = canon
+                    self.local_id_maps[folder_key][flt] = local_map
+                    self.match_summary_rows.append({
+                        "folder": folder.name,
+                        "filter": flt,
+                        "exact": len(seeded_rows),
+                        "pos": 0,
+                        "new": 0,
+                        "total": len(seeded_rows),
+                        "status": "base",
+                    })
+                    continue
+
+                canon_sid_map = {}
+                if not canon.empty and "source_id" in canon.columns:
+                    sid_vals = coerce_int64_source_id(canon["source_id"]).astype("Int64")
+                    for idx_row, sid_val in enumerate(sid_vals):
+                        if pd.notna(sid_val) and int(sid_val) not in canon_sid_map:
+                            canon_sid_map[int(sid_val)] = idx_row
+
+                used_canonical_sids: set[int] = set()
+                for _, row in df.iterrows():
+                    local_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
+                    if not np.isfinite(local_id):
+                        continue
+                    local_id = int(local_id)
+                    sid_val = coerce_int64_source_id(pd.Series([row.get("source_id")])).iloc[0]
+                    sid_int = None if pd.isna(sid_val) else int(sid_val)
+
+                    matched_sid = None
+                    match_method = ""
+                    sep_arcsec = float("nan")
+
+                    if sid_int is not None and sid_int in canon_sid_map:
+                        matched_sid = sid_int
+                        match_method = "source_id"
                     else:
-                        n_matched_comp = len(cids_local)
-                        status = f"OK (comp {n_matched_comp}/{len(base_cids)})"
-                        self.match_log.append(f"[OK]  {folder.name}: target_id={tid_local}, comp_ids={cids_local}")
+                        matched_sid, sep_arcsec = self._best_positional_match(row, canon, pos_tol)
+                        if matched_sid is not None and matched_sid not in used_canonical_sids:
+                            match_method = "position"
+                        else:
+                            matched_sid = None
 
-            entry = {
-                "folder": folder,
-                "target_id": tid_local,
-                "comp_ids": [c for c in cids_local if c is not None],
-                "target_gaia_src": base_target_src,
-                "status": status,
-            }
-            self.id_mapping.append(entry)
+                    if matched_sid is not None and matched_sid in canon_sid_map:
+                        canon_idx = canon_sid_map[matched_sid]
+                        merged_id = int(pd.to_numeric(pd.Series([canon.iloc[canon_idx]["ID"]]), errors="coerce").iloc[0])
+                        local_map[local_id] = {
+                            "merged_id": merged_id,
+                            "merged_source_id": int(matched_sid),
+                        }
+                        used_canonical_sids.add(int(matched_sid))
+                        if match_method == "source_id":
+                            n_exact += 1
+                        else:
+                            n_pos += 1
+                        canon.at[canon_idx, "folder_count"] = int(pd.to_numeric(pd.Series([canon.iloc[canon_idx].get("folder_count", 1)]), errors="coerce").iloc[0] or 1) + 1
+                        canon.at[canon_idx, "folder_tags"] = _append_folder_tag(canon.iloc[canon_idx].get("folder_tags", ""), folder_tag)
+                        self.match_records.append({
+                            "folder": folder.name,
+                            "folder_tag": folder_tag,
+                            "filter": flt,
+                            "local_id": local_id,
+                            "local_source_id": sid_int,
+                            "merged_id": merged_id,
+                            "merged_source_id": int(matched_sid),
+                            "method": match_method,
+                            "sep_arcsec": sep_arcsec,
+                            "status": "matched",
+                        })
+                        continue
 
+                    # New canonical source.
+                    merged_id = next_id_by_filter.get(flt, 1)
+                    next_id_by_filter[flt] = merged_id + 1
+
+                    if sid_int is not None and sid_int not in canon_sid_map:
+                        merged_source_id = sid_int
+                    else:
+                        merged_source_id = next_negative_sid
+                        next_negative_sid -= 1
+
+                    new_row = self._canonicalize_catalog_row(row, merged_id, merged_source_id, folder_tag)
+                    canon = pd.concat([canon, pd.DataFrame([new_row])], ignore_index=True, sort=False)
+                    canon_sid_map[int(merged_source_id)] = len(canon) - 1
+                    local_map[local_id] = {
+                        "merged_id": merged_id,
+                        "merged_source_id": int(merged_source_id),
+                    }
+                    n_new += 1
+                    self.match_records.append({
+                        "folder": folder.name,
+                        "folder_tag": folder_tag,
+                        "filter": flt,
+                        "local_id": local_id,
+                        "local_source_id": sid_int,
+                        "merged_id": merged_id,
+                        "merged_source_id": int(merged_source_id),
+                        "method": "new",
+                        "sep_arcsec": np.nan,
+                        "status": "new",
+                    })
+
+                canon = canon.sort_values("ID").reset_index(drop=True)
+                canonical_by_filter[flt] = canon
+                self.local_id_maps[folder_key][flt] = local_map
+                self.match_summary_rows.append({
+                    "folder": folder.name,
+                    "filter": flt,
+                    "exact": n_exact,
+                    "pos": n_pos,
+                    "new": n_new,
+                    "total": len(local_map),
+                    "status": "OK" if local_map else "empty",
+                })
+                self.match_log.append(
+                    f"[MATCH] {folder.name} / {flt}: exact={n_exact} positional={n_pos} new={n_new} total={len(local_map)}"
+                )
+
+        self.merged_catalogs = canonical_by_filter
+        self._update_match_table()
+        self._load_selection_defaults_from_base()
+        self._refresh_selection_filter_combo()
+        n_rows = sum(len(df) for df in self.merged_catalogs.values())
+        self.match_status_label.setText(
+            f"매칭 완료: filters={len(self.merged_catalogs)} canonical rows={n_rows} mapping rows={len(self.match_records)}"
+        )
+
+    def _update_match_table(self):
+        self.match_table.setRowCount(0)
+        for row_data in self.match_summary_rows:
             row = self.match_table.rowCount()
             self.match_table.insertRow(row)
-            self.match_table.setItem(row, 0, QTableWidgetItem(folder.name))
-            self.match_table.setItem(row, 1, QTableWidgetItem(str(tid_local) if tid_local is not None else "—"))
-            self.match_table.setItem(row, 2, QTableWidgetItem(str(base_target_src) if base_target_src else "—"))
-            cids_str = ", ".join(str(c) for c in cids_local if c is not None)
-            self.match_table.setItem(row, 3, QTableWidgetItem(cids_str or "—"))
-            status_item = QTableWidgetItem(status)
-            status_item.setForeground(
-                QColor("#2E7D32") if "OK" in status or status == "base"
-                else QColor("#C62828")
-            )
-            self.match_table.setItem(row, 4, status_item)
-            if "OK" in status or status == "base":
-                n_ok += 1
+            self.match_table.setItem(row, 0, QTableWidgetItem(str(row_data["folder"])))
+            self.match_table.setItem(row, 1, QTableWidgetItem(str(row_data["filter"])))
+            self.match_table.setItem(row, 2, QTableWidgetItem(str(row_data["exact"])))
+            self.match_table.setItem(row, 3, QTableWidgetItem(str(row_data["pos"])))
+            self.match_table.setItem(row, 4, QTableWidgetItem(str(row_data["new"])))
+            self.match_table.setItem(row, 5, QTableWidgetItem(str(row_data["total"])))
+            status_item = QTableWidgetItem(str(row_data["status"]))
+            status_item.setForeground(QColor("#2E7D32") if row_data["status"] == "OK" or row_data["status"] == "base" else QColor("#C62828"))
+            self.match_table.setItem(row, 6, status_item)
 
-        self.match_status_label.setText(
-            f"매칭 완료: {n_ok}/{len(self.folders)} 폴더 성공"
-        )
+    # ───────────────────────── Step 3: selection ─────────────────────────
 
-    # ── Step 3: Build & Merge ─────────────────────────
-
-    def _make_step3(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setSpacing(8)
-
-        info = QLabel(
-            "각 폴더의 lightcurve_ID*_raw.csv를 로드하여 병합합니다.\n"
-            "캐시 파일이 없으면 Step 10을 먼저 실행하세요."
-        )
-        info.setStyleSheet("QLabel { background:#E3F2FD; padding:8px; border-radius:4px; }")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        btn_build = QPushButton("병합 실행")
-        btn_build.setStyleSheet(
-            "QPushButton { background:#4CAF50; color:white; font-weight:bold; padding:6px 20px; }"
-            "QPushButton:hover { background:#388E3C; }"
-        )
-        btn_build.clicked.connect(self._run_build)
-        layout.addWidget(btn_build)
-
-        self.build_progress = QProgressBar()
-        self.build_progress.setRange(0, 0)
-        self.build_progress.setVisible(False)
-        layout.addWidget(self.build_progress)
-
-        self.build_log = QTextEdit()
-        self.build_log.setReadOnly(True)
-        self.build_log.setStyleSheet("font-size:8pt; font-family:monospace;")
-        self.build_log.setMinimumHeight(160)
-        layout.addWidget(self.build_log)
-
-        # Stats after merge
-        self.merge_stats_label = QLabel("")
-        self.merge_stats_label.setStyleSheet(
-            "QLabel { background:#E8F5E9; padding:8px; border-radius:4px; font-weight:bold; }"
-        )
-        self.merge_stats_label.setWordWrap(True)
-        layout.addWidget(self.merge_stats_label)
-
-        # Save
-        save_row = QHBoxLayout()
-        self.btn_save_merged = QPushButton("병합 CSV 저장")
-        self.btn_save_merged.setEnabled(False)
-        self.btn_save_merged.clicked.connect(self._save_merged_csv)
-        save_row.addWidget(self.btn_save_merged)
-        save_row.addStretch()
-        layout.addLayout(save_row)
-        layout.addStretch()
-        return page
-
-    def _run_build(self):
-        if not self.id_mapping:
-            QMessageBox.warning(self, "병합", "Step 2 ID 매칭을 먼저 실행하세요.")
-            return
-
-        self.build_log.clear()
-        self.merge_stats_label.setText("")
-        self.build_progress.setVisible(True)
-        self.btn_save_merged.setEnabled(False)
-
-        self._build_worker = MergerBuildWorker(self.folders, self.id_mapping)
-        self._build_worker.progress.connect(lambda msg: self.build_log.append(msg))
-        self._build_worker.finished.connect(self._on_build_finished)
-        self._build_worker.start()
-
-    def _on_build_finished(self, merged: pd.DataFrame, err_msg: str):
-        self.build_progress.setVisible(False)
-
-        if err_msg:
-            self.build_log.append(f"\n[경고]\n{err_msg}")
-
-        if merged.empty:
-            self.merged_df = merged
-            self.merge_stats_label.setText("병합 실패: 로드된 데이터 없음")
-            return
-
-        # Attempt BJD_TDB conversion
-        merged = self._add_bjd_column(merged)
-        self.merged_df = merged
-
-        n_frames = len(merged)
-        n_nights = merged["_source_folder"].nunique() if "_source_folder" in merged.columns else "?"
-        jd_min = merged["JD"].min() if "JD" in merged.columns else float("nan")
-        jd_max = merged["JD"].max() if "JD" in merged.columns else float("nan")
-        bjd_note = "  BJD_TDB 컬럼 추가됨" if "BJD_TDB" in merged.columns else ""
-
-        self.merge_stats_label.setText(
-            f"병합 완료: {n_frames} 포인트, {n_nights}개 폴더  |  "
-            f"JD {jd_min:.3f} ~ {jd_max:.3f}{bjd_note}"
-        )
-        self.btn_save_merged.setEnabled(True)
-        self.build_log.append(f"\n총 {n_frames}개 포인트 병합 완료.")
-
-    def _add_bjd_column(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add BJD_TDB column from JD if site coords and target coords are available."""
-        if "JD" not in df.columns or "BJD_TDB" in df.columns:
-            return df
-        try:
-            site_lat = float(getattr(self.params.P, "site_lat_deg", float("nan")))
-            site_lon = float(getattr(self.params.P, "site_lon_deg", float("nan")))
-            site_alt = float(getattr(self.params.P, "site_alt_m", 0.0))
-            if not (np.isfinite(site_lat) and np.isfinite(site_lon)):
-                return df
-            # Use base folder target ID
-            base_entry = next((e for e in self.id_mapping if e.get("target_id") is not None), None)
-            if base_entry is None:
-                return df
-            target_id = base_entry["target_id"]
-            tgt_ra, tgt_dec = _load_target_radec(self.folders[0], target_id)
-            if not (np.isfinite(tgt_ra) and np.isfinite(tgt_dec)):
-                # Fallback: params.P.target
-                target_cfg = getattr(self.params.P, "target", None)
-                if target_cfg is not None:
-                    tgt_ra = float(getattr(target_cfg, "ra_deg", float("nan")) or float("nan"))
-                    tgt_dec = float(getattr(target_cfg, "dec_deg", float("nan")) or float("nan"))
-            if not (np.isfinite(tgt_ra) and np.isfinite(tgt_dec)):
-                return df
-            jd_arr = pd.to_numeric(df["JD"], errors="coerce").to_numpy(float)
-            bjd_arr = compute_bjd_tdb_array(jd_arr, tgt_ra, tgt_dec, site_lat, site_lon, site_alt)
-            df = df.copy()
-            df["BJD_TDB"] = bjd_arr
-            self.build_log.append(f"[BJD] site=({site_lat:.4f}, {site_lon:.4f}), target=({tgt_ra:.6f}, {tgt_dec:.6f})")
-        except Exception as e:
-            self.build_log.append(f"[BJD 변환 실패] {e}")
-        return df
-
-    def _save_merged_csv(self):
-        if self.merged_df.empty:
-            return
-        base = self.folders[0]
-        default_path = str(base.parent / f"{base.name}_merged_raw.csv")
-        path, _ = QFileDialog.getSaveFileName(self, "병합 CSV 저장", default_path, "CSV (*.csv)")
-        if path:
-            self.merged_df.to_csv(path, index=False)
-            QMessageBox.information(self, "저장", f"저장 완료:\n{path}")
-
-    # ── Step 4: Detrend & Plot ────────────────────────
-
-    def _make_step4(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setSpacing(6)
-
-        splitter = QSplitter(Qt.Horizontal)
-
-        # Left: controls
-        ctrl_widget = QWidget()
-        ctrl_widget.setMaximumWidth(260)
-        ctrl_layout = QVBoxLayout(ctrl_widget)
-        ctrl_layout.setSpacing(6)
-
-        detrend_grp = QGroupBox("야간 오프셋 보정")
-        detrend_form = QFormLayout(detrend_grp)
-        detrend_form.setSpacing(4)
-
-        self.chk_detrend = QCheckBox("적용")
-        self.chk_detrend.setChecked(True)
-        detrend_form.addRow("Nightly offset:", self.chk_detrend)
-
-        self.chk_linear = QCheckBox("선형 트렌드 제거 (야간 내 drift 보정)")
-        self.chk_linear.setChecked(False)
-        detrend_form.addRow("Linear detrend:", self.chk_linear)
-
-        self.chk_clip = QCheckBox("적용")
-        self.chk_clip.setChecked(True)
-        detrend_form.addRow("Sigma clip:", self.chk_clip)
-
-        self.spin_sigma = QDoubleSpinBox()
-        self.spin_sigma.setRange(1.0, 10.0)
-        self.spin_sigma.setSingleStep(0.5)
-        self.spin_sigma.setValue(3.0)
-        detrend_form.addRow("σ:", self.spin_sigma)
-
-        ctrl_layout.addWidget(detrend_grp)
-
-        plot_grp = QGroupBox("플롯 옵션")
-        plot_form = QFormLayout(plot_grp)
-        plot_form.setSpacing(4)
-
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItem("All")
-        plot_form.addRow("필터:", self.filter_combo)
-
-        ctrl_layout.addWidget(plot_grp)
-
-        btn_plot = QPushButton("플롯 갱신")
-        btn_plot.setStyleSheet(
-            "QPushButton { background:#1565C0; color:white; font-weight:bold; padding:4px 12px; }"
-            "QPushButton:hover { background:#0D47A1; }"
-        )
-        btn_plot.clicked.connect(self._update_plot)
-        ctrl_layout.addWidget(btn_plot)
-
-        btn_export = QPushButton("보정 CSV 내보내기")
-        btn_export.clicked.connect(self._export_corrected)
-        ctrl_layout.addWidget(btn_export)
-
-        ctrl_layout.addStretch()
-        splitter.addWidget(ctrl_widget)
-
-        # Right: plot
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        self.fig = Figure(figsize=(8, 5), tight_layout=True)
-        self.canvas = FigureCanvas(self.fig)
-        right_layout.addWidget(self.canvas)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(1, 1)
-
-        layout.addWidget(splitter, 1)
-        return page
-
-    def _update_plot(self):
-        if self.merged_df.empty:
-            QMessageBox.information(self, "플롯", "Step 3 병합을 먼저 실행하세요.")
-            return
-
-        df = self.merged_df.copy()
-        flt = self.filter_combo.currentText()
-        if flt != "All" and "filter" in df.columns:
-            df = df[df["filter"] == flt]
-        if df.empty:
-            return
-
-        # Populate filter combo once
-        if self.filter_combo.count() == 1 and "filter" in self.merged_df.columns:
-            for f in sorted(self.merged_df["filter"].dropna().unique()):
-                if self.filter_combo.findText(f) < 0:
-                    self.filter_combo.addItem(f)
-
-        # Nightly offset + optional linear detrend correction
-        if self.chk_detrend.isChecked() and "_source_folder" in df.columns and "delta_mag" in df.columns:
-            corrected_parts = []
-            x_col_for_trend = "BJD_TDB" if "BJD_TDB" in df.columns else ("JD" if "JD" in df.columns else None)
-            use_linear = self.chk_linear.isChecked() and x_col_for_trend is not None
-            for folder_name, grp in df.groupby("_source_folder"):
-                vals = pd.to_numeric(grp["delta_mag"], errors="coerce")
-                sigma = self.spin_sigma.value()
-                if self.chk_clip.isChecked():
-                    med = np.nanmedian(vals)
-                    mad = np.nanmedian(np.abs(vals - med))
-                    clip_mask = np.abs(vals - med) < sigma * mad * 1.4826
-                else:
-                    clip_mask = np.ones(len(vals), dtype=bool)
-                grp = grp.copy()
-                valid = clip_mask & np.isfinite(vals)
-                if use_linear and valid.sum() >= 3:
-                    t_vals = pd.to_numeric(grp[x_col_for_trend], errors="coerce")
-                    t_c = t_vals[valid].to_numpy()
-                    y_c = vals[valid].to_numpy()
-                    t_mean = t_c.mean()
-                    coeffs = np.polyfit(t_c - t_mean, y_c, 1)
-                    trend = np.polyval(coeffs, t_vals.to_numpy() - t_mean)
-                    # Remove linear trend, keep zero-mean for the clipped subset
-                    residuals = vals.to_numpy() - trend
-                    offset = np.nanmedian(residuals[valid])
-                    grp["delta_mag_corr"] = residuals - offset
-                else:
-                    offset = np.nanmedian(vals[valid])
-                    grp["delta_mag_corr"] = vals - offset
-                corrected_parts.append(grp)
-            df = pd.concat(corrected_parts, ignore_index=True) if corrected_parts else df
-            self.corrected_df = df
-            y_col = "delta_mag_corr"
+    def _refresh_selection_filter_combo(self):
+        self.selection_filter_combo.blockSignals(True)
+        self.selection_filter_combo.clear()
+        for flt in sorted(self.merged_catalogs.keys()):
+            self.selection_filter_combo.addItem(flt)
+        self.selection_filter_combo.blockSignals(False)
+        self._selection_filter_ready = self.selection_filter_combo.count() > 0
+        if self.selection_filter_combo.count():
+            self.selection_filter_combo.setCurrentIndex(0)
+            self._on_selection_filter_changed(0)
         else:
-            self.corrected_df = df
-            y_col = "delta_mag" if "delta_mag" in df.columns else (df.columns[-1] if len(df.columns) else None)
+            self.selection_table.setRowCount(0)
 
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
-
-        x_col = next((c for c in ("BJD_TDB", "JD") if c in df.columns), None)
-        if x_col is None or y_col is None or y_col not in df.columns:
-            ax.text(0.5, 0.5, "플롯할 컬럼 없음", transform=ax.transAxes, ha="center")
-            self.canvas.draw()
-            return
-
-        colors = ["#1565C0", "#C62828", "#2E7D32", "#F57F17", "#6A1B9A", "#00695C"]
-        folders = df["_source_folder"].unique() if "_source_folder" in df.columns else ["all"]
-        for i, folder_name in enumerate(folders):
-            mask = df["_source_folder"] == folder_name if "_source_folder" in df.columns else pd.Series([True] * len(df))
-            sub = df[mask]
-            x = pd.to_numeric(sub[x_col], errors="coerce")
-            y = pd.to_numeric(sub[y_col], errors="coerce")
-            err_col = "delta_mag_err" if "delta_mag_err" in sub.columns else None
-            c = colors[i % len(colors)]
-            if err_col:
-                e = pd.to_numeric(sub[err_col], errors="coerce")
-                ax.errorbar(x, y, yerr=e, fmt="o", color=c, markersize=3,
-                            elinewidth=0.8, capsize=1.5, label=folder_name, alpha=0.8)
+    def _load_selection_defaults_from_base(self):
+        self.selection_target_by_filter = {}
+        self.selection_comp_by_filter = {}
+        self.selection_check_by_filter = {}
+        for flt, df in self.merged_catalogs.items():
+            available = set(coerce_int64_source_id(df["source_id"]).dropna().astype("int64").tolist()) if "source_id" in df.columns else set()
+            payload = self.base_selection_by_filter.get(flt, {})
+            target_sid = payload.get("target_source_id")
+            if target_sid is not None and int(target_sid) in available:
+                self.selection_target_by_filter[flt] = int(target_sid)
             else:
-                ax.scatter(x, y, color=c, s=10, label=folder_name, alpha=0.8)
+                self.selection_target_by_filter[flt] = None
+            comp_sids = set()
+            for sid in payload.get("comparison_source_ids", []):
+                if sid is not None and int(sid) in available:
+                    comp_sids.add(int(sid))
+            self.selection_comp_by_filter[flt] = comp_sids
+            check_sid = payload.get("check_source_id")
+            self.selection_check_by_filter[flt] = int(check_sid) if check_sid is not None and int(check_sid) in available else None
+        self.selection_log.append("[SEL] Base selection loaded.")
+        if self._selection_filter_ready:
+            self._update_selection_table()
 
-        ax.invert_yaxis()
-        ax.set_xlabel(x_col)
-        ax.set_ylabel("Δm (corr)" if y_col == "delta_mag_corr" else "Δm")
-        ax.legend(fontsize=7, loc="best")
-        ax.grid(True, alpha=0.3)
-        self.canvas.draw()
+    def _current_selection_filter(self) -> str | None:
+        if self.selection_filter_combo.count() <= 0:
+            return None
+        return _normalize_filter_key(self.selection_filter_combo.currentText())
 
-    def _export_corrected(self):
-        if self.corrected_df.empty:
-            QMessageBox.information(self, "내보내기", "먼저 플롯을 실행하세요.")
+    def _on_selection_filter_changed(self, index: int):
+        if index < 0:
             return
-        base = self.folders[0]
-        default_path = str(base.parent / f"{base.name}_merged_corrected.csv")
-        path, _ = QFileDialog.getSaveFileName(self, "보정 CSV 내보내기", default_path, "CSV (*.csv)")
-        if path:
-            self.corrected_df.to_csv(path, index=False)
-            QMessageBox.information(self, "저장", f"저장 완료:\n{path}")
+        self._update_selection_table()
 
-    # ── Step navigation ───────────────────────────────
+    def _role_for_sid(self, flt: str, sid: int) -> str:
+        sid = int(sid)
+        if self.selection_target_by_filter.get(flt) == sid:
+            return "T"
+        if sid in self.selection_comp_by_filter.get(flt, set()):
+            return "C"
+        if self.selection_check_by_filter.get(flt) == sid:
+            return "K"
+        return ""
+
+    def _selected_sid_from_table(self) -> int | None:
+        row = self.selection_table.currentRow()
+        if row < 0:
+            return None
+        return self._selection_row_to_sid.get(row)
+
+    def _update_selection_table(self):
+        flt = self._current_selection_filter()
+        if not flt or flt not in self.merged_catalogs:
+            self.selection_table.setRowCount(0)
+            return
+
+        df = self.merged_catalogs[flt].copy()
+        if "ID" in df.columns:
+            df = df.sort_values("ID")
+        self.selection_table.setRowCount(0)
+        self._selection_row_to_sid = {}
+
+        for _, row in df.iterrows():
+            sid_val = coerce_int64_source_id(pd.Series([row.get("source_id")])).iloc[0]
+            if pd.isna(sid_val):
+                continue
+            sid = int(sid_val)
+            row_idx = self.selection_table.rowCount()
+            self.selection_table.insertRow(row_idx)
+            self._selection_row_to_sid[row_idx] = sid
+
+            stable_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
+            gaia_text = "Gaia" if sid > 0 else "Local"
+            gmag = _extract_row_float(row, "gaia_G", "gaia_g")
+            folder_count = int(pd.to_numeric(pd.Series([row.get("folder_count", 1)]), errors="coerce").iloc[0] or 1)
+            note = str(row.get("match_status", ""))
+
+            self.selection_table.setItem(row_idx, 0, QTableWidgetItem(str(int(stable_id)) if np.isfinite(stable_id) else "—"))
+            self.selection_table.setItem(row_idx, 1, QTableWidgetItem(str(sid)))
+            self.selection_table.setItem(row_idx, 2, QTableWidgetItem(gaia_text))
+            self.selection_table.setItem(row_idx, 3, QTableWidgetItem(f"{gmag:.3f}" if np.isfinite(gmag) else "—"))
+            self.selection_table.setItem(row_idx, 4, QTableWidgetItem(str(folder_count)))
+            self.selection_table.setItem(row_idx, 5, QTableWidgetItem(self._role_for_sid(flt, sid)))
+            self.selection_table.setItem(row_idx, 6, QTableWidgetItem(note or ""))
+
+        tgt = self.selection_target_by_filter.get(flt)
+        comps = self.selection_comp_by_filter.get(flt, set())
+        chk = self.selection_check_by_filter.get(flt)
+        self.selection_status_label.setText(
+            f"Filter {flt} | Target={tgt if tgt is not None else '—'} | "
+            f"Comps={len(comps)} | Check={chk if chk is not None else '—'}"
+        )
+
+    def _set_selection_target(self):
+        flt = self._current_selection_filter()
+        sid = self._selected_sid_from_table()
+        if not flt or sid is None:
+            return
+        self.selection_target_by_filter[flt] = int(sid)
+        self.selection_comp_by_filter.setdefault(flt, set()).discard(int(sid))
+        if self.selection_check_by_filter.get(flt) == int(sid):
+            self.selection_check_by_filter[flt] = None
+        self.selection_log.append(f"[SEL] {flt}: target={sid}")
+        self._update_selection_table()
+
+    def _toggle_selection_comp(self):
+        flt = self._current_selection_filter()
+        sid = self._selected_sid_from_table()
+        if not flt or sid is None:
+            return
+        sid = int(sid)
+        if self.selection_target_by_filter.get(flt) == sid:
+            QMessageBox.information(self, "Selection", "Target cannot also be a comparison star.")
+            return
+        comps = self.selection_comp_by_filter.setdefault(flt, set())
+        if sid in comps:
+            comps.remove(sid)
+            action = "removed"
+        else:
+            comps.add(sid)
+            if self.selection_check_by_filter.get(flt) == sid:
+                self.selection_check_by_filter[flt] = None
+            action = "added"
+        self.selection_log.append(f"[SEL] {flt}: comp {action} {sid}")
+        self._update_selection_table()
+
+    def _set_selection_check(self):
+        flt = self._current_selection_filter()
+        sid = self._selected_sid_from_table()
+        if not flt or sid is None:
+            return
+        sid = int(sid)
+        if self.selection_target_by_filter.get(flt) == sid:
+            QMessageBox.information(self, "Selection", "Target cannot also be a check star.")
+            return
+        prev = self.selection_check_by_filter.get(flt)
+        self.selection_check_by_filter[flt] = None if prev == sid else sid
+        self.selection_comp_by_filter.setdefault(flt, set()).discard(sid)
+        self.selection_log.append(f"[SEL] {flt}: check={self.selection_check_by_filter.get(flt)}")
+        self._update_selection_table()
+
+    def _clear_selection_roles(self):
+        flt = self._current_selection_filter()
+        if not flt:
+            return
+        self.selection_target_by_filter[flt] = None
+        self.selection_comp_by_filter[flt] = set()
+        self.selection_check_by_filter[flt] = None
+        self.selection_log.append(f"[SEL] {flt}: cleared")
+        self._update_selection_table()
+
+    # ───────────────────────── merged workspace build ─────────────────────────
+
+    def _selection_to_id_map(self, flt: str, source_ids: set[int]) -> dict[int, int]:
+        df = self.merged_catalogs.get(flt)
+        if df is None or df.empty or "source_id" not in df.columns or "ID" not in df.columns:
+            return {}
+        sid_vals = coerce_int64_source_id(df["source_id"])
+        id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+        out = {}
+        for sid_val, id_val in zip(sid_vals, id_vals):
+            if pd.isna(sid_val) or pd.isna(id_val):
+                continue
+            sid_int = int(sid_val)
+            if sid_int in source_ids:
+                out[sid_int] = int(id_val)
+        return out
+
+    def _write_selection_outputs(self, out_dir: Path):
+        s9 = step9_selection_dir(out_dir)
+        s9.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        for flt, df in self.merged_catalogs.items():
+            if df is None or df.empty:
+                continue
+            df_out = df.copy()
+            target_sid = self.selection_target_by_filter.get(flt)
+            comp_sids = self.selection_comp_by_filter.get(flt, set())
+            check_sid = self.selection_check_by_filter.get(flt)
+
+            def _role(sid):
+                sid = int(sid)
+                if target_sid is not None and sid == int(target_sid):
+                    return "T"
+                if sid in comp_sids:
+                    return "C"
+                if check_sid is not None and sid == int(check_sid):
+                    return "K"
+                return ""
+
+            df_out["role"] = [ _role(int(sid)) for sid in coerce_int64_source_id(df_out["source_id"]).fillna(-999999).astype("int64") ]
+            if "gaia_id" not in df_out.columns:
+                df_out["gaia_id"] = [
+                    int(sid) if int(sid) > 0 else np.nan
+                    for sid in coerce_int64_source_id(df_out["source_id"]).fillna(-999999).astype("int64")
+                ]
+            if "match_status" not in df_out.columns:
+                df_out["match_status"] = [
+                    "matched" if int(sid) > 0 else "no_gaia_match"
+                    for sid in coerce_int64_source_id(df_out["source_id"]).fillna(-999999).astype("int64")
+                ]
+
+            output_cols = ["ID", "x_ref", "y_ref", "ra_deg", "dec_deg", "role", "gaia_id", "match_status"]
+            for col in [
+                "gaia_G", "gaia_BP", "gaia_RP",
+                "gaia_g", "gaia_bp", "gaia_rp", "color_gr",
+                "folder_count", "folder_tags", "source_id",
+            ]:
+                if col in df_out.columns and col not in output_cols:
+                    output_cols.append(col)
+            for col in df_out.columns:
+                if col not in output_cols:
+                    output_cols.append(col)
+            df_out = df_out[[c for c in output_cols if c in df_out.columns]]
+            df_out = df_out.sort_values("ID")
+
+            cat_path = s9 / f"master_catalog_{flt}.tsv"
+            df_out.to_csv(cat_path, sep="\t", index=False, na_rep="NaN", encoding="utf-8-sig")
+
+            id_map_path = s9 / f"id_mapping_{flt}.csv"
+            id_map_df = df_out[[c for c in ["ID", "source_id", "gaia_id", "role", "x_ref", "y_ref"] if c in df_out.columns]].copy()
+            id_map_df.to_csv(id_map_path, index=False, na_rep="NaN")
+
+            sel_sids = set(int(s) for s in comp_sids if s is not None)
+            if target_sid is not None:
+                sel_sids.add(int(target_sid))
+            if check_sid is not None:
+                sel_sids.add(int(check_sid))
+            sid_to_id = self._selection_to_id_map(flt, sel_sids)
+
+            data = {
+                "filter": flt,
+                "target_id": sid_to_id.get(int(target_sid)) if target_sid is not None else None,
+                "target_source_id": int(target_sid) if target_sid is not None else None,
+                "comparison_ids": sorted(int(sid_to_id[sid]) for sid in comp_sids if sid in sid_to_id),
+                "comparison_source_ids": sorted(int(sid) for sid in comp_sids),
+                "check_id": sid_to_id.get(int(check_sid)) if check_sid is not None else None,
+                "check_source_id": int(check_sid) if check_sid is not None else None,
+                "timestamp": stamp,
+            }
+            (s9 / f"selection_{flt}.json").write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _build_merged_workspace(self):
+        if not self.merged_catalogs:
+            QMessageBox.warning(self, "Merged Workspace", "Step 2 ID match를 먼저 실행하세요.")
+            return
+
+        output_dir_text = self.output_dir_edit.text().strip()
+        if not output_dir_text:
+            QMessageBox.warning(self, "Merged Workspace", "출력 폴더를 지정하세요.")
+            return
+
+        out_dir = Path(output_dir_text)
+        s1 = step1_dir(out_dir)
+        s5 = step5_photometry_dir(out_dir)
+        s9 = step9_selection_dir(out_dir)
+        s1.mkdir(parents=True, exist_ok=True)
+        s5.mkdir(parents=True, exist_ok=True)
+        s9.mkdir(parents=True, exist_ok=True)
+        step10_dir(out_dir).mkdir(parents=True, exist_ok=True)
+        step11_dir(out_dir).mkdir(parents=True, exist_ok=True)
+        step12_period_dir(out_dir).mkdir(parents=True, exist_ok=True)
+
+        merged_headers_rows: list[dict] = []
+        merged_index_rows: list[dict] = []
+        merged_night_assignments: dict[str, int] = {}
+        merged_path_map: dict[str, str] = {}
+
+        next_merged_night = 1
+        for folder in self.folders:
+            folder_key = str(folder)
+            folder_tag = self.folder_tags.get(folder_key, folder.name)
+            idx = _read_step5_index(folder)
+            if idx.empty or "file" not in idx.columns:
+                continue
+
+            headers_df = load_headers_table(folder)
+            header_lookup = {}
+            if not headers_df.empty and "Filename" in headers_df.columns:
+                header_lookup = {str(fn): row.to_dict() for fn, row in headers_df.set_index("Filename").iterrows()}
+
+            night_map_raw = load_night_assignments(folder)
+            local_night_ids: dict[str, int] = {}
+            for _, row in idx.iterrows():
+                fname = str(row.get("file", "")).strip()
+                if not fname:
+                    continue
+                night_id = night_map_raw.get(fname)
+                if night_id is None:
+                    nid_val = pd.to_numeric(pd.Series([row.get("night_id")]), errors="coerce").iloc[0]
+                    night_id = int(nid_val) if np.isfinite(nid_val) and int(nid_val) > 0 else 1
+                local_night_ids[fname] = int(night_id)
+
+            local_to_merged: dict[int, int] = {}
+            for local_night in sorted(set(local_night_ids.values())):
+                local_to_merged[local_night] = next_merged_night
+                next_merged_night += 1
+
+            for _, row in idx.iterrows():
+                fname = str(row.get("file", "")).strip()
+                if not fname:
+                    continue
+                flt = _normalize_filter_key(row.get("filter", row.get("FILTER", "")))
+                local_map = self.local_id_maps.get(folder_key, {}).get(flt, {})
+                if not local_map:
+                    continue
+
+                phot_df = load_frame_photometry(folder, fname, flt)
+                if phot_df is None or phot_df.empty or "ID" not in phot_df.columns:
+                    continue
+
+                local_ids = pd.to_numeric(phot_df["ID"], errors="coerce").astype("Int64")
+                phot_df = phot_df.loc[local_ids.notna()].copy()
+                phot_df["ID_local"] = local_ids[local_ids.notna()].astype(int)
+                phot_df = phot_df[phot_df["ID_local"].isin(local_map.keys())].copy()
+                if phot_df.empty:
+                    continue
+
+                phot_df["source_id"] = phot_df["ID_local"].map(lambda lid: int(local_map[int(lid)]["merged_source_id"]))
+                phot_df["ID"] = phot_df["ID_local"].map(lambda lid: int(local_map[int(lid)]["merged_id"]))
+
+                merged_fname = f"{folder_tag}__{fname}"
+                phot_df["file"] = merged_fname
+                phot_df["source_folder"] = folder_tag
+                phot_df["original_file"] = fname
+
+                out_phot_path = s5 / f"{merged_fname}_photometry.tsv"
+                phot_df.to_csv(out_phot_path, sep="\t", index=False, na_rep="NaN")
+
+                merged_path_map[merged_fname] = ""
+                merged_night_id = local_to_merged.get(local_night_ids.get(fname, 1), 1)
+                merged_night_assignments[merged_fname] = merged_night_id
+
+                row_dict = row.to_dict()
+                row_dict["file"] = merged_fname
+                row_dict["filter"] = flt
+                row_dict["night_id"] = merged_night_id
+                row_dict["source_folder"] = folder_tag
+                row_dict["original_file"] = fname
+                row_dict["path"] = str(out_phot_path)
+                merged_index_rows.append(row_dict)
+
+                header_row = header_lookup.get(fname, {}).copy()
+                if not header_row:
+                    header_row = {"Filename": merged_fname, "FILTER": flt}
+                else:
+                    header_row["Filename"] = merged_fname
+                header_row["SourceFolder"] = folder_tag
+                header_row["OriginalFilename"] = fname
+                merged_headers_rows.append(header_row)
+
+        if not merged_index_rows:
+            QMessageBox.warning(self, "Merged Workspace", "병합 가능한 Step 5 photometry rows를 만들지 못했습니다.")
+            return
+
+        pd.DataFrame(merged_index_rows).to_csv(s5 / "photometry_index.csv", index=False)
+        if merged_headers_rows:
+            pd.DataFrame(merged_headers_rows).drop_duplicates(subset=["Filename"], keep="first").to_csv(s1 / "headers.csv", index=False)
+        (s1 / "night_assignments.json").write_text(
+            json.dumps({"night_assignments": merged_night_assignments}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self._write_selection_outputs(out_dir)
+
+        manifest = {
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "input_folders": [str(p) for p in self.folders],
+            "folder_tags": self.folder_tags,
+            "filters": sorted(self.merged_catalogs.keys()),
+            "merged_result_dir": str(out_dir),
+            "records": len(self.match_records),
+        }
+        (out_dir / "merge_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        pd.DataFrame(self.match_records).to_csv(out_dir / "merge_id_map.csv", index=False)
+
+        self.merged_result_dir = out_dir
+        self._build_merged_runtime_context(merged_night_assignments, merged_path_map)
+        self._refresh_runtime_status_labels()
+        self.selection_log.append(f"[BUILD] merged workspace ready: {out_dir}")
+        QMessageBox.information(self, "Merged Workspace", f"생성 완료:\n{out_dir}")
+        self._go_to_step(3)
+
+    def _build_merged_runtime_context(self, night_assignments: dict[str, int], path_map: dict[str, str]):
+        if self.merged_result_dir is None:
+            return
+        out_dir = Path(self.merged_result_dir)
+        self.merged_runtime_params = _MergedParamsProxy(self.params, out_dir)
+        idx = _read_step5_index(out_dir)
+        filenames = idx["file"].astype(str).tolist() if not idx.empty and "file" in idx.columns else []
+        self.merged_runtime_file_manager = _MergedFileManagerProxy(filenames, night_assignments, path_map)
+        self.merged_runtime_project_state = ProjectState(out_dir)
+        self.merged_runtime_project_state.state["completed_steps"] = sorted(set(range(9)))
+        self.merged_runtime_project_state.state["current_step"] = 9
+        self.merged_runtime_project_state.save()
+
+    # ───────────────────────── child workflow launch ─────────────────────────
+
+    def _refresh_runtime_status_labels(self):
+        merged_dir = self.merged_result_dir
+        if merged_dir is None:
+            self.step10_status_label.setText("Merged workspace 없음")
+            self.step11_status_label.setText("Merged workspace 없음")
+            self.step12_status_label.setText("Merged workspace 없음")
+            return
+
+        s10 = step10_dir(merged_dir)
+        s11 = step11_dir(merged_dir)
+        s12 = step12_period_dir(merged_dir)
+
+        s10_ready = bool(list(s10.glob("lightcurve_ID*_raw.csv"))) or bool(list(s10.glob("comp_selection.json")))
+        s11_ready = bool(list(s11.glob("lightcurve_ID*_current.csv"))) or bool(list(s11.glob("lightcurve_ID*_global.csv")))
+        s12_ready = bool(list(s12.glob("period_analysis_*_ID*.json")))
+
+        self.step10_status_label.setText(
+            f"Workspace: {merged_dir}\nStep10 outputs: {'있음' if s10_ready else '없음'}"
+        )
+        self.step11_status_label.setText(
+            f"Workspace: {merged_dir}\nStep11 outputs: {'있음' if s11_ready else '없음'}"
+        )
+        self.step12_status_label.setText(
+            f"Workspace: {merged_dir}\nStep12 outputs: {'있음' if s12_ready else '없음'}"
+        )
+
+    def on_step_completed(self, step_index: int):
+        self._refresh_runtime_status_labels()
+
+    def open_step(self, step_index: int):
+        if step_index <= 8:
+            # Return to merger selection page.
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self._go_to_step(2)
+            return
+
+        if self.merged_result_dir is None:
+            QMessageBox.warning(self, "Merged Workflow", "Merged workspace를 먼저 생성하세요.")
+            return
+        if self.merged_runtime_params is None or self.merged_runtime_project_state is None:
+            QMessageBox.warning(self, "Merged Workflow", "Merged runtime context 초기화 실패")
+            return
+
+        if self.current_step_window is not None and self.current_step_window.isVisible():
+            self.current_step_window.close()
+
+        if step_index == 9:
+            from .step10_light_curve_builder import LightCurveBuilderWindow
+            self.current_step_window = LightCurveBuilderWindow(
+                self.merged_runtime_params,
+                self.merged_runtime_file_manager,
+                self.merged_runtime_project_state,
+                self,
+            )
+        elif step_index == 10:
+            from .step11_detrend_merge import DetrendNightMergeWindow
+            self.current_step_window = DetrendNightMergeWindow(
+                self.merged_runtime_params,
+                self.merged_runtime_file_manager,
+                self.merged_runtime_project_state,
+                self,
+            )
+        elif step_index == 11:
+            from .step12_period_analysis import PeriodAnalysisWindow
+            self.current_step_window = PeriodAnalysisWindow(
+                self.merged_runtime_params,
+                self.merged_runtime_file_manager,
+                self.merged_runtime_project_state,
+                self,
+            )
+        else:
+            return
+
+        self.current_step_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.current_step_window.show()
+        self.current_step_window.raise_()
+        self.current_step_window.activateWindow()
+
+    # ───────────────────────── navigation ─────────────────────────
 
     def _go_to_step(self, idx: int):
         for i, (page, btn) in enumerate(zip(self._pages, self._step_btns)):
@@ -874,28 +1397,31 @@ class MultiNightMergerWindow(QMainWindow):
         self._current_step = idx
         self.btn_prev.setEnabled(idx > 0)
         self.btn_next.setEnabled(idx < len(self._pages) - 1)
-        # Auto-actions on entering steps
-        if idx == 3 and not self.merged_df.empty:
-            self._populate_filter_combo()
-
-    def _populate_filter_combo(self):
-        self.filter_combo.clear()
-        self.filter_combo.addItem("All")
-        if "filter" in self.merged_df.columns:
-            for f in sorted(self.merged_df["filter"].dropna().unique()):
-                self.filter_combo.addItem(f)
+        if idx >= 3:
+            self._refresh_runtime_status_labels()
 
     def _prev_step(self):
         if self._current_step > 0:
             self._go_to_step(self._current_step - 1)
 
     def _next_step(self):
+        if self._current_step == 0 and not self.folders:
+            QMessageBox.warning(self, "Merger", "폴더를 먼저 선택하세요.")
+            return
+        if self._current_step == 1 and not self.merged_catalogs:
+            QMessageBox.warning(self, "Merger", "Step 2 ID 매칭을 먼저 실행하세요.")
+            return
+        if self._current_step == 2 and self.merged_result_dir is None:
+            QMessageBox.warning(self, "Merger", "Merged workspace를 먼저 생성하세요.")
+            return
         if self._current_step < len(self._pages) - 1:
             self._go_to_step(self._current_step + 1)
 
-    # ── Back to main ─────────────────────────────────
+    # ───────────────────────── back ─────────────────────────
 
     def _go_back(self):
+        if self.current_step_window is not None and self.current_step_window.isVisible():
+            self.current_step_window.close()
         self.hide()
         self.main_window.show()
         self.main_window.raise_()
@@ -903,4 +1429,4 @@ class MultiNightMergerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._go_back()
-        event.ignore()  # Don't destroy, just hide
+        event.ignore()

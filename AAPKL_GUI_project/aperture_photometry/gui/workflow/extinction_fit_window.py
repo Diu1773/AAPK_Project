@@ -35,22 +35,19 @@ from ...utils.photometry_utils import (
     MAD_TO_SIGMA,
 )
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
+from ...utils.photometry_loader import load_frame_photometry
 from ...utils.qc_utils import load_frame_excludes as _load_frame_excludes
 from ...utils.step_paths import (
     step2_cropped_dir,
     step4_dir,
-    step5_dir,
-    step6_dir,
-    step7_dir,
-    step9_dir,
+    step5_photometry_dir,
+    step6_wcs_dir,
+    step7_refbuild_dir,
+    step8_idmatch_dir,
     step10_dir,
     legacy_step11_extinction_dir,
     tool_extinction_dir,
     crop_is_active,
-    legacy_step5_refbuild_dir,
-    legacy_step6_idmatch_dir,
-    legacy_step7_wcs_dir,
-    legacy_step7_refbuild_dir,
 )
 
 
@@ -490,27 +487,21 @@ class ExtinctionFitWorker(QThread):
     def _resolve_idmatch(result_dir: Path, fname: str) -> Path | None:
         """Locate idmatch_{fname}.csv from step 7."""
         import re
-        s7 = step7_dir(result_dir)
+        s8 = step8_idmatch_dir(result_dir)
         # date-keyed subdirectory
         m = re.search(r"(20\d{6})", str(fname))
         if m:
-            dated = s7 / m.group(1) / f"idmatch_{fname}.csv"
+            dated = s8 / m.group(1) / f"idmatch_{fname}.csv"
             if dated.exists():
                 return dated
-        direct = s7 / f"idmatch_{fname}.csv"
+        direct = s8 / f"idmatch_{fname}.csv"
         if direct.exists():
             return direct
         # glob fallback
-        hits = list(s7.glob(f"*/idmatch_{fname}.csv"))
+        hits = list(s8.glob(f"*/idmatch_{fname}.csv"))
         if hits:
             return hits[0]
-        # legacy step6_idmatch
-        leg = legacy_step6_idmatch_dir(result_dir)
-        lp = leg / f"idmatch_{fname}.csv"
-        if lp.exists():
-            return lp
-        hits2 = list(leg.glob(f"*/idmatch_{fname}.csv"))
-        return hits2[0] if hits2 else None
+        return None
 
     @staticmethod
     def _load_fwhm_meta(cache_dir: Path, fname: str, default: float = 6.0) -> float:
@@ -558,9 +549,7 @@ class ExtinctionFitWorker(QThread):
         file_list = []
         filter_map: dict[str, str] = {}
 
-        idx_path = step9_dir(result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
         if idx_path.exists():
             idx = pd.read_csv(idx_path)
             if "file" in idx.columns:
@@ -570,10 +559,10 @@ class ExtinctionFitWorker(QThread):
                     filter_map[str(r["file"])] = str(r["filter"]).strip().lower()
 
         if not file_list:
-            # Fall back: scan idmatch files from step7
-            s7 = step7_dir(result_dir)
-            if s7.exists():
-                for p in sorted(s7.rglob("idmatch_*.csv")):
+            # Fall back: scan idmatch files from step8
+            s8 = step8_idmatch_dir(result_dir)
+            if s8.exists():
+                for p in sorted(s8.rglob("idmatch_*.csv")):
                     fname = p.stem.replace("idmatch_", "")
                     if fname not in file_list:
                         file_list.append(fname)
@@ -585,8 +574,7 @@ class ExtinctionFitWorker(QThread):
 
         # Load frame quality if available (step 4/5 QC)
         qc_exclude: set[str] = set()
-        for qp in [step5_dir(result_dir) / "frame_quality.csv",
-                    legacy_step7_wcs_dir(result_dir) / "frame_quality.csv",
+        for qp in [step5_photometry_dir(result_dir) / "frame_quality.csv",
                     result_dir / "frame_quality.csv"]:
             if qp.exists():
                 try:
@@ -1494,22 +1482,10 @@ class ExtinctionFitWorker(QThread):
             P = self.params.P
             result_dir = self.result_dir
 
-            idx_candidates = [
-                step9_dir(result_dir) / "photometry_index.csv",
-                result_dir / "photometry_index.csv",
-                result_dir / "phot_index.csv",
-                result_dir / "phot" / "photometry_index.csv",
-                result_dir / "phot" / "phot_index.csv",
-            ]
-            idx_path = next((p for p in idx_candidates if p.exists()), None)
-            if idx_path is None:
+            idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
+            if not idx_path.exists():
                 raise FileNotFoundError("photometry index csv not found")
             idx = pd.read_csv(idx_path)
-            if "path" not in idx.columns:
-                for cand in ("phot_tsv", "tsv", "out", "output"):
-                    if cand in idx.columns:
-                        idx = idx.rename(columns={cand: "path"})
-                        break
             if "file" not in idx.columns:
                 for cand in ("fname", "frame", "image", "fits", "name"):
                     if cand in idx.columns:
@@ -1535,16 +1511,14 @@ class ExtinctionFitWorker(QThread):
                 if self._stop_requested:
                     self.finished.emit({"stopped": True})
                     return
-                p = r.get("path", "")
-                p = str(p) if p is not None else ""
-                if p.strip() == "":
+                fname = str(r.get("file", "") or "").strip()
+                if not fname:
                     continue
-                tsv = step9_dir(self.result_dir) / p
-                if not tsv.exists():
-                    tsv = self.result_dir / p
-                if not tsv.exists():
+                filt_hint = str(r.get("filter", "") or "").strip().lower()
+                dfp = load_frame_photometry(result_dir, fname, filt_hint)
+                if dfp is None or dfp.empty:
                     continue
-                dfp = pd.read_csv(tsv, sep="\t")
+                dfp = dfp.copy()
                 mag_col = None
                 for cand in ("mag_inst", "mag", "mag_ap", "mag_apcorr"):
                     if cand in dfp.columns:
@@ -1561,15 +1535,27 @@ class ExtinctionFitWorker(QThread):
                     dfp["mag_err"] = np.nan
                     err_col = "mag_err"
                 snr_col = "snr" if "snr" in dfp.columns else None
-                tmp = dfp[["ID", "FILTER", mag_col, err_col] + ([snr_col] if snr_col else [])].copy()
+                if "FILTER" not in dfp.columns:
+                    if "filter" in dfp.columns:
+                        dfp["FILTER"] = dfp["filter"]
+                    else:
+                        dfp["FILTER"] = filt_hint
+                keep_cols = ["ID", "FILTER", mag_col, err_col]
+                if "source_id" in dfp.columns:
+                    keep_cols.append("source_id")
+                if snr_col:
+                    keep_cols.append(snr_col)
+                if "ID" not in dfp.columns:
+                    continue
+                tmp = dfp[keep_cols].copy()
                 tmp = tmp.rename(columns={mag_col: "mag_inst", err_col: "mag_err"})
                 if snr_col is None:
                     tmp["snr"] = np.nan
                 else:
                     tmp = tmp.rename(columns={snr_col: "snr"})
-                tmp["file"] = str(r.get("file", ""))
+                tmp["file"] = fname
                 rows.append(tmp)
-                self.progress.emit(i + 1, total, str(r.get("file", "")))
+                self.progress.emit(i + 1, total, fname)
 
             if not rows:
                 raise RuntimeError("No photometry data found")
@@ -1592,13 +1578,7 @@ class ExtinctionFitWorker(QThread):
             wide_snr.columns = [f"snr_{c}" for c in wide_snr.columns]
             wide = pd.concat([wide_mag, wide_snr], axis=1).reset_index()
 
-            master_path = step6_dir(result_dir) / "ref_catalog.tsv"
-            if not master_path.exists():
-                master_path = legacy_step5_refbuild_dir(result_dir) / "ref_catalog.tsv"
-            if not master_path.exists():
-                master_path = legacy_step7_refbuild_dir(result_dir) / "master_catalog.tsv"
-            if not master_path.exists():
-                master_path = result_dir / "master_catalog.tsv"
+            master_path = step7_refbuild_dir(result_dir) / "ref_catalog.tsv"
             if not master_path.exists():
                 raise FileNotFoundError("master_catalog.tsv missing")
             master = pd.read_csv(master_path, sep="\t")
@@ -1635,11 +1615,7 @@ class ExtinctionFitWorker(QThread):
                 src_sid = coerce_int64_source_id(df["source_id"])
                 df = df.loc[src_sid.notna()].copy()
                 df["source_id"] = src_sid[src_sid.notna()].astype("int64")
-                gaia_path = step5_dir(result_dir) / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    gaia_path = legacy_step7_wcs_dir(result_dir) / "gaia_fov.ecsv"
-                if not gaia_path.exists():
-                    gaia_path = result_dir / "gaia_fov.ecsv"
+                gaia_path = step6_wcs_dir(result_dir) / "gaia_fov.ecsv"
                 if not gaia_path.exists():
                     raise RuntimeError("gaia_fov.ecsv not found")
                 t_gaia = Table.read(gaia_path, format="ascii.ecsv")

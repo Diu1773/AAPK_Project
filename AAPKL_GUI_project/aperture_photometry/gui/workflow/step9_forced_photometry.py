@@ -1,5 +1,5 @@
 """
-Step 9: Aperture Photometry (per-frame ID-matched XY positions)
+Step 5: Full Aperture Photometry (all detected sources per frame)
 Ported from AAPKI_GUI.ipynb Cell 12 (GUI adaptation).
 
 Features:
@@ -39,60 +39,20 @@ from .aperture_photometry_worker import ApertureWorker
 from .aperture_overlay_tab import ApertureOverlayWindow
 from ...utils.step_paths import (
     step2_cropped_dir,
+    step4_dir,
     step5_dir,
-    step6_dir,
-    step7_dir,
-    step9_dir,
+    step5_photometry_dir,
     crop_is_active,
-    legacy_step5_refbuild_dir,
-    legacy_step6_idmatch_dir,
-    legacy_step7_wcs_dir,
-    legacy_step7_refbuild_dir,
 )
 from ...utils.constants import get_parallel_workers
 from ...utils.header_cache import HeaderCache
-from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key
+from ...utils.common_helpers import safe_float as _safe_float
 from ...utils.qc_utils import filter_files_by_qc, filter_files_by_wcs_qc
-from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.photometry_utils import (
     circle_mask as _circle_mask,
     refine_local_centroid as _refine_local_centroid,
     phot_one_star as _phot_one_target,
 )
-
-
-_DATE_RE = re.compile(r"(20\d{6})")
-
-
-def _extract_date_key(filename: str) -> str:
-    match = _DATE_RE.search(str(filename))
-    return match.group(1) if match else ""
-
-
-def _resolve_idmatch_path(result_dir: Path, cache_dir: Path, fname: str) -> Path:
-    step7_out = step7_dir(result_dir)
-    date_key = _extract_date_key(fname)
-    if date_key:
-        dated = step7_out / date_key / f"idmatch_{fname}.csv"
-        if dated.exists():
-            return dated
-    direct = step7_out / f"idmatch_{fname}.csv"
-    if direct.exists():
-        return direct
-    matches = list(step7_out.glob(f"*/idmatch_{fname}.csv"))
-    if matches:
-        return matches[0]
-    legacy_dir = legacy_step6_idmatch_dir(result_dir)
-    legacy_path = legacy_dir / f"idmatch_{fname}.csv"
-    if legacy_path.exists():
-        return legacy_path
-    legacy_matches = list(legacy_dir.glob(f"*/idmatch_{fname}.csv"))
-    if legacy_matches:
-        return legacy_matches[0]
-    cache_path = Path(cache_dir) / "idmatch" / f"idmatch_{fname}.csv"
-    if cache_path.exists():
-        return cache_path
-    return direct
 
 
 def _as_bool(x, default=False):
@@ -202,115 +162,53 @@ class ForcedPhotometryWorker(QThread):
         P = self.params.P
         try:
             result_dir = self.result_dir
-            output_dir = step9_dir(result_dir)
+            output_dir = step5_dir(result_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             cache_dir = self.cache_dir
 
-            # Step 8 selection 로드 (final ID map 사용)
-            step8_dir = result_dir / "step8_selection"
-            target_sids = {}  # filter -> target source_id
-            comp_sids = {}    # filter -> set of comparison source_ids
-            check_sids = {}   # filter -> check source_id
-            selected_sids_by_filter: dict[str, set[int]] = {}
-            all_source_ids = set()
-            final_id_maps: dict[str, dict[int, int]] = {}
-
-            def _load_step8_final_maps(step8_path: Path) -> dict[str, dict[int, int]]:
-                maps: dict[str, dict[int, int]] = {}
-                if not step8_path.exists():
-                    return maps
-                for mp in step8_path.glob("master_catalog_*.tsv"):
-                    flt = _normalize_filter_key(mp.stem.replace("master_catalog_", ""))
-                    if not flt:
-                        continue
-                    try:
-                        df = read_csv_int64_source_id(mp, sep="\t")
-                        if {"source_id", "ID"} <= set(df.columns):
-                            sid = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
-                            fid = pd.to_numeric(df["ID"], errors="coerce").dropna().astype("int64")
-                            maps[flt] = dict(zip(sid.tolist(), fid.tolist()))
-                    except Exception:
-                        continue
-                return maps
-
-            if step8_dir.exists():
-                final_id_maps = _load_step8_final_maps(step8_dir)
-                for sel_file in step8_dir.glob("selection_*.json"):
-                    try:
-                        with open(sel_file, "r", encoding="utf-8") as f:
-                            sel = json.load(f)
-                        flt = _normalize_filter_key(sel.get("filter", sel_file.stem.replace("selection_", "")))
-                        if not flt:
+            # Full photometry: load ALL detected sources from step4
+            def _load_frame_detections(fname):
+                """Load ALL detected sources from step4 detection CSV."""
+                for det_path in (
+                    cache_dir / f"detect_{fname}.csv",
+                    step4_dir(result_dir) / f"detect_{fname}.csv",
+                    result_dir / f"detect_{fname}.csv",
+                ):
+                    if det_path.exists():
+                        try:
+                            df = pd.read_csv(det_path)
+                            x_col = "x" if "x" in df.columns else ("xcenter" if "xcenter" in df.columns else None)
+                            y_col = "y" if "y" in df.columns else ("ycenter" if "ycenter" in df.columns else None)
+                            if x_col is None or y_col is None:
+                                continue
+                            out = pd.DataFrame({
+                                "x": pd.to_numeric(df[x_col], errors="coerce"),
+                                "y": pd.to_numeric(df[y_col], errors="coerce"),
+                            })
+                            if "det_uid" in df.columns:
+                                out["det_uid"] = df["det_uid"]
+                            else:
+                                out["det_uid"] = range(len(df))
+                            return out.dropna(subset=["x", "y"])
+                        except Exception:
                             continue
-                        tid = sel.get("target_source_id")
-                        cids = sel.get("comparison_source_ids", [])
-                        check_sid = sel.get("check_source_id")
-                        if tid is not None:
-                            target_sids[flt] = int(tid)
-                            all_source_ids.add(int(tid))
-                        comp_sids[flt] = set(int(c) for c in cids if c is not None)
-                        all_source_ids.update(comp_sids[flt])
-                        if check_sid is not None:
-                            check_sids[flt] = int(check_sid)
-                            all_source_ids.add(int(check_sid))
-                        selected = set(comp_sids[flt])
-                        if tid is not None:
-                            selected.add(int(tid))
-                        if check_sid is not None:
-                            selected.add(int(check_sid))
-                        if selected:
-                            selected_sids_by_filter[flt] = selected
-                    except Exception as e:
-                        self._log(f"[WARN] Failed to load {sel_file.name}: {e}")
-
-            if not all_source_ids:
-                raise RuntimeError("No targets/comparisons/check stars found. Complete Step 8 first.")
-
-            self._log(
-                f"Loaded {len(target_sids)} target(s), "
-                f"{sum(len(v) for v in comp_sids.values())} comparison(s), "
-                f"{len(check_sids)} check star(s) from Step 8"
-            )
-            self._log(f"Target source_ids: {target_sids}")
-            self._log(f"All source_ids to photometer: {sorted(all_source_ids)}")
-
-            # final ID map per filter
-            sid2id_by_filter: dict[str, dict[int, int]] = {}
-            for flt, sids in selected_sids_by_filter.items():
-                fmap = final_id_maps.get(flt, {})
-                if fmap:
-                    sid2id_map = {sid: fmap.get(sid) for sid in sids if sid in fmap}
-                    missing = sorted(set(sids) - set(sid2id_map))
-                    if missing:
-                        self._log(f"[WARN] Missing final IDs in Step8 master ({flt}): {missing[:5]}...")
-                else:
-                    sid2id_map = {}
-                if not sid2id_map:
-                    # fallback: sequential per-filter IDs
-                    sorted_sids = sorted(sids)
-                    sid2id_map = {sid: idx + 1 for idx, sid in enumerate(sorted_sids)}
-                    if not fmap:
-                        self._log(f"[WARN] Step8 master missing for '{flt}'. Using fallback IDs.")
-                sid2id_by_filter[flt] = sid2id_map
-
-            # master catalog compatibility file (for caching/deps)
-            master_rows = []
-            for flt, sid2id_map in sid2id_by_filter.items():
-                for sid, fid in sorted(sid2id_map.items(), key=lambda x: x[1]):
-                    master_rows.append({"filter": flt, "source_id": int(sid), "ID": int(fid)})
-            master_path = output_dir / "pseudo_master.csv"
-            if master_rows:
-                try:
-                    pd.DataFrame(master_rows).to_csv(master_path, index=False)
-                except Exception as e:
-                    self._log(f"[WARN] Failed to write pseudo master: {e}")
+                return pd.DataFrame(columns=["det_uid", "x", "y"])
 
             ap_mode = str(getattr(P, "aperture_mode", getattr(P, "ap_mode", "apcorr"))).strip().lower()
+            use_apcorr_results = bool(getattr(P, "phot_use_apcorr_results", True))
             resume = bool(getattr(P, "resume_mode", True))
             force_rephot = bool(getattr(P, "force_rephot", False))
 
             GAIN = float(getattr(P, "gain_e_per_adu", 0.1))
             ZP = float(getattr(P, "zp_initial", 25.0))
+            ap_scale = float(getattr(P, "phot_aperture_scale", 1.0))
+            ann_in_scale = float(getattr(P, "fitsky_annulus_scale", 4.0))
+            ann_out_scale = float(getattr(P, "fitsky_dannulus_scale", 2.0))
+            ann_gap = float(getattr(P, "annulus_min_gap_px", 6.0))
+            min_r_ap_px = float(getattr(P, "min_r_ap_px", 4.0))
+            fwhm_px_min = float(getattr(P, "fwhm_px_min", 3.5))
+            fwhm_px_max = float(getattr(P, "fwhm_px_max", 8.0))
+            fwhm_guess = float(getattr(P, "fwhm_pix_guess", 6.0))
             ann_sigma = float(getattr(P, "annulus_sigma_clip", 3.0))
             ann_maxiter = int(getattr(P, "fitsky_max_iter", 5))
             neigh_scale = float(getattr(P, "annulus_neighbor_mask_scale", 1.3))
@@ -328,40 +226,34 @@ class ForcedPhotometryWorker(QThread):
             min_n_sky_for_local = int(getattr(P, "sky_sigma_min_n_sky", 50))
 
             self._log(
-                "Start forced photometry | "
+                "Start full photometry | "
                 f"frames={len(self.file_list)} | resume={resume} | force_rephot={force_rephot} | "
-                f"ap_mode={ap_mode} | ZP={ZP} (ADU/sec) | gain={GAIN} e-/ADU | "
+                f"ap_mode={ap_mode} | use_apcorr_results={use_apcorr_results} | "
+                f"ZP={ZP} (ADU/sec) | gain={GAIN} e-/ADU | "
                 f"min_snr={min_snr_for_mag} | use_cropped={self.use_cropped}"
             )
 
             ap_path = output_dir / "aperture_by_frame.csv"
-            if not ap_path.exists():
-                legacy_ap = result_dir / "aperture_by_frame.csv"
-                if legacy_ap.exists():
-                    ap_path = legacy_ap
             apcorr_path = output_dir / "apcorr_summary.csv"
-            if not apcorr_path.exists():
-                legacy_apcorr = result_dir / "apcorr_summary.csv"
-                if legacy_apcorr.exists():
-                    apcorr_path = legacy_apcorr
 
             apcorr_cand_path = output_dir / "apcorr_candidates.csv"
-            if not apcorr_cand_path.exists():
-                legacy_apcorr_cand = result_dir / "apcorr_candidates.csv"
-                if legacy_apcorr_cand.exists():
-                    apcorr_cand_path = legacy_apcorr_cand
 
-            if not ap_path.exists():
-                self._log("[WARN] aperture_by_frame.csv not found. Run Apcorr first.")
-                self.error.emit("MISSING_APCORR", "aperture_by_frame.csv not found. Run Apcorr first.")
+            if use_apcorr_results and not ap_path.exists():
+                self._log("[WARN] aperture_by_frame.csv not found. Run Apcorr first or disable 'Use Apcorr results'.")
+                self.error.emit("MISSING_APCORR", "aperture_by_frame.csv not found. Run Apcorr first or disable 'Use Apcorr results'.")
                 self.finished.emit({})
                 return
 
-            # Re-resolve to prefer newly generated Step9 outputs.
-            ap_path = output_dir / "aperture_by_frame.csv" if (output_dir / "aperture_by_frame.csv").exists() else ap_path
-            apcorr_path = output_dir / "apcorr_summary.csv" if (output_dir / "apcorr_summary.csv").exists() else apcorr_path
-            df_ap = pd.read_csv(ap_path)
-            apcorr_df = pd.read_csv(apcorr_path) if apcorr_path.exists() else None
+            if use_apcorr_results:
+                # Re-resolve to prefer newly generated Step5 outputs.
+                ap_path = output_dir / "aperture_by_frame.csv" if (output_dir / "aperture_by_frame.csv").exists() else ap_path
+                apcorr_path = output_dir / "apcorr_summary.csv" if (output_dir / "apcorr_summary.csv").exists() else apcorr_path
+                df_ap = pd.read_csv(ap_path)
+                apcorr_df = pd.read_csv(apcorr_path) if apcorr_path.exists() else None
+            else:
+                df_ap = pd.DataFrame()
+                apcorr_df = None
+                self._log("[APCORR] disabled for photometry: using per-frame FWHM-scaled default apertures")
 
             # ── apcorr 요약 로그 ──────────────────────────────────────────────
             if apcorr_df is not None and not apcorr_df.empty:
@@ -397,38 +289,15 @@ class ForcedPhotometryWorker(QThread):
                 self._log(f"[APCORR] apcorr_summary.csv 없음 ({apcorr_path})")
             # ─────────────────────────────────────────────────────────────────
 
-            # source_id -> final ID 매핑 (Step 8 master 기반)
-            df_frame_map = None  # Reference Build 없이 동작 - idmatch_df에서 직접 좌표 읽음
-
-            # Reference Build 파일이 있으면 추가로 로드 (선택사항)
-            frame_map_path = step6_dir(result_dir) / "frame_sourceid_to_ID.tsv"
-            if not frame_map_path.exists():
-                frame_map_path = legacy_step5_refbuild_dir(result_dir) / "frame_sourceid_to_ID.tsv"
-            if not frame_map_path.exists():
-                frame_map_path = legacy_step7_refbuild_dir(result_dir) / "frame_sourceid_to_ID.tsv"
-            if not frame_map_path.exists():
-                frame_map_path = result_dir / "frame_sourceid_to_ID.tsv"
-            if frame_map_path.exists():
-                try:
-                    df_frame_map = pd.read_csv(frame_map_path, sep="\t")
-                except Exception:
-                    df_frame_map = None
-
             # sky sigma
             _sky_df = None
             _sky_src = None
             sky_csv = output_dir / "frame_sky_sigma.csv"
-            if not sky_csv.exists():
-                legacy_sky = result_dir / "frame_sky_sigma.csv"
-                if legacy_sky.exists():
-                    sky_csv = legacy_sky
             if sky_csv.exists():
                 _sky_df = pd.read_csv(sky_csv)
                 _sky_src = "frame_sky_sigma.csv"
             else:
-                fq_path = step5_dir(result_dir) / "frame_quality.csv"
-                if not fq_path.exists():
-                    fq_path = legacy_step7_wcs_dir(result_dir) / "frame_quality.csv"
+                fq_path = step5_photometry_dir(result_dir) / "frame_quality.csv"
                 if not fq_path.exists():
                     fq_path = result_dir / "frame_quality.csv"
                 if fq_path.exists():
@@ -464,68 +333,23 @@ class ForcedPhotometryWorker(QThread):
                         return c
                 return None
 
-            # Pre-index df_frame_map by filename (avoid repeated .astype(str) per frame)
-            _frame_map_index = {}
-            _fm_c_file = _fm_c_id = _fm_c_sid = _fm_c_x = _fm_c_y = _fm_c_sep = None
-            if df_frame_map is not None and not df_frame_map.empty:
-                _fm_cols = df_frame_map.columns
-                _fm_c_file = _pick_col(_fm_cols, ["file", "fname", "frame"])
-                _fm_c_id = _pick_col(_fm_cols, ["ID", "id"])
-                _fm_c_sid = _pick_col(_fm_cols, ["source_id", "sourceid", "sid"])
-                _fm_c_x = _pick_col(_fm_cols, ["x", "x_det", "x_pix", "x0"])
-                _fm_c_y = _pick_col(_fm_cols, ["y", "y_det", "y_pix", "y0"])
-                _fm_c_sep = _pick_col(_fm_cols, ["sep_arcsec", "sep", "dist_arcsec"])
-                if _fm_c_file and _fm_c_x and _fm_c_y:
-                    for fn, grp in df_frame_map.groupby(df_frame_map[_fm_c_file].astype(str)):
-                        _frame_map_index[str(fn)] = grp
-
-            def _load_frame_targets(fname, filt_key: str):
-                sid2id_map = sid2id_by_filter.get(filt_key, {})
-                if _frame_map_index:
-                    sub = _frame_map_index.get(fname)
-                    if sub is not None and len(sub):
-                        if not _fm_c_sid:
-                            return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
-                        out = pd.DataFrame({
-                            "x": pd.to_numeric(sub[_fm_c_x], errors="coerce"),
-                            "y": pd.to_numeric(sub[_fm_c_y], errors="coerce"),
-                        })
-                        out["source_id"] = coerce_int64_source_id(sub[_fm_c_sid])
-                        if sid2id_map:
-                            out["ID"] = out["source_id"].map(sid2id_map).astype("Int64")
-                        if "ID" not in out.columns and _fm_c_id and not sid2id_map:
-                            out["ID"] = pd.to_numeric(sub[_fm_c_id], errors="coerce").astype("Int64")
-                        if _fm_c_sep:
-                            out["sep_arcsec"] = pd.to_numeric(sub[_fm_c_sep], errors="coerce")
-                        out = out.dropna(subset=["ID", "x", "y"])
-                        return out[["ID", "x", "y", "source_id"]]
-
-                # fallback: idmatch CSV + master map
-                p = _resolve_idmatch_path(result_dir, cache_dir, fname)
-                if p.exists():
+            def _load_fwhm_for_frame(fname):
+                for meta_path in (
+                    cache_dir / f"detect_{fname}.json",
+                    step4_dir(result_dir) / f"detect_{fname}.json",
+                    result_dir / f"detect_{fname}.json",
+                ):
+                    if not meta_path.exists():
+                        continue
                     try:
-                        df = read_csv_int64_source_id(p)
-                        if {"source_id", "x", "y"} <= set(df.columns):
-                            if not sid2id_map:
-                                return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
-                            # 매칭 전 source_id 개수
-                            n_before = len(df)
-                            df["ID"] = df["source_id"].map(sid2id_map)
-                            df = df.dropna(subset=["ID", "x", "y"])
-                            # 첫 프레임만 로그
-                            if not hasattr(self, '_logged_first_frame'):
-                                self._log(f"[DEBUG] First frame {fname}: {n_before} detections, {len(df)} matched to selection")
-                                if len(df) > 0:
-                                    self._log(f"[DEBUG] Matched source_ids: {df['source_id'].tolist()[:10]}...")
-                                self._logged_first_frame = True
-                            return df[["ID", "x", "y", "source_id"]]
-                    except Exception as e:
-                        self._log(f"[WARN] Failed to load idmatch for {fname}: {e}")
-                else:
-                    if not hasattr(self, '_logged_missing_idmatch'):
-                        self._log(f"[WARN] idmatch not found: {p}")
-                        self._logged_missing_idmatch = True
-                return pd.DataFrame(columns=["ID", "x", "y", "source_id"])
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    for key in ("fwhm_med_rad_px", "fwhm_med_px", "fwhm_px", "fwhm_med"):
+                        val = _safe_float(meta.get(key), np.nan)
+                        if np.isfinite(val) and val > 0:
+                            return float(np.clip(val, fwhm_px_min, fwhm_px_max))
+                return float(np.clip(fwhm_guess, fwhm_px_min, fwhm_px_max))
 
             def _det_xy_for(fname):
                 det_csv = cache_dir / f"detect_{fname}.csv"
@@ -540,23 +364,25 @@ class ForcedPhotometryWorker(QThread):
                         pass
                 return np.zeros((0, 2), float)
 
-            def _cached_counts(fname, out_tsv, filt_key):
+            def _cached_counts(fname, out_tsv):
                 n = 0
                 n_goodmag = 0
+                n_badmag = 0
                 if out_tsv.exists() and out_tsv.stat().st_size > 0:
                     try:
                         df = pd.read_csv(out_tsv, sep="\t")
                         n = int(len(df))
                         if "mag" in df.columns:
                             n_goodmag = int(pd.to_numeric(df["mag"], errors="coerce").notna().sum())
+                            n_badmag = max(n - n_goodmag, 0)
                     except Exception:
                         pass
                 try:
-                    targets = int(len(_load_frame_targets(fname, filt_key)))
+                    n_sources = int(len(_load_frame_detections(fname)))
                 except Exception:
-                    targets = 0
-                n_fail = max(int(targets) - int(n), 0)
-                return n, n_goodmag, n_fail, targets
+                    n_sources = 0
+                n_fail = max(int(n_sources) - int(n), 0)
+                return n, n_goodmag, n_badmag, n_fail, n_sources
 
             def _neighbor_mask(img, xc, yc, fwhm_used, xys, r_exclude=0.0):
                 if xys.size == 0:
@@ -625,7 +451,7 @@ class ForcedPhotometryWorker(QThread):
 
             frames = list(self.file_list)
             total = len(frames)
-            counters = {"cached": 0, "processed": 0, "no_targets": 0, "no_aperture": 0, "no_file": 0, "error": 0}
+            counters = {"cached": 0, "processed": 0, "no_sources": 0, "no_aperture": 0, "no_file": 0, "error": 0}
             completed_count = [0]
 
             def process_single_frame(fname):
@@ -635,8 +461,6 @@ class ForcedPhotometryWorker(QThread):
 
                     if self.use_cropped:
                         cropped_dir = step2_cropped_dir(result_dir)
-                        if not cropped_dir.exists():
-                            cropped_dir = result_dir / "cropped"
                         fpath = cropped_dir / fname
                     else:
                         fpath = self.data_dir / fname
@@ -649,47 +473,55 @@ class ForcedPhotometryWorker(QThread):
                     out_tsv = output_dir / f"{fname}_photometry.tsv"
                     if not fpath.exists():
                         idx_row = dict(
-                            file=fname, filter="unknown", n=0, n_goodmag=0, n_fail=0,
-                            targets=0, path=str(out_tsv.name)
+                            file=fname, filter="unknown", n=0, n_goodmag=0, n_badmag=0, n_fail=0,
+                            n_sources=0, path=str(out_tsv.name)
                         )
-                        dbg_row = dict(file=fname, cached=False, targets=0, reason="file_not_found")
+                        dbg_row = dict(file=fname, cached=False, n_sources=0, reason="file_not_found")
                         return fname, idx_row, dbg_row, [], "no_file"
-                    deps = [fpath, master_path, ap_path]
-                    idmatch_path = _resolve_idmatch_path(result_dir, cache_dir, fname)
-                    if idmatch_path.exists():
-                        deps.append(idmatch_path)
+                    deps = [fpath]
+                    if use_apcorr_results and ap_path.exists():
+                        deps.append(ap_path)
+                    if use_apcorr_results and apcorr_path.exists():
+                        deps.append(apcorr_path)
 
                     this_filter = _get_filter_lower(fpath, self._header_cache, fname)
 
                     if resume and (not force_rephot) and out_tsv.exists() and _is_up_to_date(out_tsv, deps):
-                        n, n_goodmag, n_fail, targets = _cached_counts(fname, out_tsv, this_filter)
+                        n, n_goodmag, n_badmag, n_fail, n_sources = _cached_counts(fname, out_tsv)
                         idx_row = dict(
                             file=fname, filter=this_filter,
-                            n="cached", n_goodmag=n_goodmag, n_fail=n_fail,
-                            targets=targets, path=str(out_tsv.name)
+                            n="cached", n_goodmag=n_goodmag, n_badmag=n_badmag, n_fail=n_fail,
+                            n_sources=n_sources, path=str(out_tsv.name)
                         )
                         dbg_row = dict(
                             file=fname, cached=True,
-                            n=n, n_goodmag=n_goodmag, n_fail=n_fail, targets=targets
+                            n=n, n_goodmag=n_goodmag, n_badmag=n_badmag, n_fail=n_fail, n_sources=n_sources
                         )
                         return fname, idx_row, dbg_row, [], "cached"
 
-                    tgt = _load_frame_targets(fname, this_filter)
+                    tgt = _load_frame_detections(fname)
                     n_tgt = int(len(tgt))
                     if n_tgt == 0:
-                        idx_row = dict(file=fname, filter=this_filter, n=0, path=str(out_tsv.name))
-                        dbg_row = dict(file=fname, cached=False, targets=0, reason="no_targets")
+                        idx_row = dict(file=fname, filter=this_filter, n=0, n_goodmag=0, n_badmag=0, n_fail=0, n_sources=0, path=str(out_tsv.name))
+                        dbg_row = dict(file=fname, cached=False, n_sources=0, reason="no_targets")
                         return fname, idx_row, dbg_row, [], "no_targets"
 
-                    row = df_ap[df_ap["file"].astype(str) == str(fname)]
-                    if row.empty:
-                        dbg_row = dict(file=fname, cached=False, targets=n_tgt, reason="no_aperture_by_frame")
-                        return fname, None, dbg_row, [], "no_aperture"
-
-                    r_ap_val = float(row["r_ap"].values[0])
-                    r_in_val = float(row["r_in"].values[0])
-                    r_out_val = float(row["r_out"].values[0])
-                    fwhm_used = float(row["fwhm_used"].values[0])
+                    row = df_ap[df_ap["file"].astype(str) == str(fname)] if not df_ap.empty else pd.DataFrame()
+                    if not row.empty:
+                        r_ap_val = float(row["r_ap"].values[0])
+                        r_in_val = float(row["r_in"].values[0])
+                        r_out_val = float(row["r_out"].values[0])
+                        fwhm_used = float(row["fwhm_used"].values[0])
+                        aperture_source = "apcorr"
+                    else:
+                        if use_apcorr_results:
+                            dbg_row = dict(file=fname, cached=False, n_sources=n_tgt, reason="no_aperture_by_frame")
+                            return fname, None, dbg_row, [], "no_aperture"
+                        fwhm_used = _load_fwhm_for_frame(fname)
+                        r_ap_val = max(ap_scale * fwhm_used, min_r_ap_px)
+                        r_in_val = max(ann_in_scale * fwhm_used, r_ap_val + ann_gap)
+                        r_out_val = r_in_val + ann_out_scale * fwhm_used
+                        aperture_source = "default_scale"
 
                     exptime = _get_exptime_fallback(fpath, default=1.0, header_cache=self._header_cache, filename=fname)
                     sky_frame_e = _sky_sigma_for(fname)
@@ -726,32 +558,28 @@ class ForcedPhotometryWorker(QThread):
                     n_goodmag = 0
                     n_fail = 0
 
-                    id2sid = {}
-                    if "source_id" in tgt.columns:
-                        id2sid = dict(zip(tgt["ID"].astype(int), tgt["source_id"].astype("Int64")))
-
                     if bkg_use_segm_mask:
                         det_xy = _det_xy_for(fname)
                     else:
                         det_xy = np.zeros((0, 2), float)
                 except Exception as e:
                     idx_row = dict(
-                        file=fname, filter="unknown", n=0, n_goodmag=0, n_fail=0,
-                        targets=0, path=str(out_tsv.name)
+                        file=fname, filter="unknown", n=0, n_goodmag=0, n_badmag=0, n_fail=0,
+                        n_sources=0, path=str(out_tsv.name)
                     )
                     dbg_row = dict(
-                        file=fname, cached=False, targets=0, reason="exception", error=str(e)
+                        file=fname, cached=False, n_sources=0, reason="exception", error=str(e)
                     )
                     return fname, idx_row, dbg_row, [], "error"
 
                 try:
                     for _, tr in tgt.iterrows():
-                        ID = int(tr["ID"])
+                        det_uid = int(tr["det_uid"])
                         x0 = float(tr["x"])
                         y0 = float(tr["y"])
                         if not (np.isfinite(x0) and np.isfinite(y0)):
                             n_fail += 1
-                            frame_fail_rows.append(dict(file=fname, ID=ID, reason="bad_xy"))
+                            frame_fail_rows.append(dict(file=fname, det_uid=det_uid, reason="bad_xy"))
                             continue
 
                         xc, yc = (x0, y0)
@@ -767,7 +595,7 @@ class ForcedPhotometryWorker(QThread):
 
                         if xc < 0 or xc >= w or yc < 0 or yc >= h:
                             n_fail += 1
-                            frame_fail_rows.append(dict(file=fname, ID=ID, reason="xy_outside"))
+                            frame_fail_rows.append(dict(file=fname, det_uid=det_uid, reason="xy_outside"))
                             continue
 
                         cut, xc_cut, yc_cut, x0_cut, y0_cut = _cutout(img, xc, yc, r_out_val)
@@ -813,8 +641,8 @@ class ForcedPhotometryWorker(QThread):
 
                         centroid_outlier = bool(delta_r > centroid_outlier_px) if np.isfinite(delta_r) else False
                         rows.append(dict(
-                            ID=ID, source_id=int(id2sid.get(ID, -1)),
-                            x_init=x0, y_init=y0, xcenter=xc, ycenter=yc, FILTER=this_filter,
+                            det_uid=det_uid,
+                            x_det=x0, y_det=y0, xcenter=xc, ycenter=yc, FILTER=this_filter,
                             delta_r=delta_r, recenter_capped=recenter_capped, centroid_outlier=centroid_outlier,
                             r_ap_px=r_ap_val, r_in_px=r_in_val, r_out_px=r_out_val,
                             ap_sum_adu=ap_sum_adu, bkg_median_adu=bkg_med_adu, bkg_std_adu=bkg_std_adu,
@@ -830,27 +658,29 @@ class ForcedPhotometryWorker(QThread):
                     with self._write_lock:
                         df_out.to_csv(out_tsv, sep="\t", index=False, na_rep="NaN")
 
+                    n_badmag = max(len(df_out) - n_goodmag, 0)
                     idx_row = dict(
                         file=fname, filter=this_filter,
-                        n=len(df_out), n_goodmag=n_goodmag, n_fail=n_fail,
-                        targets=n_tgt, path=str(out_tsv.name)
+                        n=len(df_out), n_goodmag=n_goodmag, n_badmag=n_badmag, n_fail=n_fail,
+                        n_sources=n_tgt, path=str(out_tsv.name)
                     )
                     dbg_row = dict(
                         file=fname, cached=False,
-                        targets=n_tgt, out_rows=len(df_out),
-                        n_goodmag=n_goodmag, n_fail=n_fail,
+                        n_sources=n_tgt, out_rows=len(df_out),
+                        n_goodmag=n_goodmag, n_badmag=n_badmag, n_fail=n_fail,
                         apcorr_applied=bool(apply_flag),
+                        aperture_source=aperture_source,
                         sky_sigma_source=_sky_src, sky_frame_e=float(sky_frame_e) if np.isfinite(sky_frame_e) else None
                     )
                     return fname, idx_row, dbg_row, frame_fail_rows, "processed"
                 except Exception as e:
                     idx_row = dict(
                         file=fname, filter=this_filter,
-                        n=0, n_goodmag=0, n_fail=0,
-                        targets=n_tgt, path=str(out_tsv.name)
+                        n=0, n_goodmag=0, n_badmag=0, n_fail=0,
+                        n_sources=n_tgt, path=str(out_tsv.name)
                     )
                     dbg_row = dict(
-                        file=fname, cached=False, targets=n_tgt, reason="exception", error=str(e)
+                        file=fname, cached=False, n_sources=n_tgt, reason="exception", error=str(e)
                     )
                     return fname, idx_row, dbg_row, [], "error"
 
@@ -871,7 +701,7 @@ class ForcedPhotometryWorker(QThread):
                         elif status == "processed":
                             counters["processed"] += 1
                         elif status == "no_targets":
-                            counters["no_targets"] += 1
+                            counters["no_sources"] += 1
                         elif status == "no_aperture":
                             counters["no_aperture"] += 1
                         elif status == "no_file":
@@ -898,8 +728,9 @@ class ForcedPhotometryWorker(QThread):
                                 "filter": idx_row.get("filter", ""),
                                 "n": idx_row.get("n", 0),
                                 "n_goodmag": idx_row.get("n_goodmag", 0),
+                                "n_badmag": idx_row.get("n_badmag", 0),
                                 "n_fail": idx_row.get("n_fail", 0),
-                                "targets": idx_row.get("targets", 0),
+                                "n_sources": idx_row.get("n_sources", 0),
                             })
 
                     except Exception:
@@ -911,7 +742,7 @@ class ForcedPhotometryWorker(QThread):
                 pd.DataFrame(_fail_rows_all).to_csv(fail_csv, sep="\t", index=False, encoding="utf-8-sig")
 
             idx_path = output_dir / "photometry_index.csv"
-            index_cols = ["file", "filter", "night_id", "n", "n_goodmag", "n_fail", "targets", "path"]
+            index_cols = ["file", "filter", "night_id", "n", "n_goodmag", "n_badmag", "n_fail", "n_sources", "path"]
             pd.DataFrame(index_rows, columns=index_cols).to_csv(idx_path, index=False)
 
             try:
@@ -924,7 +755,7 @@ class ForcedPhotometryWorker(QThread):
                 n_frames=len(frames),
                 n_cached=counters["cached"],
                 n_processed=counters["processed"],
-                n_no_targets=counters["no_targets"],
+                n_no_sources=counters["no_sources"],
                 n_no_aperture=counters["no_aperture"],
                 n_no_file=counters["no_file"],
                 n_error=counters["error"],
@@ -939,7 +770,7 @@ class ForcedPhotometryWorker(QThread):
 
 
 class ForcedPhotometryWindow(StepWindowBase):
-    """Step 9: Aperture Photometry"""
+    """Step 5: Aperture Photometry"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -952,7 +783,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self._growth_curve_df = pd.DataFrame()
 
         super().__init__(
-            step_index=8,
+            step_index=4,
             step_name="Aperture Photometry",
             params=params,
             project_state=project_state,
@@ -971,9 +802,21 @@ class ForcedPhotometryWindow(StepWindowBase):
         phot_tab = QWidget()
         phot_layout = QVBoxLayout(phot_tab)
 
-        info = QLabel("Forced photometry per frame based on ID-matched positions.")
+        info = QLabel("Full aperture photometry for all detected sources per frame.")
         info.setStyleSheet("QLabel { background-color: #E3F2FD; padding: 10px; border-radius: 5px; }")
         phot_layout.addWidget(info)
+
+        mode_row = QHBoxLayout()
+        self.chk_use_apcorr_results = QCheckBox("Use Apcorr results")
+        self.chk_use_apcorr_results.setChecked(bool(getattr(self.params.P, "phot_use_apcorr_results", True)))
+        self.chk_use_apcorr_results.setToolTip(
+            "Checked: use Step 5 Apcorr/QC optimal aperture results.\n"
+            "Unchecked: skip Apcorr and use default FWHM-scaled aperture/annulus."
+        )
+        self.chk_use_apcorr_results.toggled.connect(self._on_use_apcorr_results_toggled)
+        mode_row.addWidget(self.chk_use_apcorr_results)
+        mode_row.addStretch()
+        phot_layout.addLayout(mode_row)
 
         control_layout = QHBoxLayout()
         btn_params = QPushButton("Photometry Parameters")
@@ -1016,9 +859,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         table_group = QGroupBox("Per-Frame Photometry Summary")
         table_layout = QVBoxLayout(table_group)
         self.frame_table = QTableWidget()
-        self.frame_table.setColumnCount(6)
+        self.frame_table.setColumnCount(7)
         self.frame_table.setHorizontalHeaderLabels(
-            ["Frame", "Filter", "N_rows", "N_goodmag", "N_fail", "Targets"]
+            ["Frame", "Filter", "Measured", "Good mag", "Bad mag", "Hard fail", "Detected"]
         )
         self.frame_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.frame_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1026,6 +869,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.frame_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.frame_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.frame_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.frame_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.frame_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table_layout.addWidget(self.frame_table)
         phot_layout.addWidget(table_group)
@@ -1214,14 +1058,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         self._restore_file_context()
         crop_active = crop_is_active(self.params.P.result_dir)
         cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-        legacy_cropped = self.params.P.result_dir / "cropped"
         if crop_active and cropped_dir.exists() and list(cropped_dir.glob("*.fit*")):
             files = sorted([f.name for f in cropped_dir.glob("*.fit*")])
             self.use_cropped = True
-        elif crop_active and legacy_cropped.exists() and list(legacy_cropped.glob("*.fit*")):
-            files = sorted([f.name for f in legacy_cropped.glob("*.fit*")])
-            self.use_cropped = True
-            cropped_dir = legacy_cropped
         else:
             if not self.file_manager.filenames:
                 try:
@@ -1363,6 +1202,10 @@ class ForcedPhotometryWindow(StepWindowBase):
         QMessageBox.information(dialog, "Success", "Parameters saved!")
         dialog.accept()
 
+    def _on_use_apcorr_results_toggled(self, checked: bool):
+        self.params.P.phot_use_apcorr_results = bool(checked)
+        self.save_state()
+
     # ------------------------------------------------------------------
     # Apcorr run / stop
     # ------------------------------------------------------------------
@@ -1375,7 +1218,7 @@ class ForcedPhotometryWindow(StepWindowBase):
             return
         if self.apcorr_worker and self.apcorr_worker.isRunning():
             return
-        output_dir = step9_dir(Path(self.params.P.result_dir))
+        output_dir = step5_dir(Path(self.params.P.result_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
         cache_dir = output_dir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1444,12 +1287,25 @@ class ForcedPhotometryWindow(StepWindowBase):
         if self.worker and self.worker.isRunning():
             return
 
+        use_apcorr_results = bool(getattr(self.params.P, "phot_use_apcorr_results", True))
+        ap_path = step5_dir(Path(self.params.P.result_dir)) / "aperture_by_frame.csv"
+        if not ap_path.exists():
+            ap_path = Path(self.params.P.result_dir) / "aperture_by_frame.csv"
+        if use_apcorr_results and not ap_path.exists():
+            QMessageBox.warning(
+                self,
+                "Photometry",
+                "Apcorr 결과가 없습니다.\nRun Apcorr first 또는 'Use Apcorr results' 체크를 해제하세요.",
+            )
+            return
+
         self.log_text.clear()
         self.log(
             "Params | "
             f"files={len(self.file_list)} | use_cropped={self.use_cropped} | "
             f"force_rephot={getattr(self.params.P, 'force_rephot', False)} | "
             f"ap_mode={getattr(self.params.P, 'aperture_mode', 'apcorr')} | "
+            f"use_apcorr_results={use_apcorr_results} | "
             f"min_snr={getattr(self.params.P, 'min_snr_for_mag', 3.0)} | "
             f"neighbor_mask={bool(getattr(self.params.P, 'bkg_use_segm_mask', False))}"
         )
@@ -1508,8 +1364,9 @@ class ForcedPhotometryWindow(StepWindowBase):
         n_val = result.get("n", 0)
         self.frame_table.setItem(r, 2, QTableWidgetItem(str(n_val) if n_val != "cached" else "cached"))
         self.frame_table.setItem(r, 3, QTableWidgetItem(str(result.get("n_goodmag", 0))))
-        self.frame_table.setItem(r, 4, QTableWidgetItem(str(result.get("n_fail", 0))))
-        self.frame_table.setItem(r, 5, QTableWidgetItem(str(result.get("targets", 0))))
+        self.frame_table.setItem(r, 4, QTableWidgetItem(str(result.get("n_badmag", 0))))
+        self.frame_table.setItem(r, 5, QTableWidgetItem(str(result.get("n_fail", 0))))
+        self.frame_table.setItem(r, 6, QTableWidgetItem(str(result.get("n_sources", 0))))
 
         self.frame_table.scrollToBottom()
 
@@ -1525,9 +1382,7 @@ class ForcedPhotometryWindow(StepWindowBase):
                 from PyQt5.QtCore import QTimer
                 QTimer.singleShot(500, self._cleanup_worker)
 
-            idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-            if not idx_path.exists():
-                idx_path = self.params.P.result_dir / "photometry_index.csv"
+            idx_path = step5_dir(self.params.P.result_dir) / "photometry_index.csv"
             if idx_path.exists():
                 if idx_path.stat().st_size == 0:
                     self.log("[WARN] photometry_index.csv is empty")
@@ -1537,18 +1392,23 @@ class ForcedPhotometryWindow(StepWindowBase):
                 try:
                     idx = pd.read_csv(idx_path)
                     if not idx.empty and "filter" in idx.columns:
-                        by_f = idx.groupby("filter").agg(
+                        agg_dict = dict(
                             frames=("file", "count"),
                             n_rows=("n", "sum"),
                             n_good=("n_goodmag", "sum"),
+                            n_bad=("n_badmag", "sum"),
                             n_fail=("n_fail", "sum"),
-                            targets=("targets", "sum"),
                         )
+                        if "n_sources" in idx.columns:
+                            agg_dict["n_sources"] = ("n_sources", "sum")
+                        elif "targets" in idx.columns:
+                            agg_dict["n_sources"] = ("targets", "sum")
+                        by_f = idx.groupby("filter").agg(**agg_dict)
                         for filt, row in by_f.iterrows():
                             self.log(
                                 f"Filter[{filt}] frames={int(row['frames'])} | "
                                 f"rows={int(row['n_rows'])} | good={int(row['n_good'])} | "
-                                f"fail={int(row['n_fail'])} | targets={int(row['targets'])}"
+                                f"badmag={int(row['n_bad'])} | fail={int(row['n_fail'])} | sources={int(row.get('n_sources', 0))}"
                             )
                 except Exception as e:
                     self.log(f"[WARN] Failed to read index: {e}")
@@ -1581,9 +1441,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         self.log_window.activateWindow()
 
     def update_frame_table(self):
-        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        idx_path = step5_dir(self.params.P.result_dir) / "photometry_index.csv"
         if not idx_path.exists() or not hasattr(self, "frame_table"):
             return
         try:
@@ -1633,12 +1491,13 @@ class ForcedPhotometryWindow(StepWindowBase):
             self.frame_table.setItem(r, 1, QTableWidgetItem(str(row.get("filter", ""))))
             self.frame_table.setItem(r, 2, QTableWidgetItem(_fmt_count(row.get("n", 0))))
             self.frame_table.setItem(r, 3, QTableWidgetItem(_fmt_count(row.get("n_goodmag", 0))))
-            self.frame_table.setItem(r, 4, QTableWidgetItem(_fmt_count(row.get("n_fail", 0))))
-            self.frame_table.setItem(r, 5, QTableWidgetItem(_fmt_count(row.get("targets", 0))))
+            self.frame_table.setItem(r, 4, QTableWidgetItem(_fmt_count(row.get("n_badmag", 0))))
+            self.frame_table.setItem(r, 5, QTableWidgetItem(_fmt_count(row.get("n_fail", 0))))
+            self.frame_table.setItem(r, 6, QTableWidgetItem(_fmt_count(row.get("n_sources", row.get("targets", 0)))))
 
     def _resolve_apcorr_paths(self) -> tuple[Path, Path]:
         result_dir = Path(self.params.P.result_dir)
-        out_dir = step9_dir(result_dir)
+        out_dir = step5_dir(result_dir)
         summary = out_dir / "apcorr_summary.csv"
         gc = out_dir / "growth_curve.csv"
         if not summary.exists():
@@ -1863,9 +1722,7 @@ class ForcedPhotometryWindow(StepWindowBase):
         event.accept()
 
     def validate_step(self) -> bool:
-        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        idx_path = step5_dir(self.params.P.result_dir) / "photometry_index.csv"
         return idx_path.exists()
 
     def save_state(self):

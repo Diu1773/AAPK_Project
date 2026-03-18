@@ -10,14 +10,13 @@ from typing import Iterable, Optional, Tuple, Dict, List
 import numpy as np
 import pandas as pd
 
-from .step_paths import step5_dir, legacy_step7_wcs_dir, step10_dir
+from .step_paths import step5_photometry_dir, step6_wcs_dir, step10_dir
 
 
 def resolve_frame_quality_path(result_dir: Path) -> Optional[Path]:
     """Resolve the best available frame_quality.csv path."""
     candidates = [
-        step5_dir(result_dir) / "frame_quality.csv",
-        legacy_step7_wcs_dir(result_dir) / "frame_quality.csv",
+        step5_photometry_dir(result_dir) / "frame_quality.csv",
         Path(result_dir) / "frame_quality.csv",
     ]
     for path in candidates:
@@ -92,8 +91,7 @@ def filter_files_by_qc(
 def resolve_frame_wcs_qc_path(result_dir: Path) -> Optional[Path]:
     """Resolve the best available frame_wcs_qc.csv path."""
     candidates = [
-        step5_dir(result_dir) / "frame_wcs_qc.csv",
-        legacy_step7_wcs_dir(result_dir) / "frame_wcs_qc.csv",
+        step6_wcs_dir(result_dir) / "frame_wcs_qc.csv",
         Path(result_dir) / "frame_wcs_qc.csv",
     ]
     for path in candidates:

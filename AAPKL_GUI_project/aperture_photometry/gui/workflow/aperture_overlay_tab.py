@@ -27,19 +27,19 @@ from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt
 
 from .step_window_base import StepWindowBase
+from ...utils.photometry_loader import load_frame_photometry
 from ...utils.step_paths import (
     step1_dir,
     step2_cropped_dir,
-    step6_dir,
-    step9_dir,
-    legacy_step5_refbuild_dir,
-    legacy_step7_refbuild_dir,
+    step5_photometry_dir,
+    step7_refbuild_dir,
+    step8_idmatch_dir,
 )
 from ...utils.qc_utils import filter_files_by_qc
 
 
 class ApertureOverlayWindow(StepWindowBase):
-    """Step 10: Aperture Overlay (also used within Step 9)"""
+    """Step 10: Aperture Overlay (also used within Step 5)"""
 
     def __init__(
         self,
@@ -110,7 +110,7 @@ class ApertureOverlayWindow(StepWindowBase):
             self.btn_previous.hide()
             self.btn_complete.hide()
             self.btn_next.hide()
-            self.title_label.setText("Aperture Overlay (from Step 9)")
+            self.title_label.setText("Aperture Overlay (from Step 5)")
         self.restore_state()
 
     def setup_step_ui(self):
@@ -312,13 +312,7 @@ class ApertureOverlayWindow(StepWindowBase):
                 self.load_and_display(keep_view=True)
 
     def load_master_catalog(self):
-        master_path = step6_dir(self.params.P.result_dir) / "ref_catalog.tsv"
-        if not master_path.exists():
-            master_path = legacy_step5_refbuild_dir(self.params.P.result_dir) / "ref_catalog.tsv"
-        if not master_path.exists():
-            master_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / "master_catalog.tsv"
-        if not master_path.exists():
-            master_path = self.params.P.result_dir / "master_catalog.tsv"
+        master_path = step7_refbuild_dir(self.params.P.result_dir) / "ref_catalog.tsv"
         if master_path.exists():
             try:
                 self.master_df = pd.read_csv(master_path, sep="\t")
@@ -329,9 +323,7 @@ class ApertureOverlayWindow(StepWindowBase):
             self.log(f"Master catalog: {n} rows")
 
     def load_aperture_by_frame(self):
-        ap_path = step9_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
-        if not ap_path.exists():
-            ap_path = self.params.P.result_dir / "aperture_by_frame.csv"
+        ap_path = step5_photometry_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
         if ap_path.exists():
             try:
                 self.ap_df = pd.read_csv(ap_path)
@@ -365,28 +357,17 @@ class ApertureOverlayWindow(StepWindowBase):
 
     def _build_lab_frame(self, fname: str) -> pd.DataFrame | None:
         result_dir = self.params.P.result_dir
-        step9_out = step9_dir(result_dir)
         cache_dir = self.params.P.cache_dir
 
-        phot_path = step9_out / f"{fname}_photometry.tsv"
-        if not phot_path.exists():
-            phot_path = result_dir / f"{fname}_photometry.tsv"
-        phot = None
-        if phot_path.exists():
-            try:
-                phot = pd.read_csv(phot_path, sep="\t")
-            except Exception:
-                try:
-                    phot = pd.read_csv(phot_path)
-                except Exception:
-                    phot = None
+        filt_hint = self._file_filter_map.get(fname, "")
+        phot = load_frame_photometry(result_dir, fname, filt_hint)
 
         if phot is not None and ("ID" in phot.columns):
             cols = phot.columns
             cx = "xcenter" if "xcenter" in cols else None
             cy = "ycenter" if "ycenter" in cols else None
-            ix = "x_init" if "x_init" in cols else None
-            iy = "y_init" if "y_init" in cols else None
+            ix = "x_init" if "x_init" in cols else ("x_det" if "x_det" in cols else None)
+            iy = "y_init" if "y_init" in cols else ("y_det" if "y_det" in cols else None)
 
             use_centroid = self._as_bool(getattr(self.params.P, "overlay_use_phot_centroid", True), True)
             if use_centroid and (cx is not None) and (cy is not None):
@@ -415,9 +396,7 @@ class ApertureOverlayWindow(StepWindowBase):
             })
             return lab
 
-        fm_path = step9_out / "frame_sourceid_to_ID.tsv"
-        if not fm_path.exists():
-            fm_path = result_dir / "frame_sourceid_to_ID.tsv"
+        fm_path = step8_idmatch_dir(result_dir) / "frame_sourceid_to_ID.tsv"
         if fm_path.exists():
             try:
                 fm = pd.read_csv(fm_path, sep="\t")
@@ -451,13 +430,7 @@ class ApertureOverlayWindow(StepWindowBase):
                 x = idm.loc[mask, c_x].astype(float).to_numpy()
                 y = idm.loc[mask, c_y].astype(float).to_numpy()
 
-                map_path = step6_dir(result_dir) / "sourceid_to_ID.csv"
-                if not map_path.exists():
-                    map_path = legacy_step5_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-                if not map_path.exists():
-                    map_path = legacy_step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-                if not map_path.exists():
-                    map_path = result_dir / "sourceid_to_ID.csv"
+                map_path = step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
                 if map_path.exists():
                     mp = pd.read_csv(map_path)
                     if ("source_id" in mp.columns) and ("ID" in mp.columns):
@@ -1217,10 +1190,8 @@ class ApertureOverlayWindow(StepWindowBase):
             except Exception:
                 pass
 
-        # 2) photometry_index.csv에서 보충 (Step 9 이후)
-        idx_path = step9_dir(self.params.P.result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = self.params.P.result_dir / "photometry_index.csv"
+        # 2) photometry_index.csv에서 보충 (Step 5 이후)
+        idx_path = step5_photometry_dir(self.params.P.result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             return
         try:
@@ -1336,16 +1307,8 @@ class ApertureOverlayWindow(StepWindowBase):
         dialog.accept()
 
     def validate_step(self) -> bool:
-        ap_path = step9_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
-        if not ap_path.exists():
-            ap_path = self.params.P.result_dir / "aperture_by_frame.csv"
-        master_path = step6_dir(self.params.P.result_dir) / "ref_catalog.tsv"
-        if not master_path.exists():
-            master_path = legacy_step5_refbuild_dir(self.params.P.result_dir) / "ref_catalog.tsv"
-        if not master_path.exists():
-            master_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / "master_catalog.tsv"
-        if not master_path.exists():
-            master_path = self.params.P.result_dir / "master_catalog.tsv"
+        ap_path = step5_photometry_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
+        master_path = step7_refbuild_dir(self.params.P.result_dir) / "ref_catalog.tsv"
         return ap_path.exists() and master_path.exists()
 
     def save_state(self):

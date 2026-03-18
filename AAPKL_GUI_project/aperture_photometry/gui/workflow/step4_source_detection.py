@@ -37,8 +37,7 @@ from ...utils.step_paths import (
     step2_cropped_dir,
     crop_is_active,
     step4_dir,
-    step5_dir,
-    legacy_step7_wcs_dir,
+    step5_photometry_dir,
 )
 from ...utils.cache_utils import norm_path_key
 
@@ -231,8 +230,6 @@ class DetectionWorker(QThread):
                     # Determine path
                     if self.use_cropped:
                         cropped_dir = step2_cropped_dir(self.result_dir)
-                        if not cropped_dir.exists():
-                            cropped_dir = self.result_dir / "cropped"
                         file_path = cropped_dir / filename
                     else:
                         file_path = self.params.get_file_path(filename)
@@ -1476,9 +1473,7 @@ class QCInspectionPanel(QWidget):
         self.update_summary()
 
     def _apply_exclusions_from_file(self):
-        fq_path = step5_dir(self.params.P.result_dir) / "frame_quality.csv"
-        if not fq_path.exists():
-            fq_path = legacy_step7_wcs_dir(self.params.P.result_dir) / "frame_quality.csv"
+        fq_path = step5_photometry_dir(self.params.P.result_dir) / "frame_quality.csv"
         if not fq_path.exists():
             return
         try:
@@ -1566,7 +1561,7 @@ class QCInspectionPanel(QWidget):
         df = self._build_quality_df()
         if df.empty:
             return
-        out_dir = step5_dir(self.params.P.result_dir)
+        out_dir = step5_photometry_dir(self.params.P.result_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         gain = self._safe_float(getattr(self.params.P, "gain_e_per_adu", np.nan), np.nan)
         if np.isfinite(gain):
@@ -1959,10 +1954,6 @@ class SourceDetectionWindow(StepWindowBase):
             cand = cropped_dir / filename
             if cand.exists():
                 return cand
-            legacy_cropped = self.params.P.result_dir / "cropped"
-            cand = legacy_cropped / filename
-            if cand.exists():
-                return cand
         try:
             cand = Path(self.params.get_file_path(filename))
             if cand.exists():
@@ -2335,15 +2326,10 @@ class SourceDetectionWindow(StepWindowBase):
         """Populate file combo box"""
         crop_active = crop_is_active(self.params.P.result_dir)
         cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-        legacy_cropped = self.params.P.result_dir / "cropped"
 
         if crop_active and cropped_dir.exists() and list(cropped_dir.glob("*.fit*")):
             files = sorted([f.name for f in cropped_dir.glob("*.fit*")])
             self.use_cropped = True
-        elif crop_active and legacy_cropped.exists() and list(legacy_cropped.glob("*.fit*")):
-            files = sorted([f.name for f in legacy_cropped.glob("*.fit*")])
-            self.use_cropped = True
-            cropped_dir = legacy_cropped
         else:
             if not self.file_manager.filenames:
                 try:
@@ -2636,9 +2622,6 @@ class SourceDetectionWindow(StepWindowBase):
             cand = cropped_dir / fname
             if cand.exists():
                 return cand
-            legacy = self.params.P.result_dir / "cropped" / fname
-            if legacy.exists():
-                return legacy
         try:
             cand = Path(self.params.get_file_path(fname))
             if cand.exists():

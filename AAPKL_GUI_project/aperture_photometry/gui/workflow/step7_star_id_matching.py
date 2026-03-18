@@ -1,7 +1,7 @@
 """
-Step 7: Star ID Matching (WCS-based)
+Step 8: Star ID Matching (WCS-based)
 
-- Uses a fixed ref catalog (RA/Dec) from Step 6
+- Uses a fixed ref catalog (RA/Dec) from Step 7
 - Converts detections to sky coordinates via per-frame WCS
 - Sky-matches within a configurable arcsec radius
 """
@@ -40,11 +40,9 @@ from ...utils.step_paths import (
     crop_is_active,
     crop_rect_path,
     step4_dir,
-    step5_dir,
-    step6_dir,
-    step7_dir,
-    legacy_step5_refbuild_dir,
-    legacy_step7_refbuild_dir,
+    step6_wcs_dir,
+    step7_refbuild_dir,
+    step8_idmatch_dir,
 )
 from ...utils.qc_utils import filter_files_by_qc, filter_files_by_wcs_qc
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
@@ -441,17 +439,14 @@ class IdMatchWorker(QThread):
             cand = step2_cropped_dir(self.result_dir) / fname
             if cand.exists():
                 return cand
-            legacy = self.result_dir / "cropped" / fname
-            if legacy.exists():
-                return legacy
         try:
             orig = Path(self.params.get_file_path(fname))
             if orig.exists():
                 return orig
         except Exception:
             pass
-        step5_out = step5_dir(self.result_dir)
-        cand = step5_out / fname
+        step6_out = step6_wcs_dir(self.result_dir)
+        cand = step6_out / fname
         if cand.exists():
             return cand
         try:
@@ -504,13 +499,11 @@ class IdMatchWorker(QThread):
             return float("nan")
 
     def _load_ref_catalog(self, date_key: Optional[str] = None) -> pd.DataFrame:
-        step6_out = step6_dir(self.result_dir)
+        step7_out = step7_refbuild_dir(self.result_dir)
         candidates: List[Path] = []
         if date_key:
-            candidates.append(step6_out / f"ref_catalog_{self.ref_filter}_{date_key}.tsv")
-        candidates.append(step6_out / f"ref_catalog_{self.ref_filter}.tsv")
-        candidates.append(legacy_step5_refbuild_dir(self.result_dir) / f"ref_catalog_{self.ref_filter}.tsv")
-        candidates.append(legacy_step7_refbuild_dir(self.result_dir) / f"master_catalog_{self.ref_filter}.tsv")
+            candidates.append(step7_out / f"ref_catalog_{self.ref_filter}_{date_key}.tsv")
+        candidates.append(step7_out / f"ref_catalog_{self.ref_filter}.tsv")
         ref_path = None
         for cand in candidates:
             if cand.exists():
@@ -581,9 +574,9 @@ class IdMatchWorker(QThread):
             raise RuntimeError("No frames to process")
 
         import time as _time
-        out_dir = step7_dir(self.result_dir)
+        out_dir = step8_idmatch_dir(self.result_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        log_path = out_dir / f"step7_idmatch_{_time.strftime('%Y%m%d_%H%M%S')}.log"
+        log_path = out_dir / f"step8_idmatch_{_time.strftime('%Y%m%d_%H%M%S')}.log"
         try:
             self._log_file = open(log_path, "w", encoding="utf-8")
             self._log(f"[IDMATCH] Log file: {log_path}")
@@ -991,12 +984,12 @@ class IdMatchWorker(QThread):
         # Write summary files
         try:
             stats_df = pd.DataFrame(frame_stats)
-            stats_df.to_csv(out_dir / "step7_frame_stats.csv", index=False)
+            stats_df.to_csv(out_dir / "step8_frame_stats.csv", index=False)
         except Exception:
             pass
 
         try:
-            (out_dir / "step7_filter_frames.json").write_text(
+            (out_dir / "step8_filter_frames.json").write_text(
                 json.dumps(filter_frames, indent=2), encoding="utf-8"
             )
         except Exception:
@@ -1028,7 +1021,7 @@ class IdMatchWorker(QThread):
                     "x_std": float(np.sqrt(var_x)) if np.isfinite(var_x) else np.nan,
                     "y_std": float(np.sqrt(var_y)) if np.isfinite(var_y) else np.nan,
                 })
-            pd.DataFrame(master_rows).to_csv(out_dir / "step7_master_sources.csv", index=False)
+            pd.DataFrame(master_rows).to_csv(out_dir / "step8_master_sources.csv", index=False)
         except Exception:
             pass
 
@@ -1122,7 +1115,7 @@ class IdMatchWorker(QThread):
                 "match_r_fwhm": self.match_r_fwhm,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            (out_dir / "step7_idmatch_meta.json").write_text(
+            (out_dir / "step8_idmatch_meta.json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8"
             )
         except Exception:
@@ -1131,7 +1124,7 @@ class IdMatchWorker(QThread):
         self.finished.emit(summary)
 
 class StarIdMatchingWindow(StepWindowBase):
-    """Step 7: Star ID Matching (WCS-based)"""
+    """Step 8: Star ID Matching (WCS-based)"""
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -1140,7 +1133,7 @@ class StarIdMatchingWindow(StepWindowBase):
         self.log_window = None
 
         super().__init__(
-            step_index=6,
+            step_index=7,
             step_name="Star ID Matching",
             params=params,
             project_state=project_state,
@@ -1380,12 +1373,8 @@ class StarIdMatchingWindow(StepWindowBase):
         if self.worker and self.worker.isRunning():
             return
 
-        step6_out = step6_dir(self.params.P.result_dir)
-        meta_path = step6_out / "ref_build_meta.json"
-        if not meta_path.exists():
-            meta_path = legacy_step5_refbuild_dir(self.params.P.result_dir) / "ref_build_meta.json"
-        if not meta_path.exists():
-            meta_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / "ref_build_meta.json"
+        step7_out = step7_refbuild_dir(self.params.P.result_dir)
+        meta_path = step7_out / "ref_build_meta.json"
         if not meta_path.exists():
             QMessageBox.warning(self, "Missing Reference", "Run Reference Build first.")
             return
@@ -1397,7 +1386,7 @@ class StarIdMatchingWindow(StepWindowBase):
             QMessageBox.warning(self, "Missing Reference", "Reference info not found in ref_build_meta.json")
             return
         if bool(getattr(self.params.P, "ref_per_date", False)) and not ref_per_date:
-            self.log("[WARN] Per-date ref is ON in parameters, but ref_build_meta.json is global. Re-run Step 6.")
+            self.log("[WARN] Per-date ref is ON in parameters, but ref_build_meta.json is global. Re-run Step 7.")
 
         files = list(self.file_manager.filenames) if self.file_manager else []
         if not files and self.file_manager:
@@ -1673,7 +1662,9 @@ class StarIdMatchingWindow(StepWindowBase):
         ax1 = fig.add_subplot(1, 2, 1)
         ax2 = fig.add_subplot(1, 2, 2)
 
-        stats_path = step7_dir(self.params.P.result_dir) / "step7_frame_stats.csv"
+        stats_path = step8_idmatch_dir(self.params.P.result_dir) / "step8_frame_stats.csv"
+        if not stats_path.exists():
+            stats_path = step8_idmatch_dir(self.params.P.result_dir) / "step7_frame_stats.csv"
         if not stats_path.exists():
             ax1.text(0.5, 0.5, "No ID match stats available", ha="center", va="center")
             ax2.axis("off")
@@ -1788,8 +1779,8 @@ class StarIdMatchingWindow(StepWindowBase):
         self._update_plot_tab()
 
     def validate_step(self) -> bool:
-        out_dir = step7_dir(self.params.P.result_dir)
-        return (out_dir / "step7_frame_stats.csv").exists()
+        out_dir = step8_idmatch_dir(self.params.P.result_dir)
+        return (out_dir / "step8_frame_stats.csv").exists() or (out_dir / "step7_frame_stats.csv").exists()
 
     def save_state(self, summary: Optional[dict] = None):
         if summary is None:

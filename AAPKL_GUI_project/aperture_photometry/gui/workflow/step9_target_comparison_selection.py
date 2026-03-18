@@ -1,11 +1,11 @@
 """
-Step 8: Target/Comparison Selection (Filter-based)
+Step 9: Target/Comparison Selection (Filter-based)
 
 완전 리팩토링:
-- Reference Build 출력물(step6_refbuild/)을 입력으로 사용
+- Reference Build 출력물(step7_refbuild/)을 입력으로 사용
 - 필터별 타겟/비교성 선택
-- Step 8에서 최종 master catalog 저장 (step8_selection/master_catalog_{filter}.tsv)
-- 출력: step8_selection/ 폴더
+- Step 9에서 최종 master catalog 저장 (step9_selection/master_catalog_{filter}.tsv)
+- 출력: step9_selection/ 폴더
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import astropy.units as u
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
+import sip
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox, QMessageBox,
@@ -41,18 +42,15 @@ from PyQt5.QtWidgets import (
     QColorDialog, QGridLayout, QScrollArea, QMenu, QAction
 )
 from PyQt5.QtGui import QKeySequence, QColor
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import (
     step2_cropped_dir,
-    step5_dir,
-    step6_dir,
-    step7_dir,
-    legacy_step5_refbuild_dir,
-    legacy_step6_idmatch_dir,
-    legacy_step7_wcs_dir,
-    legacy_step7_refbuild_dir,
+    step6_wcs_dir,
+    step7_refbuild_dir,
+    step8_idmatch_dir,
+    step9_selection_dir,
 )
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 
@@ -65,7 +63,7 @@ def _extract_date_key(filename: str) -> str:
     return match.group(1) if match else ""
 
 
-def _resolve_idmatch_path(step7_dir: Path, legacy_dir: Path, filename: str) -> Path:
+def _resolve_idmatch_path(step7_dir: Path, filename: str) -> Path:
     date_key = _extract_date_key(filename)
     if date_key:
         dated = step7_dir / date_key / f"idmatch_{filename}.csv"
@@ -75,17 +73,13 @@ def _resolve_idmatch_path(step7_dir: Path, legacy_dir: Path, filename: str) -> P
     if direct.exists():
         return direct
     matches = list(step7_dir.glob(f"*/idmatch_{filename}.csv"))
-    if matches:
-        return matches[0]
-    legacy_direct = legacy_dir / f"idmatch_{filename}.csv"
-    if legacy_direct.exists():
-        return legacy_direct
-    legacy_matches = list(legacy_dir.glob(f"*/idmatch_{filename}.csv"))
-    return legacy_matches[0] if legacy_matches else direct
+    return matches[0] if matches else direct
 
 
-class MasterIdEditorWindow(StepWindowBase):
-    """Step 8: Target/Comparison Selection (Filter-based)"""
+class TargetComparisonSelectionWindow(StepWindowBase):
+    """Step 9: Target/Comparison Selection (Filter-based)"""
+    simbad_log = pyqtSignal(str)
+    simbad_fetch_done = pyqtSignal(dict)
 
     def __init__(self, params, file_manager, project_state, main_window):
         self.file_manager = file_manager
@@ -103,7 +97,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self.filter_catalogs: Dict[str, pd.DataFrame] = {}  # filter -> reference catalog
         self.filter_targets: Dict[str, Optional[int]] = {}  # filter -> target source_id
         self.filter_comparisons: Dict[str, Set[int]] = {}  # filter -> comparison source_ids
-        self.filter_master_ids: Dict[str, Set[int]] = {}  # filter -> final master source_ids (Step 8)
+        self.filter_master_ids: Dict[str, Set[int]] = {}  # filter -> final master source_ids (Step 9)
         self.catalog_ids: Set[int] = set()  # current filter reference catalog source_ids
         self._filter_all_source_ids: Dict[str, Set[int]] = {}
         self.step6_master_df: Optional[pd.DataFrame] = None
@@ -115,6 +109,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._gaia_radec_map: Dict[int, tuple] = {}
         self._gaia_bp_map: Dict[int, float] = {}
         self._gaia_rp_map: Dict[int, float] = {}
+        self._gaia_variable_flag_map: Dict[int, str] = {}
 
         self.master_ids: Set[int] = set()
         self.target_source_id: Optional[int] = None
@@ -125,6 +120,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self.sid_to_id: Dict[int, int] = {}
         self.id_to_sid: Dict[int, int] = {}
         self._pending_frame_index = None
+        self._closing = False
 
         # Global ID map (source_id -> display ID) from Step 6
         self._global_id_map: Dict[int, int] = {}
@@ -155,7 +151,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._flip_y: bool = False
 
         # SIMBAD type cache: source_id -> otype string (fetched async)
-        self._simbad_type_cache: Dict[int, str] = {}
+        self._simbad_type_cache: Dict[str, str] = {}
         self._simbad_fetch_thread: Optional[threading.Thread] = None
 
         # Overlay color management
@@ -207,7 +203,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._stretch_marker_max_line = None
 
         super().__init__(
-            step_index=7,
+            step_index=8,
             step_name="Target/Comparison Selection",
             params=params,
             project_state=project_state,
@@ -215,6 +211,8 @@ class MasterIdEditorWindow(StepWindowBase):
         )
 
         self.setup_step_ui()
+        self.simbad_log.connect(self.log)
+        self.simbad_fetch_done.connect(self._on_simbad_fetch_done)
         self.restore_state()
         self.setFocusPolicy(Qt.StrongFocus)
         self._shortcuts = []
@@ -308,7 +306,7 @@ class MasterIdEditorWindow(StepWindowBase):
         action_row1.addWidget(btn_set_check)
 
         btn_simbad = QPushButton("Aladin")
-        btn_simbad.setToolTip("현재 화각을 Aladin Lite(SIMBAD)에서 열기 (브라우저)")
+        btn_simbad.setToolTip("현재 화각을 Aladin Lite와 SIMBAD field query로 열기 (브라우저)")
         btn_simbad.clicked.connect(self.open_aladin_fov)
         action_row1.addWidget(btn_simbad)
 
@@ -329,21 +327,21 @@ class MasterIdEditorWindow(StepWindowBase):
 
         action_row2.addStretch()
 
-        action_row2.addWidget(QLabel("Rec:"))
+        action_row2.addWidget(QLabel("Recs:"))
         self.comp_reco_count = QSpinBox()
         self.comp_reco_count.setRange(1, 20)
         self.comp_reco_count.setValue(5)
         self.comp_reco_count.setFixedWidth(50)
         action_row2.addWidget(self.comp_reco_count)
 
-        btn_auto_comp = QPushButton("Auto")
-        btn_auto_comp.setToolTip("비교성 자동 선택")
+        btn_auto_comp = QPushButton("Auto Select")
+        btn_auto_comp.setToolTip("현재 선택을 유지한 채 비교성을 자동으로 추가 선택")
         btn_auto_comp.clicked.connect(self.auto_select_comparisons)
         action_row2.addWidget(btn_auto_comp)
 
-        btn_clear_comp = QPushButton("Clear")
-        btn_clear_comp.setToolTip("비교성 전체 해제")
-        btn_clear_comp.clicked.connect(self.clear_comparisons)
+        btn_clear_comp = QPushButton("Clear All")
+        btn_clear_comp.setToolTip("현재 필터의 Target / Comp / Check 역할을 모두 해제")
+        btn_clear_comp.clicked.connect(self.clear_all_roles)
         action_row2.addWidget(btn_clear_comp)
 
         btn_copy_to_all = QPushButton("Copy All")
@@ -352,7 +350,7 @@ class MasterIdEditorWindow(StepWindowBase):
         action_row2.addWidget(btn_copy_to_all)
 
         self.btn_simbad_types = QPushButton("SIMBAD Types")
-        self.btn_simbad_types.setToolTip("현재 화각의 SIMBAD 오브젝트 타입 가져오기 (인터넷 필요)")
+        self.btn_simbad_types.setToolTip("현재 필터의 Gaia 매치 소스에 대해 SIMBAD 오브젝트 타입 가져오기 (인터넷 필요)")
         self.btn_simbad_types.clicked.connect(self.fetch_simbad_types)
         action_row2.addWidget(self.btn_simbad_types)
 
@@ -502,8 +500,10 @@ class MasterIdEditorWindow(StepWindowBase):
         table_layout = QVBoxLayout(table_group)
 
         self.master_table = QTableWidget()
-        self.master_table.setColumnCount(9)
-        self.master_table.setHorizontalHeaderLabels(["ID", "x", "y", "G mag", "BP-RP", "Gaia ID", "Status", "Role", "SIMBAD"])
+        self.master_table.setColumnCount(10)
+        self.master_table.setHorizontalHeaderLabels(
+            ["ID", "x", "y", "G mag", "BP-RP", "Gaia ID", "Status", "Role", "Gaia Var", "SIMBAD"]
+        )
         header = self.master_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
@@ -513,13 +513,17 @@ class MasterIdEditorWindow(StepWindowBase):
         self.master_table.horizontalHeaderItem(4).setToolTip("Gaia BP-RP 색지수")
         self.master_table.setHorizontalHeaderItem(5, QTableWidgetItem("Gaia ID"))
         self.master_table.horizontalHeaderItem(5).setToolTip("Gaia DR3 source_id (매칭 안되면 '-')")
+        self.master_table.setHorizontalHeaderItem(8, QTableWidgetItem("Gaia Var"))
+        self.master_table.horizontalHeaderItem(8).setToolTip("Gaia phot_variable_flag. VARIABLE이면 변광 후보")
+        self.master_table.setHorizontalHeaderItem(9, QTableWidgetItem("SIMBAD"))
+        self.master_table.horizontalHeaderItem(9).setToolTip("SIMBAD object type code")
         self.master_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.master_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.master_table.setColumnHidden(5, True)
         self.master_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.master_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.master_table.customContextMenuRequested.connect(self._table_context_menu)
-        # SIMBAD col (8) is double-click editable
+        # SIMBAD col (9) is double-click editable
         self.master_table.doubleClicked.connect(self._on_table_double_click)
         table_layout.addWidget(self.master_table)
 
@@ -543,8 +547,125 @@ class MasterIdEditorWindow(StepWindowBase):
         self.load_step6_master_sources()
 
     def log(self, message: str):
+        if not self._qt_alive(getattr(self, "log_text", None)):
+            return
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
+        try:
+            self.log_text.append(f"[{timestamp}] {message}")
+        except RuntimeError:
+            pass
+
+    def _qt_alive(self, obj) -> bool:
+        if obj is None:
+            return False
+        try:
+            return not sip.isdeleted(obj)
+        except Exception:
+            return False
+
+    def _safe_canvas_draw_idle(self):
+        if self._closing:
+            return
+        canvas = getattr(self, "canvas", None)
+        if not self._qt_alive(canvas):
+            return
+        try:
+            canvas.draw_idle()
+        except RuntimeError:
+            pass
+
+    def _safe_stretch_plot_draw_idle(self):
+        if self._closing:
+            return
+        canvas = getattr(self, "stretch_plot_canvas", None)
+        if not self._qt_alive(canvas):
+            return
+        try:
+            canvas.draw_idle()
+        except RuntimeError:
+            pass
+
+    def _simbad_cache_key(self, source_id: int, flt: Optional[str] = None) -> str:
+        sid = int(source_id)
+        if sid > 0:
+            return f"gaia:{sid}"
+        flt_key = str(flt if flt is not None else (self.current_filter or ""))
+        return f"local:{flt_key}:{sid}"
+
+    def _get_simbad_type_for_source(self, source_id: int, flt: Optional[str] = None) -> str:
+        key = self._simbad_cache_key(source_id, flt=flt)
+        return str(self._simbad_type_cache.get(key, "") or "")
+
+    def _set_simbad_type_for_source(self, source_id: int, otype: str, flt: Optional[str] = None) -> None:
+        key = self._simbad_cache_key(source_id, flt=flt)
+        value = str(otype or "").strip()
+        if value:
+            self._simbad_type_cache[key] = value
+        else:
+            self._simbad_type_cache.pop(key, None)
+
+    def _normalize_gaia_variable_flag(self, value) -> str:
+        text = str(value or "").strip().upper()
+        if text in ("", "NAN", "NONE", "<NA>"):
+            return ""
+        return text
+
+    def _get_gaia_variable_flag(self, source_id: int) -> str:
+        sid = int(source_id)
+        if sid <= 0:
+            return ""
+        return self._normalize_gaia_variable_flag(self._gaia_variable_flag_map.get(sid, ""))
+
+    def _is_gaia_variable_candidate(self, source_id: int) -> bool:
+        return self._get_gaia_variable_flag(source_id) == "VARIABLE"
+
+    def _ensure_idmatch_radec_columns(self) -> tuple[Optional[str], Optional[str]]:
+        if self.idmatch_df is None or self.idmatch_df.empty:
+            return None, None
+
+        df = self.idmatch_df
+
+        def _coalesce_numeric(columns) -> Optional[pd.Series]:
+            series = None
+            for col in columns:
+                if col not in df.columns:
+                    continue
+                vals = pd.to_numeric(df[col], errors="coerce")
+                series = vals if series is None else series.combine_first(vals)
+            return series
+
+        ra_series = _coalesce_numeric(("ra_gaia", "ra", "RA", "ra_deg"))
+        dec_series = _coalesce_numeric(("dec_gaia", "dec", "DEC", "dec_deg"))
+
+        need_wcs_fill = (
+            ra_series is None
+            or dec_series is None
+            or bool((ra_series.isna() | dec_series.isna()).any())
+        )
+        if need_wcs_fill and {"x", "y"} <= set(df.columns) and self.header is not None:
+            try:
+                w = WCS(self.header, relax=True)
+            except Exception:
+                w = None
+            if w is not None and w.has_celestial:
+                try:
+                    xy = df[["x", "y"]].to_numpy(float)
+                    ra_wcs, dec_wcs = w.all_pix2world(xy[:, 0], xy[:, 1], 0)
+                    ra_wcs_s = pd.Series(pd.to_numeric(ra_wcs, errors="coerce"), index=df.index)
+                    dec_wcs_s = pd.Series(pd.to_numeric(dec_wcs, errors="coerce"), index=df.index)
+                    ra_series = ra_wcs_s if ra_series is None else ra_series.combine_first(ra_wcs_s)
+                    dec_series = dec_wcs_s if dec_series is None else dec_series.combine_first(dec_wcs_s)
+                except Exception:
+                    pass
+
+        if ra_series is None or dec_series is None:
+            return None, None
+        if not bool((ra_series.notna() & dec_series.notna()).any()):
+            return None, None
+
+        self.idmatch_df["ra"] = ra_series.to_numpy()
+        self.idmatch_df["dec"] = dec_series.to_numpy()
+        return "ra", "dec"
 
     def _restore_file_context(self):
         """Restore data_dir and file_path_map after restart if needed."""
@@ -590,18 +711,14 @@ class MasterIdEditorWindow(StepWindowBase):
                 self.params.P.file_path_map = {k: str(v) for k, v in self.file_manager.path_map.items()}
 
     def check_step7_status(self):
-        """Step 7/ID Match 출력물 확인 및 필터 로드 (Reference Build 없이도 동작)"""
-        step7_out = step7_dir(self.params.P.result_dir)
-        legacy_idmatch = legacy_step6_idmatch_dir(self.params.P.result_dir)
-        step6_out = step6_dir(self.params.P.result_dir)
-        legacy_refbuild = legacy_step5_refbuild_dir(self.params.P.result_dir)
+        """Step 8 ID-match 출력물 확인 및 필터 로드 (Reference Build 없이도 동작)"""
+        step8_out = step8_idmatch_dir(self.params.P.result_dir)
+        step7_out = step7_refbuild_dir(self.params.P.result_dir)
 
-        # Step 7 필터 정보 로드 (필수)
-        filter_frames_path = step7_out / "step7_filter_frames.json"
+        # Step 8 필터 정보 로드 (필수)
+        filter_frames_path = step8_out / "step8_filter_frames.json"
         if not filter_frames_path.exists():
-            filter_frames_path = legacy_idmatch / "step6_filter_frames.json"
-        if not filter_frames_path.exists():
-            self.step7_status_label.setText("Step 7 not complete. Run ID Match first.")
+            self.step7_status_label.setText("Step 8 not complete. Run ID Match first.")
             self.step7_status_label.setStyleSheet("color: red;")
             return
 
@@ -614,7 +731,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
             filters = list(self.filter_frames.keys())
             if not filters:
-                self.step7_status_label.setText("No filters found in Step 7")
+                self.step7_status_label.setText("No filters found in Step 8")
                 self.step7_status_label.setStyleSheet("color: red;")
                 return
         except Exception as e:
@@ -626,11 +743,7 @@ class MasterIdEditorWindow(StepWindowBase):
         try:
             # Reference Build catalog 로드 (선택사항 - catalog_ids만 표시)
             step7_available = False
-            meta_path = step6_out / "ref_build_meta.json"
-            if not meta_path.exists():
-                meta_path = legacy_refbuild / "ref_build_meta.json"
-            if not meta_path.exists():
-                meta_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / "step7_meta.json"
+            meta_path = step7_out / "ref_build_meta.json"
             if meta_path.exists():
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
@@ -639,14 +752,10 @@ class MasterIdEditorWindow(StepWindowBase):
                     self.log(f"Reference build meta warning: {e}")
 
             for flt in filters:
-                catalog_path = step6_out / f"ref_catalog_{flt}.tsv"
-                if not catalog_path.exists():
-                    catalog_path = legacy_refbuild / f"ref_catalog_{flt}.tsv"
-                if not catalog_path.exists():
-                    catalog_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / f"master_catalog_{flt}.tsv"
+                catalog_path = step7_out / f"ref_catalog_{flt}.tsv"
                 if not catalog_path.exists():
                     # per-date fallback: pick the first matching ref catalog
-                    matches = sorted(step6_out.glob(f"ref_catalog_{flt}_*.tsv"))
+                    matches = sorted(step7_out.glob(f"ref_catalog_{flt}_*.tsv"))
                     if matches:
                         catalog_path = matches[0]
                 if catalog_path.exists():
@@ -692,13 +801,13 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def load_selections(self):
         """기존 선택 데이터 로드"""
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        if not step8_dir.exists():
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        if not step9_out.exists():
             return
 
         # filter_frames 기준으로 선택 로드 (filter_catalogs 의존성 제거)
         for flt in self.filter_frames.keys():
-            selection_path = step8_dir / f"selection_{flt}.json"
+            selection_path = step9_out / f"selection_{flt}.json"
             if selection_path.exists():
                 try:
                     with open(selection_path, "r", encoding="utf-8") as f:
@@ -721,11 +830,7 @@ class MasterIdEditorWindow(StepWindowBase):
     def load_gaia_catalog(self):
         """Gaia 카탈로그 로드"""
         from astropy.table import Table
-        gaia_path = step5_dir(self.params.P.result_dir) / "gaia_fov.ecsv"
-        if not gaia_path.exists():
-            gaia_path = legacy_step7_wcs_dir(self.params.P.result_dir) / "gaia_fov.ecsv"
-        if not gaia_path.exists():
-            gaia_path = self.params.P.result_dir / "gaia_fov.ecsv"
+        gaia_path = step6_wcs_dir(self.params.P.result_dir) / "gaia_fov.ecsv"
         if gaia_path.exists():
             try:
                 tab = Table.read(str(gaia_path), format="ascii.ecsv")
@@ -740,6 +845,7 @@ class MasterIdEditorWindow(StepWindowBase):
                     self.gaia_df["source_id"] = sid_series[sid_series.notna()].astype("int64")
                 self._gaia_gmag_map = {}
                 self._gaia_radec_map = {}
+                self._gaia_variable_flag_map = {}
                 if self.gaia_df is not None and "source_id" in self.gaia_df.columns:
                     sid_series = coerce_int64_source_id(self.gaia_df["source_id"])
                     g_col = None
@@ -762,23 +868,30 @@ class MasterIdEditorWindow(StepWindowBase):
                             int(sid): (float(ra), float(dec))
                             for sid, ra, dec in zip(sid_series[mask], ra_vals[mask], dec_vals[mask])
                         }
-                self.log(f"Gaia catalog: {len(self.gaia_df)} sources")
+                    if "phot_variable_flag" in self.gaia_df.columns:
+                        for sid_val, raw_flag in zip(sid_series, self.gaia_df["phot_variable_flag"]):
+                            if pd.isna(sid_val):
+                                continue
+                            flag = self._normalize_gaia_variable_flag(raw_flag)
+                            if flag:
+                                self._gaia_variable_flag_map[int(sid_val)] = flag
+                n_var = sum(1 for flag in self._gaia_variable_flag_map.values() if flag == "VARIABLE")
+                self.log(f"Gaia catalog: {len(self.gaia_df)} sources, variable-flagged {n_var}")
                 self._enrich_filter_catalogs_with_gaia()
             except Exception as e:
                 self.log(f"Failed to load Gaia: {e}")
                 self.gaia_df = None
                 self._gaia_gmag_map = {}
                 self._gaia_radec_map = {}
+                self._gaia_variable_flag_map = {}
 
     def load_step6_master_sources(self):
-        """Step 7 master source list (ra/dec, Gaia mags)"""
-        step6_path = self.params.P.result_dir / "step7_idmatch" / "step7_master_sources.csv"
-        if not step6_path.exists():
-            step6_path = legacy_step6_idmatch_dir(self.params.P.result_dir) / "step6_master_sources.csv"
-        if not step6_path.exists():
+        """Step 8 master source list (ra/dec, Gaia mags)"""
+        step8_path = step8_idmatch_dir(self.params.P.result_dir) / "step8_master_sources.csv"
+        if not step8_path.exists():
             return
         try:
-            df = read_csv_int64_source_id(step6_path)
+            df = read_csv_int64_source_id(step8_path)
             if "source_id" not in df.columns:
                 return
             sid_series = coerce_int64_source_id(df["source_id"])
@@ -977,13 +1090,13 @@ class MasterIdEditorWindow(StepWindowBase):
             self.log(f"Gaia G matched to ref sources: {matched}")
 
     def load_master_catalogs(self):
-        """Load Step 8 master catalogs if they already exist."""
+        """Load Step 9 master catalogs if they already exist."""
         self.filter_master_ids.clear()
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        if not step8_dir.exists():
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        if not step9_out.exists():
             return
         for flt in self.filter_frames.keys():
-            path = step8_dir / f"master_catalog_{flt}.tsv"
+            path = step9_out / f"master_catalog_{flt}.tsv"
             if not path.exists():
                 continue
             try:
@@ -1120,9 +1233,9 @@ class MasterIdEditorWindow(StepWindowBase):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _load_global_id_map(self, flt: Optional[str] = None) -> None:
-        """Load global ID map (source_id -> ID) from Step 6 output."""
-        step6_out = step6_dir(self.params.P.result_dir)
-        global_path = step6_out / "sourceid_to_ID.csv"
+        """Load global ID map (source_id -> ID) from Step 7 output."""
+        step7_out = step7_refbuild_dir(self.params.P.result_dir)
+        global_path = step7_out / "sourceid_to_ID.csv"
 
         path = None
         if global_path.exists():
@@ -1130,7 +1243,7 @@ class MasterIdEditorWindow(StepWindowBase):
         else:
             use_flt = flt or self.current_filter
             if use_flt:
-                cand = step6_out / f"sourceid_to_ID_{use_flt}.csv"
+                cand = step7_out / f"sourceid_to_ID_{use_flt}.csv"
                 if cand.exists():
                     path = cand
 
@@ -1167,8 +1280,8 @@ class MasterIdEditorWindow(StepWindowBase):
         if flt in self._id_registry:
             return  # Already loaded
 
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        registry_path = step8_dir / f"id_registry_{flt}.json"
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        registry_path = step9_out / f"id_registry_{flt}.json"
 
         if registry_path.exists():
             # Load existing persistent registry
@@ -1184,7 +1297,7 @@ class MasterIdEditorWindow(StepWindowBase):
                 pass
 
         # Migration: try to load from existing master_catalog
-        legacy_path = step8_dir / f"master_catalog_{flt}.tsv"
+        legacy_path = step9_out / f"master_catalog_{flt}.tsv"
         if legacy_path.exists():
             try:
                 df = read_csv_int64_source_id(legacy_path, sep="\t")
@@ -1213,9 +1326,9 @@ class MasterIdEditorWindow(StepWindowBase):
         if flt not in self._id_registry:
             return
 
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        step8_dir.mkdir(parents=True, exist_ok=True)
-        registry_path = step8_dir / f"id_registry_{flt}.json"
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        step9_out.mkdir(parents=True, exist_ok=True)
+        registry_path = step9_out / f"id_registry_{flt}.json"
 
         data = {
             "source_id_to_stable_id": {
@@ -1320,13 +1433,12 @@ class MasterIdEditorWindow(StepWindowBase):
         if flt in self._filter_all_source_ids:
             return set(self._filter_all_source_ids[flt])
 
-        step6_dir = self.params.P.result_dir / "step7_idmatch"
-        legacy_idmatch = legacy_step6_idmatch_dir(self.params.P.result_dir)
+        step8_out = step8_idmatch_dir(self.params.P.result_dir)
         frames = self.filter_frames.get(flt, [])
         sids: Set[int] = set()
 
         for fname in frames:
-            p = _resolve_idmatch_path(step6_dir, legacy_idmatch, fname)
+            p = _resolve_idmatch_path(step8_out, fname)
             if not p.exists():
                 continue
             try:
@@ -1355,8 +1467,7 @@ class MasterIdEditorWindow(StepWindowBase):
         if cached is not None:
             return set(cached)
 
-        step7_out = self.params.P.result_dir / "step7_idmatch"
-        legacy_idmatch = legacy_step6_idmatch_dir(self.params.P.result_dir)
+        step8_out = step8_idmatch_dir(self.params.P.result_dir)
         frames = self.filter_frames.get(flt, [])
         if not frames:
             return set()
@@ -1366,7 +1477,7 @@ class MasterIdEditorWindow(StepWindowBase):
         n_frames = 0
 
         for fname in frames:
-            p = _resolve_idmatch_path(step7_out, legacy_idmatch, fname)
+            p = _resolve_idmatch_path(step8_out, fname)
             if not p.exists():
                 continue
             try:
@@ -1492,16 +1603,26 @@ class MasterIdEditorWindow(StepWindowBase):
             return self._step6_radec_map[sid]
         if sid in self._gaia_radec_map:
             return self._gaia_radec_map[sid]
-        if self.idmatch_df is not None and not self.idmatch_df.empty:
-            df = self.idmatch_df
-            for ra_col, dec_col in (("ra_gaia", "dec_gaia"), ("ra", "dec"), ("RA", "DEC")):
-                if ra_col in df.columns and dec_col in df.columns:
-                    sub = df[df["source_id"] == sid]
-                    if len(sub):
+        if self.current_filter and self.current_filter in self.filter_catalogs:
+            cat = self.filter_catalogs[self.current_filter]
+            if "source_id" in cat.columns:
+                sub = cat[cat["source_id"] == sid]
+                if len(sub):
+                    for ra_col, dec_col in (("ra_deg", "dec_deg"), ("ra", "dec")):
+                        if ra_col not in sub.columns or dec_col not in sub.columns:
+                            continue
                         ra = pd.to_numeric(sub.iloc[0][ra_col], errors="coerce")
                         dec = pd.to_numeric(sub.iloc[0][dec_col], errors="coerce")
                         if np.isfinite(ra) and np.isfinite(dec):
                             return float(ra), float(dec)
+        ra_col, dec_col = self._ensure_idmatch_radec_columns()
+        if ra_col is not None and dec_col is not None and self.idmatch_df is not None and not self.idmatch_df.empty:
+            sub = self.idmatch_df[self.idmatch_df["source_id"] == sid]
+            if len(sub):
+                ra = pd.to_numeric(sub.iloc[0][ra_col], errors="coerce")
+                dec = pd.to_numeric(sub.iloc[0][dec_col], errors="coerce")
+                if np.isfinite(ra) and np.isfinite(dec):
+                    return float(ra), float(dec)
         return (float("nan"), float("nan"))
 
     def _get_xy_ref_for_source(self, source_id: int, ra_deg: float, dec_deg: float) -> tuple:
@@ -1607,8 +1728,8 @@ class MasterIdEditorWindow(StepWindowBase):
         if master_ids is None:
             return
 
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        step8_dir.mkdir(parents=True, exist_ok=True)
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        step9_out.mkdir(parents=True, exist_ok=True)
 
         base_df = None
         if flt in self.filter_catalogs:
@@ -1693,11 +1814,11 @@ class MasterIdEditorWindow(StepWindowBase):
 
         df_out = df_out[[c for c in output_cols if c in df_out.columns]]
 
-        out_path = step8_dir / f"master_catalog_{flt}.tsv"
+        out_path = step9_out / f"master_catalog_{flt}.tsv"
         df_out.to_csv(out_path, sep="\t", index=False, na_rep="NaN", encoding="utf-8-sig")
 
         # ID 매핑 파일도 저장 (다른 Step에서 참조용)
-        id_map_path = step8_dir / f"id_mapping_{flt}.csv"
+        id_map_path = step9_out / f"id_mapping_{flt}.csv"
         id_map_df = df_out[["ID", "source_id", "gaia_id", "role", "x_ref", "y_ref"]].copy()
         id_map_df.to_csv(id_map_path, index=False, na_rep="NaN")
 
@@ -1727,11 +1848,7 @@ class MasterIdEditorWindow(StepWindowBase):
     def _load_ref_header(self) -> None:
         if self.ref_header is not None:
             return
-        meta_path = step6_dir(self.params.P.result_dir) / "ref_build_meta.json"
-        if not meta_path.exists():
-            meta_path = legacy_step5_refbuild_dir(self.params.P.result_dir) / "ref_build_meta.json"
-        if not meta_path.exists():
-            meta_path = legacy_step7_refbuild_dir(self.params.P.result_dir) / "ref_build_meta.json"
+        meta_path = step7_refbuild_dir(self.params.P.result_dir) / "ref_build_meta.json"
         if not meta_path.exists():
             return
         try:
@@ -1781,7 +1898,7 @@ class MasterIdEditorWindow(StepWindowBase):
             cat = self.filter_catalogs[self.current_filter]
             self.catalog_ids = set(coerce_int64_source_id(cat["source_id"]).dropna().astype("int64").tolist())
 
-        # Step 8 master (final) load/init
+        # Step 9 master (final) load/init
         self._ensure_master_ids_for_filter(self.current_filter)
 
         # 모든 프레임의 source_id에 대해 안정적인 ID 사전 할당
@@ -1843,7 +1960,6 @@ class MasterIdEditorWindow(StepWindowBase):
             return cached
 
         cropped_dir = step2_cropped_dir(self.params.P.result_dir)
-        legacy_cropped_dir = self.params.P.result_dir / "cropped"
         data_dir = Path(self.params.P.data_dir)
         mapped_path = None
         try:
@@ -1856,7 +1972,6 @@ class MasterIdEditorWindow(StepWindowBase):
             candidates.append(Path(mapped_path))
         candidates.extend([
             cropped_dir / filename,
-            legacy_cropped_dir / filename,
             data_dir / filename,
         ])
         if not filename.endswith((".fits", ".fit", ".fts", ".fit.fz", ".fits.fz")):
@@ -1865,10 +1980,6 @@ class MasterIdEditorWindow(StepWindowBase):
                 cropped_dir / f"{filename}.fit",
                 cropped_dir / f"{filename}.fit.fz",
                 cropped_dir / f"{filename}.fits.fz",
-                legacy_cropped_dir / f"{filename}.fits",
-                legacy_cropped_dir / f"{filename}.fit",
-                legacy_cropped_dir / f"{filename}.fit.fz",
-                legacy_cropped_dir / f"{filename}.fits.fz",
                 data_dir / f"{filename}.fits",
                 data_dir / f"{filename}.fit",
                 data_dir / f"{filename}.fit.fz",
@@ -2008,14 +2119,13 @@ class MasterIdEditorWindow(StepWindowBase):
         return np.column_stack([x, y])
 
     def load_idmatch_for_file(self, filename):
-        """Step 7 idmatch 파일 로드"""
+        """Step 8 idmatch 파일 로드"""
         if filename in self._idmatch_cache:
             self.idmatch_df = self._idmatch_cache[filename]
             return
 
-        step6_dir = self.params.P.result_dir / "step7_idmatch"
-        legacy_idmatch = legacy_step6_idmatch_dir(self.params.P.result_dir)
-        idmatch_path = _resolve_idmatch_path(step6_dir, legacy_idmatch, filename)
+        step8_out = step8_idmatch_dir(self.params.P.result_dir)
+        idmatch_path = _resolve_idmatch_path(step8_out, filename)
 
         if idmatch_path.exists():
             try:
@@ -2041,7 +2151,7 @@ class MasterIdEditorWindow(StepWindowBase):
         self._idmatch_cache[filename] = self.idmatch_df
 
     def display_image(self, full_redraw=False):
-        if self.image_data is None:
+        if self._closing or self.image_data is None or not self._qt_alive(self.canvas) or self.ax is None:
             return
 
         stretched = self._get_stretched_display_cached()
@@ -2056,7 +2166,7 @@ class MasterIdEditorWindow(StepWindowBase):
         if self._imshow_obj is not None and not full_redraw:
             self._imshow_obj.set_data(stretched)
             self.ax.set_title(f"{self.current_filename} | {self.current_filter}")
-            self.canvas.draw_idle()
+            self._safe_canvas_draw_idle()
             return
 
         xlim_current = self.ax.get_xlim() if self.xlim_original else None
@@ -2097,11 +2207,13 @@ class MasterIdEditorWindow(StepWindowBase):
         self._scat_selected = self.ax.scatter(
             [], [], s=70, facecolors='none', edgecolors='red', linewidths=1.8, alpha=0.9)
 
-        self.canvas.draw_idle()
+        self._safe_canvas_draw_idle()
 
     def update_overlay(self):
+        if self._closing or not self._qt_alive(self.canvas) or self.ax is None:
+            return
         if self.idmatch_df is None or self.idmatch_df.empty:
-            self.canvas.draw_idle()
+            self._safe_canvas_draw_idle()
             return
 
         # Use pre-created scatter artists if available, else fall back to remove+create
@@ -2155,12 +2267,20 @@ class MasterIdEditorWindow(StepWindowBase):
         is_gaia_matched = np.array([sid in gaia_ids for sid in sids])
 
         # "Show selected only" 모드: 타겟과 비교성만 표시
-        show_selected_only = self.show_selected_only.isChecked()
+        show_selected_only = False
+        if self._qt_alive(getattr(self, "show_selected_only", None)):
+            try:
+                show_selected_only = self.show_selected_only.isChecked()
+            except RuntimeError:
+                show_selected_only = False
         def _toggle_enabled(key: str, default: bool = True) -> bool:
             if hasattr(self, "overlay_toggles"):
                 cb = self.overlay_toggles.get(key)
-                if cb is not None:
-                    return cb.isChecked()
+                if self._qt_alive(cb):
+                    try:
+                        return cb.isChecked()
+                    except RuntimeError:
+                        return default
             return default
 
         show_matched_gaia = _toggle_enabled("matched_gaia", True)
@@ -2365,7 +2485,7 @@ class MasterIdEditorWindow(StepWindowBase):
                     self.ax.scatter(sx, sy, s=70, facecolors='none',
                                     edgecolors='red', linewidths=1.8, alpha=0.9)
 
-        self.canvas.draw_idle()
+        self._safe_canvas_draw_idle()
 
     def update_master_table(self):
         """검출 테이블 업데이트 - idmatch_df의 모든 검출 표시
@@ -2459,14 +2579,21 @@ class MasterIdEditorWindow(StepWindowBase):
             self.master_table.setItem(i, 5, QTableWidgetItem(gaia_id_str))
             self.master_table.setItem(i, 6, QTableWidgetItem(match_status))
             self.master_table.setItem(i, 7, QTableWidgetItem(role))
-            # SIMBAD type (col 8) — filled from cache if available
-            otype = self._simbad_type_cache.get(sid, "")
+            var_flag = self._get_gaia_variable_flag(sid)
+            var_item = QTableWidgetItem("VAR" if var_flag == "VARIABLE" else "")
+            if var_flag == "VARIABLE":
+                from PyQt5.QtGui import QColor as _QColor
+                var_item.setForeground(_QColor("#FF6B6B"))
+                var_item.setToolTip("Gaia phot_variable_flag=VARIABLE")
+            self.master_table.setItem(i, 8, var_item)
+            # SIMBAD type (col 9) — filled from cache if available
+            otype = self._get_simbad_type_for_source(sid, flt=self.current_filter)
             otype_item = QTableWidgetItem(otype)
             if otype and otype not in ("*", ""):
                 from PyQt5.QtGui import QColor as _QColor
                 otype_item.setForeground(_QColor("#FFD700") if any(k in otype for k in ("V*", "EB", "RR", "Cep"))
                                          else _QColor("#80DEEA"))
-            self.master_table.setItem(i, 8, otype_item)
+            self.master_table.setItem(i, 9, otype_item)
             self._sid_to_row[int(sid)] = i
 
         self._toggle_gaia_id_column()
@@ -2482,19 +2609,13 @@ class MasterIdEditorWindow(StepWindowBase):
                     # 내부 ID에서 source_id 가져오기
                     self.selected_source_id = self.id_to_sid.get(internal_id)
                     if self.selected_source_id is not None:
-                        status = self.master_table.item(row_idx, 6).text() if self.master_table.item(row_idx, 6) else ""
-                        role = self.master_table.item(row_idx, 7).text() if self.master_table.item(row_idx, 7) else ""
-                        g_str = self.master_table.item(row_idx, 3).text() if self.master_table.item(row_idx, 3) else "-"
-                        bp_rp = self.master_table.item(row_idx, 4).text() if self.master_table.item(row_idx, 4) else "-"
-                        role_str = f" [{role}]" if role else ""
-                        self.selected_label.setText(
-                            f"Selected: ID {internal_id}{role_str} G={g_str} BP-RP={bp_rp} ({status})"
-                        )
+                        self._update_selected_label_for_sid(self.selected_source_id)
                         self.update_overlay()
                 except ValueError:
                     pass
         else:
             self.selected_source_id = None
+            self._update_selected_label_for_sid(None)
 
     def _toggle_gaia_id_column(self):
         """Hide/show Gaia ID column in the table."""
@@ -2597,7 +2718,56 @@ class MasterIdEditorWindow(StepWindowBase):
             return
         self.master_table.blockSignals(True)
         self.master_table.selectRow(row)
+        self.master_table.setCurrentCell(row, 0)
+        item = self.master_table.item(row, 0)
+        if item is not None:
+            self.master_table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
         self.master_table.blockSignals(False)
+
+    def _update_selected_label_for_sid(self, sid: Optional[int] = None):
+        if sid is None:
+            sid = self.selected_source_id
+        if sid is None:
+            self.selected_label.setText("Selected: (none)")
+            return
+
+        row_idx = getattr(self, "_sid_to_row", {}).get(int(sid))
+        if row_idx is None:
+            display_id = self.sid_to_id.get(int(sid))
+            if display_id is None:
+                self._load_global_id_map(self.current_filter)
+                display_id = self._global_id_map.get(int(sid), "?")
+            self.selected_label.setText(f"Selected: ID {display_id}")
+            return
+
+        id_item = self.master_table.item(row_idx, 0)
+        status_item = self.master_table.item(row_idx, 6)
+        role_item = self.master_table.item(row_idx, 7)
+        g_item = self.master_table.item(row_idx, 3)
+        color_item = self.master_table.item(row_idx, 4)
+
+        internal_id = id_item.text() if id_item else "?"
+        status = status_item.text() if status_item else ""
+        role = role_item.text() if role_item else ""
+        g_str = g_item.text() if g_item else "-"
+        bp_rp = color_item.text() if color_item else "-"
+        role_str = f" [{role}]" if role else ""
+        self.selected_label.setText(
+            f"Selected: ID {internal_id}{role_str} G={g_str} BP-RP={bp_rp} ({status})"
+        )
+
+    def _refresh_role_ui(self, *, preserve_selection: bool = True):
+        keep_sid = int(self.selected_source_id) if (preserve_selection and self.selected_source_id is not None) else None
+        self.update_target_labels()
+        self._update_check_label()
+        self.update_master_table()
+        if keep_sid is not None:
+            self.selected_source_id = keep_sid
+            self._select_table_row_by_sid(keep_sid)
+            self._update_selected_label_for_sid(keep_sid)
+        else:
+            self._update_selected_label_for_sid(None)
+        self.update_overlay()
 
     def _drop_from_selection(self, sids: Set[int]):
         if not sids:
@@ -2615,7 +2785,13 @@ class MasterIdEditorWindow(StepWindowBase):
             self.update_target_labels()
             self.save_selection()
 
-    def _add_to_master(self, sids: Set[int], reason: str = "added") -> Set[int]:
+    def _add_to_master(
+        self,
+        sids: Set[int],
+        reason: str = "added",
+        refresh: bool = True,
+        persist: bool = True,
+    ) -> Set[int]:
         if not self.current_filter:
             return set()
         added = set()
@@ -2632,9 +2808,11 @@ class MasterIdEditorWindow(StepWindowBase):
         if added:
             self.filter_master_ids[self.current_filter] = self.master_ids
             self._filter_all_source_ids.pop(self.current_filter, None)
-            self.save_master_catalog(log_action=reason)
-            self.update_master_table()
-            self.update_overlay()
+            if persist:
+                self.save_master_catalog(log_action=reason)
+            if refresh:
+                self.update_master_table()
+                self.update_overlay()
         return added
 
     def _remove_from_master(self, sids: Set[int], reason: str = "removed") -> Set[int]:
@@ -2701,7 +2879,7 @@ class MasterIdEditorWindow(StepWindowBase):
         sid = int(self.selected_source_id)
 
         if sid not in self.master_ids:
-            self._add_to_master({sid}, reason="auto_add_target")
+            self._add_to_master({sid}, reason="auto_add_target", refresh=False, persist=False)
 
         if self.target_source_id == sid:
             # 토글 해제
@@ -2713,10 +2891,8 @@ class MasterIdEditorWindow(StepWindowBase):
             self.comparison_ids.discard(sid)
             self.filter_comparisons[self.current_filter] = self.comparison_ids.copy()
 
-        self.update_target_labels()
         self.save_selection()
-        self.update_master_table()
-        self.update_overlay()
+        self._refresh_role_ui()
         self.log(f"Target set: {self.target_source_id}")
 
     def toggle_comparison_selected(self):
@@ -2730,7 +2906,7 @@ class MasterIdEditorWindow(StepWindowBase):
             return
 
         if sid not in self.master_ids:
-            self._add_to_master({sid}, reason="auto_add_comp")
+            self._add_to_master({sid}, reason="auto_add_comp", refresh=False, persist=False)
 
         flt = self.current_filter
         is_check = flt and self.filter_check_stars.get(flt) == sid
@@ -2749,10 +2925,8 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if flt:
             self.filter_comparisons[flt] = self.comparison_ids.copy()
-        self.update_target_labels()
         self.save_selection()
-        self.update_master_table()
-        self.update_overlay()
+        self._refresh_role_ui()
         self.log(f"Comparison {action}: {sid}")
 
     def set_check_selected(self):
@@ -2767,15 +2941,15 @@ class MasterIdEditorWindow(StepWindowBase):
             self.filter_check_stars[flt] = None
         else:
             sid = int(self.selected_source_id)
+            if sid not in self.master_ids:
+                self._add_to_master({sid}, reason="auto_add_check", refresh=False, persist=False)
             self.filter_check_stars[flt] = sid
             # Check star는 comp ensemble에서 제외
             self.comparison_ids.discard(sid)
             if flt in self.filter_comparisons:
                 self.filter_comparisons[flt].discard(sid)
-        self._update_check_label()
         self.save_selection()
-        self.update_master_table()
-        self.update_overlay()
+        self._refresh_role_ui()
         self.log(f"Check star set: {self.filter_check_stars.get(flt)}")
 
     def _update_check_label(self):
@@ -2856,7 +3030,7 @@ class MasterIdEditorWindow(StepWindowBase):
                                 scat.set_edgecolors(hex_color)
                             except Exception:
                                 pass
-                    self.canvas.draw_idle()
+                    self._safe_canvas_draw_idle()
                 return _on_click
 
             btn_swatch.clicked.connect(_make_color_click(key, btn_swatch))
@@ -2910,6 +3084,7 @@ class MasterIdEditorWindow(StepWindowBase):
         # 후보 수집: 공통 source_id에 해당하는 것만
         candidates = []
         seen_sids = set()
+        excluded_variable_sids: Set[int] = set()
         # check star는 comp ensemble에서 제외
         _check_sid = self.filter_check_stars.get(self.current_filter) if self.current_filter else None
 
@@ -2920,11 +3095,14 @@ class MasterIdEditorWindow(StepWindowBase):
                 if not np.isfinite(sid_val):
                     continue
                 sid = int(sid_val)
-                if sid == self.target_source_id or sid in seen_sids:
+                if sid == self.target_source_id or sid in seen_sids or sid in self.comparison_ids:
                     continue
                 if _check_sid is not None and sid == _check_sid:
                     continue
                 if sid not in common_sids:
+                    continue
+                if self._is_gaia_variable_candidate(sid):
+                    excluded_variable_sids.add(sid)
                     continue
                 seen_sids.add(sid)
 
@@ -2958,11 +3136,14 @@ class MasterIdEditorWindow(StepWindowBase):
                 if not np.isfinite(sid_val):
                     continue
                 sid = int(sid_val)
-                if sid == self.target_source_id or sid in seen_sids:
+                if sid == self.target_source_id or sid in seen_sids or sid in self.comparison_ids:
                     continue
                 if _check_sid is not None and sid == _check_sid:
                     continue
                 if sid not in common_sids:
+                    continue
+                if self._is_gaia_variable_candidate(sid):
+                    excluded_variable_sids.add(sid)
                     continue
                 seen_sids.add(sid)
 
@@ -2997,6 +3178,8 @@ class MasterIdEditorWindow(StepWindowBase):
 
         self.log(f"Auto-select: {len(candidates)} candidates from "
                  f"{len(common_sids)} common sources")
+        if excluded_variable_sids:
+            self.log(f"Auto-select: excluded {len(excluded_variable_sids)} Gaia variable candidates")
 
         cand_df = pd.DataFrame(candidates)
 
@@ -3059,13 +3242,11 @@ class MasterIdEditorWindow(StepWindowBase):
         self.comparison_ids.update(picked_sids)
         if self.target_source_id is not None:
             self.comparison_ids.discard(self.target_source_id)
-        self._add_to_master(picked_sids, reason="auto_add_comp")
+        self._add_to_master(picked_sids, reason="auto_add_comp", refresh=False, persist=False)
 
         self.filter_comparisons[self.current_filter] = self.comparison_ids.copy()
-        self.update_target_labels()
         self.save_selection()
-        self.update_master_table()
-        self.update_overlay()
+        self._refresh_role_ui()
 
         # 결과 메시지
         msg = f"Added {len(picked)} comparison stars:\n\n"
@@ -3080,17 +3261,26 @@ class MasterIdEditorWindow(StepWindowBase):
 
         QMessageBox.information(self, "Comparison", msg)
 
-    def clear_comparisons(self):
-        if not self.comparison_ids:
+    def clear_all_roles(self):
+        if not self.current_filter:
             return
-
-        self.comparison_ids.clear()
-        self.filter_comparisons[self.current_filter] = set()
-        self.update_target_labels()
+        changed = False
+        if self.target_source_id is not None:
+            self.target_source_id = None
+            self.filter_targets[self.current_filter] = None
+            changed = True
+        if self.comparison_ids:
+            self.comparison_ids.clear()
+            self.filter_comparisons[self.current_filter] = set()
+            changed = True
+        if self.filter_check_stars.get(self.current_filter) is not None:
+            self.filter_check_stars[self.current_filter] = None
+            changed = True
+        if not changed:
+            return
         self.save_selection()
-        self.update_master_table()
-        self.update_overlay()
-        self.log("Comparisons cleared")
+        self._refresh_role_ui()
+        self.log(f"Roles cleared: {self.current_filter}")
 
     def copy_selection_to_all_filters(self):
         """현재 필터의 타겟/비교성 선택을 모든 필터에 복사"""
@@ -3135,8 +3325,8 @@ class MasterIdEditorWindow(StepWindowBase):
 
     def _save_selection_for_filter(self, flt: str, target_sid: int, comp_sids: set):
         """특정 필터의 선택 저장 (catalog 없이 동작)"""
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        step8_dir.mkdir(parents=True, exist_ok=True)
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        step9_out.mkdir(parents=True, exist_ok=True)
 
         # Ensure selected IDs are included in master catalog first.
         all_sids = {int(sid) for sid in comp_sids if sid is not None}
@@ -3176,19 +3366,19 @@ class MasterIdEditorWindow(StepWindowBase):
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        selection_path = step8_dir / f"selection_{flt}.json"
+        selection_path = step9_out / f"selection_{flt}.json"
         with open(selection_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         self.log(f"  Saved selection for {flt}: target={target_sid}, {len(comp_sids)} comps, check={check_sid}")
 
     def _load_source_to_id_map(self, flt: str) -> Dict[int, int]:
-        """Load final source_id -> ID mapping for a filter from Step 8 outputs."""
-        step8_dir = self.params.P.result_dir / "step8_selection"
+        """Load final source_id -> ID mapping for a filter from Step 9 outputs."""
+        step9_out = step9_selection_dir(self.params.P.result_dir)
         source_to_id: Dict[int, int] = {}
         candidates = [
-            (step8_dir / f"master_catalog_{flt}.tsv", "\t"),
-            (step8_dir / f"id_mapping_{flt}.csv", ","),
+            (step9_out / f"master_catalog_{flt}.tsv", "\t"),
+            (step9_out / f"id_mapping_{flt}.csv", ","),
         ]
         for path, sep in candidates:
             if not path.exists():
@@ -3211,57 +3401,86 @@ class MasterIdEditorWindow(StepWindowBase):
 
     # ── SIMBAD type query ──────────────────────────────────────────────────────
 
+    def _collect_simbad_source_radec(self) -> Dict[int, tuple]:
+        """Collect Gaia-matched source coordinates for the current filter."""
+        sids: Set[int] = set()
+
+        if self.current_filter and self.current_filter in self.filter_catalogs:
+            cat = self.filter_catalogs[self.current_filter]
+            if "source_id" in cat.columns:
+                sid_vals = coerce_int64_source_id(cat["source_id"]).dropna().astype("int64")
+                sids.update(int(sid) for sid in sid_vals.tolist() if int(sid) > 0)
+
+        if not sids and self.current_filter:
+            sids.update(int(sid) for sid in self.filter_master_ids.get(self.current_filter, set()) if int(sid) > 0)
+
+        if not sids and self.idmatch_df is not None and not self.idmatch_df.empty and "source_id" in self.idmatch_df.columns:
+            sid_vals = coerce_int64_source_id(self.idmatch_df["source_id"]).dropna().astype("int64")
+            sids.update(int(sid) for sid in sid_vals.tolist() if int(sid) > 0)
+
+        src_radec: Dict[int, tuple] = {}
+        for sid in sorted(sids):
+            ra_deg, dec_deg = self._get_radec_for_source(int(sid))
+            if np.isfinite(ra_deg) and np.isfinite(dec_deg):
+                src_radec[int(sid)] = (float(ra_deg), float(dec_deg))
+        return src_radec
+
+    def _compute_simbad_query_region(self, src_radec: Dict[int, tuple]) -> Optional[tuple]:
+        """Compute a cone that covers the current SIMBAD target sources."""
+        if not src_radec:
+            return None
+
+        ras = np.array([ra for ra, _ in src_radec.values()], dtype=float)
+        decs = np.array([dec for _, dec in src_radec.values()], dtype=float)
+        if ras.size == 0 or decs.size == 0:
+            return None
+
+        ra_c = float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.deg2rad(ras)))))) % 360.0
+        dec_c = float(np.mean(decs))
+        center = SkyCoord(ra_c * u.deg, dec_c * u.deg, frame="icrs")
+        coords = SkyCoord(ras * u.deg, decs * u.deg, frame="icrs")
+        radius_deg = float(np.max(center.separation(coords).deg)) + 0.02
+        radius_deg = min(max(radius_deg, 0.02), 2.0)
+        return ra_c, dec_c, radius_deg
+
     def fetch_simbad_types(self):
-        """현재 화각의 모든 별에 대해 SIMBAD otype을 비동기로 가져온다."""
+        """현재 필터의 Gaia-matched source들에 대해 SIMBAD otype을 비동기로 가져온다."""
         if self._simbad_fetch_thread and self._simbad_fetch_thread.is_alive():
             self.log("[SIMBAD] 이미 조회 중...")
             return
-        info = self._get_frame_center_radec()
-        if info is None:
-            self.log("[SIMBAD] WCS 없음 — 프레임을 먼저 로드하세요.")
-            return
-        ra_c, dec_c, fov_deg = info
-
-        # Collect all source RA/Dec from idmatch_df
-        if self.idmatch_df is None or self.idmatch_df.empty:
-            self.log("[SIMBAD] 검출 데이터 없음.")
-            return
-
-        # Build source_id → (ra, dec) map from idmatch
-        df = self.idmatch_df.copy()
-        ra_col = next((c for c in ["ra_gaia", "ra", "RA"] if c in df.columns), None)
-        dec_col = next((c for c in ["dec_gaia", "dec", "DEC"] if c in df.columns), None)
-        sid_col = next((c for c in ["source_id", "gaia_source_id"] if c in df.columns), None)
-
-        if ra_col is None or dec_col is None:
-            self.log("[SIMBAD] RA/Dec 컬럼 없음.")
-            return
-
-        src_radec: Dict[int, tuple] = {}
-        for _, row in df.iterrows():
-            ra_v = row.get(ra_col)
-            dec_v = row.get(dec_col)
-            if pd.isna(ra_v) or pd.isna(dec_v):
-                continue
-            sid = int(row[sid_col]) if sid_col and not pd.isna(row.get(sid_col, float('nan'))) else id(row)
-            src_radec[sid] = (float(ra_v), float(dec_v))
-
+        src_radec = self._collect_simbad_source_radec()
         if not src_radec:
-            self.log("[SIMBAD] 유효한 좌표 없음.")
+            self.log("[SIMBAD] 현재 필터에서 조회할 Gaia 매치 소스 좌표가 없습니다.")
             return
+
+        query_region = self._compute_simbad_query_region(src_radec)
+        if query_region is None:
+            self.log("[SIMBAD] 조회 영역 계산 실패.")
+            return
+        ra_c, dec_c, radius_deg = query_region
 
         self.btn_simbad_types.setEnabled(False)
         self.btn_simbad_types.setText("조회 중...")
-        self.log(f"[SIMBAD] FOV RA={ra_c:.4f} Dec={dec_c:.4f} r={fov_deg*60:.1f}′ 조회 시작...")
+        self.log(
+            f"[SIMBAD] filter={self.current_filter or '-'} "
+            f"Gaia sources={len(src_radec)} cone r={radius_deg*60:.1f}′ 조회 시작..."
+        )
+        request_filter = self.current_filter
 
         def _worker():
+            payload = {
+                "filter": request_filter,
+                "logs": [],
+                "updates": {},
+            }
             try:
-                results = self._query_simbad_tap(ra_c, dec_c, fov_deg + 0.05)
+                results = self._query_simbad_tap(ra_c, dec_c, radius_deg)
                 if results is None:
+                    payload["logs"].append("[SIMBAD] 결과 없음.")
                     return
                 # Match each source to nearest SIMBAD result within 5 arcsec
                 if results.empty:
-                    self.log("[SIMBAD] 결과 없음.")
+                    payload["logs"].append("[SIMBAD] 결과 없음.")
                     return
 
                 simbad_coords = SkyCoord(
@@ -3270,32 +3489,39 @@ class MasterIdEditorWindow(StepWindowBase):
                     frame="icrs"
                 )
                 matched = 0
+                updates = {}
                 for sid, (ra_s, dec_s) in src_radec.items():
                     sc = SkyCoord(ra_s * u.deg, dec_s * u.deg, frame="icrs")
                     idx, sep, _ = sc.match_to_catalog_sky(simbad_coords)
                     if float(sep.arcsec) <= 5.0:
                         otype = str(results.iloc[int(idx)].get("otype", "")).strip()
                         if otype:
-                            self._simbad_type_cache[sid] = otype
+                            updates[self._simbad_cache_key(sid, flt=request_filter)] = otype
                             matched += 1
-                self.log(f"[SIMBAD] {matched}/{len(src_radec)} 별 타입 매칭 완료")
-                # Update table on main thread via signal-safe method
-                self._simbad_types_ready = True
+                payload["updates"] = updates
+                payload["logs"].append(f"[SIMBAD] {matched}/{len(src_radec)} 별 타입 매칭 완료")
             except Exception as e:
-                self.log(f"[SIMBAD] 오류: {e}")
+                payload["logs"].append(f"[SIMBAD] 오류: {e}")
             finally:
-                # Re-enable button via Qt timer on main thread
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, self._on_simbad_fetch_done)
+                self.simbad_fetch_done.emit(payload)
 
-        self._simbad_types_ready = False
         self._simbad_fetch_thread = threading.Thread(target=_worker, daemon=True)
         self._simbad_fetch_thread.start()
 
-    def _on_simbad_fetch_done(self):
+    def _on_simbad_fetch_done(self, payload: Optional[dict] = None):
+        payload = payload or {}
+        for msg in payload.get("logs", []):
+            self.log(str(msg))
+        updates = payload.get("updates", {})
+        if isinstance(updates, dict):
+            for key, value in updates.items():
+                if isinstance(key, str):
+                    self._simbad_type_cache[key] = str(value or "").strip()
+        if self._closing or not self._qt_alive(getattr(self, "btn_simbad_types", None)):
+            return
         self.btn_simbad_types.setEnabled(True)
         self.btn_simbad_types.setText("SIMBAD Types")
-        if getattr(self, "_simbad_types_ready", False):
+        if updates:
             self._apply_simbad_types_to_table()
 
     def _query_simbad_tap(self, ra_c: float, dec_c: float, radius_deg: float):
@@ -3324,20 +3550,22 @@ class MasterIdEditorWindow(StepWindowBase):
         return df
 
     def _apply_simbad_types_to_table(self):
-        """테이블 SIMBAD 컬럼(col 8) 업데이트."""
+        """테이블 SIMBAD 컬럼(col 9) 업데이트."""
         if not self._simbad_type_cache:
             return
         # Use _sid_to_row (source_id → table row index) populated in update_master_table
         from PyQt5.QtGui import QColor as _QColor
-        for sid, otype in self._simbad_type_cache.items():
-            row = self._sid_to_row.get(int(sid), -1)
+        for sid, row in self._sid_to_row.items():
+            otype = self._get_simbad_type_for_source(int(sid), flt=self.current_filter)
+            if not otype:
+                continue
             if row < 0:
                 continue
             item = QTableWidgetItem(str(otype))
             if otype and otype not in ("*", ""):
                 item.setForeground(_QColor("#FFD700") if any(k in otype for k in ("V*", "EB", "RR", "Cep"))
                                    else _QColor("#80DEEA"))
-            self.master_table.setItem(row, 8, item)
+            self.master_table.setItem(row, 9, item)
 
     # ── Aladin / browser helpers ───────────────────────────────────────────────
 
@@ -3370,7 +3598,7 @@ class MasterIdEditorWindow(StepWindowBase):
             return None
 
     def open_aladin_fov(self):
-        """현재 화각을 Aladin Lite(SIMBAD 오버레이)로 브라우저에서 열기."""
+        """현재 화각을 Aladin Lite와 SIMBAD field query로 브라우저에서 연다."""
         info = self._get_frame_center_radec()
         if info is None:
             # Fallback to step1 target coords
@@ -3387,47 +3615,39 @@ class MasterIdEditorWindow(StepWindowBase):
         else:
             ra, dec, fov_deg = info
 
-        # Aladin Lite URL with DSS2 color + SIMBAD catalog
-        target_str = f"{ra:+.6f}{dec:+.6f}".replace("+", "%2B").replace("-", "%2D")
-        # Use simple RA+Dec format that Aladin accepts
-        url = (
+        # Current frame helper uses a half-diagonal-like FOV in degrees.
+        # SIMBAD cone query should use an angular radius, so reuse this value
+        # as an arcmin radius with conservative clipping.
+        radius_arcmin = max(3.0, min(float(fov_deg) * 60.0, 180.0))
+
+        aladin_url = (
             f"https://aladin.cds.unistra.fr/AladinLite/"
             f"?target={ra:.6f}%20{dec:+.6f}"
             f"&fov={fov_deg:.3f}"
             f"&survey=P%2FDSS2%2Fcolor"
             f"&catName=SIMBAD"
         )
-        webbrowser.open(url)
-        self.log(f"[Aladin] Opened FOV: RA={ra:.4f} Dec={dec:.4f} FOV={fov_deg*60:.1f}′")
+        simbad_url = (
+            f"https://simbad.cds.unistra.fr/simbad/sim-coo"
+            f"?Coord={ra:.6f}+{dec:+.6f}&CooSystem=ICRS"
+            f"&Radius={radius_arcmin:.2f}&Radius.unit=arcmin"
+            f"&submit=submit+query"
+        )
+
+        webbrowser.open(aladin_url)
+        webbrowser.open_new_tab(simbad_url)
+        self.log(
+            f"[Aladin] Opened FOV: RA={ra:.4f} Dec={dec:.4f} "
+            f"FOV={fov_deg*60:.1f}′ | SIMBAD radius={radius_arcmin:.1f}′"
+        )
 
     def open_simbad_for_selected(self):
         """선택된 별의 RA/Dec로 SIMBAD 페이지를 브라우저에서 열기."""
         if self.selected_source_id is None:
             QMessageBox.information(self, "SIMBAD", "별을 먼저 선택하세요.")
             return
-        ra, dec = None, None
-        # Try idmatch_df
-        if self.idmatch_df is not None and not self.idmatch_df.empty:
-            sid = int(self.selected_source_id)
-            for sid_col in ["source_id", "gaia_source_id"]:
-                if sid_col in self.idmatch_df.columns:
-                    row = self.idmatch_df[self.idmatch_df[sid_col] == sid]
-                    if not row.empty:
-                        for rc in ["ra_gaia", "ra", "RA"]:
-                            if rc in row.columns and pd.notna(row.iloc[0].get(rc)):
-                                ra = float(row.iloc[0][rc])
-                                break
-                        for dc in ["dec_gaia", "dec", "DEC"]:
-                            if dc in row.columns and pd.notna(row.iloc[0].get(dc)):
-                                dec = float(row.iloc[0][dc])
-                                break
-                        break
-        if ra is None or dec is None:
-            # Try step6 radec map
-            entry = self._step6_radec_map.get(int(self.selected_source_id))
-            if entry:
-                ra, dec = entry
-        if ra is None or dec is None:
+        ra, dec = self._get_radec_for_source(int(self.selected_source_id))
+        if not (np.isfinite(ra) and np.isfinite(dec)):
             QMessageBox.information(self, "SIMBAD", "선택된 별의 좌표를 찾을 수 없습니다.")
             return
         url = (
@@ -3466,7 +3686,7 @@ class MasterIdEditorWindow(StepWindowBase):
         act_clear_role.triggered.connect(self.clear_role_selected)
         menu.addAction(act_clear_role)
         col = self.master_table.columnAt(pos.x())
-        if col == 8:
+        if col == 9:
             act_edit = QAction("SIMBAD 타입 직접 입력", self)
             act_edit.triggered.connect(lambda: self._edit_simbad_type(row))
             menu.insertAction(menu.actions()[0], act_edit)
@@ -3493,23 +3713,20 @@ class MasterIdEditorWindow(StepWindowBase):
             self.filter_check_stars[flt] = None
             changed = True
         if changed:
-            self._update_check_label()
-            self.update_target_labels()
             self.save_selection()
-            self.update_master_table()
-            self.update_overlay()
+            self._refresh_role_ui()
             self.log(f"역할 제거: ID {self.sid_to_id.get(sid, sid)}")
 
     def _on_table_double_click(self, index):
-        """SIMBAD 컬럼(8) 더블클릭 시 직접 편집."""
-        if index.column() == 8:
+        """SIMBAD 컬럼(9) 더블클릭 시 직접 편집."""
+        if index.column() == 9:
             self._edit_simbad_type(index.row())
 
     def _edit_simbad_type(self, row: int):
         """SIMBAD type 수동 입력 다이얼로그."""
         from PyQt5.QtWidgets import QInputDialog
         gaia_item = self.master_table.item(row, 5)
-        current = (self.master_table.item(row, 8) or QTableWidgetItem("")).text()
+        current = (self.master_table.item(row, 9) or QTableWidgetItem("")).text()
         id_item = self.master_table.item(row, 0)
         label = f"ID {id_item.text()}" if id_item else f"row {row}"
         text, ok = QInputDialog.getText(
@@ -3523,14 +3740,14 @@ class MasterIdEditorWindow(StepWindowBase):
         # Update cache via _sid_to_row reverse map
         for sid, r in self._sid_to_row.items():
             if r == row:
-                self._simbad_type_cache[int(sid)] = text
+                self._set_simbad_type_for_source(int(sid), text, flt=self.current_filter)
                 break
         from PyQt5.QtGui import QColor as _QColor
         item = QTableWidgetItem(text)
         if text and text not in ("*", ""):
             item.setForeground(_QColor("#FFD700") if any(k in text for k in ("V*", "EB", "RR", "Cep"))
                                else _QColor("#80DEEA"))
-        self.master_table.setItem(row, 8, item)
+        self.master_table.setItem(row, 9, item)
 
     def select_target_from_simbad(self):
         """SIMBAD 좌표로 타겟 선택 (Step 1에서 입력한 대상 좌표 사용)"""
@@ -3562,34 +3779,10 @@ class MasterIdEditorWindow(StepWindowBase):
             QMessageBox.information(self, "Target", "No detections loaded. Select a frame first.")
             return
 
-        # RA/Dec 컬럼 확인
-        ra_col = None
-        dec_col = None
-        for rc in ["ra_gaia", "ra", "RA"]:
-            if rc in self.idmatch_df.columns:
-                ra_col = rc
-                break
-        for dc in ["dec_gaia", "dec", "DEC"]:
-            if dc in self.idmatch_df.columns:
-                dec_col = dc
-                break
-
+        ra_col, dec_col = self._ensure_idmatch_radec_columns()
         if ra_col is None or dec_col is None:
-            if {"x", "y"} <= set(self.idmatch_df.columns) and self.header is not None:
-                try:
-                    w = WCS(self.header, relax=True)
-                except Exception:
-                    w = None
-                if w is not None and w.has_celestial:
-                    xy = self.idmatch_df[["x", "y"]].to_numpy(float)
-                    ra_vals, dec_vals = w.all_pix2world(xy[:, 0], xy[:, 1], 0)
-                    self.idmatch_df["ra"] = ra_vals
-                    self.idmatch_df["dec"] = dec_vals
-                    ra_col = "ra"
-                    dec_col = "dec"
-            if ra_col is None or dec_col is None:
-                QMessageBox.information(self, "Target", "No RA/Dec columns in detection data.")
-                return
+            QMessageBox.information(self, "Target", "No RA/Dec columns in detection data.")
+            return
 
         try:
             sc_target = SkyCoord(ra_deg * u.deg, dec_deg * u.deg, frame="icrs")
@@ -3623,23 +3816,19 @@ class MasterIdEditorWindow(StepWindowBase):
             sid = int(df_valid.iloc[int(idx)]["source_id"])
 
             if sid not in self.master_ids:
-                self._add_to_master({sid}, reason="auto_add_target")
+                self._add_to_master({sid}, reason="auto_add_target", refresh=False, persist=False)
 
             self.target_source_id = sid
             self.filter_targets[self.current_filter] = sid
             self.comparison_ids.discard(sid)
             self.filter_comparisons[self.current_filter] = self.comparison_ids.copy()
 
-            self.update_target_labels()
             self.save_selection()
-            self.update_master_table()
-            self.update_overlay()
+            self._refresh_role_ui()
 
             # 대상 이름 가져오기
             target_name = getattr(self.params.P, "target_name", "Unknown")
             self.log(f"Target '{target_name}' matched: source_id={sid} (sep={sep_arcsec:.2f}\")")
-            self._select_table_row_by_sid(sid)
-
             QMessageBox.information(
                 self, "Target Set",
                 f"Target '{target_name}' matched to source_id {sid}\n"
@@ -3654,8 +3843,8 @@ class MasterIdEditorWindow(StepWindowBase):
         if not self.current_filter:
             return
 
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        step8_dir.mkdir(parents=True, exist_ok=True)
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        step9_out.mkdir(parents=True, exist_ok=True)
 
         # Ensure selected IDs are present in the master set first.
         all_sids = {int(sid) for sid in self.comparison_ids if sid is not None}
@@ -3671,7 +3860,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         # Save/update master catalog first, then map source IDs to final IDs.
         self.save_master_catalog(log_action="selection_update")
-        source_to_id = self._load_source_to_id_map(self.current_filter)
+        source_to_id = self._current_source_to_id_map(self.current_filter, all_sids)
 
         # Map source_ids to final IDs
         target_id = source_to_id.get(int(self.target_source_id)) if self.target_source_id is not None else None
@@ -3697,59 +3886,36 @@ class MasterIdEditorWindow(StepWindowBase):
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        selection_path = step8_dir / f"selection_{self.current_filter}.json"
+        selection_path = step9_out / f"selection_{self.current_filter}.json"
         with open(selection_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-
-        # Save selection summary inside Step 8 directory
-        self._save_legacy_selection()
 
         self.save_state()
         self.update_navigation_buttons()
 
-    def _save_legacy_selection(self):
-        """Save target_selection.json inside Step 8 directory."""
-        try:
-            all_targets = {}
-            all_comps = {}
-
-            for flt, target_sid in self.filter_targets.items():
-                if target_sid is not None:
-                    all_targets[flt] = target_sid
-
-            for flt, comp_sids in self.filter_comparisons.items():
-                if comp_sids:
-                    all_comps[flt] = sorted(comp_sids)
-
-            # 첫 번째 필터 기준으로 legacy 형식 (filter_frames 기준)
-            first_filter = list(self.filter_frames.keys())[0] if self.filter_frames else None
-
-            data = {
-                "target_source_id": self.filter_targets.get(first_filter) if first_filter else None,
-                "comparison_source_ids": sorted(self.filter_comparisons.get(first_filter, set())) if first_filter else [],
-                "check_source_id": self.filter_check_stars.get(first_filter) if first_filter else None,
-                "filter_targets": all_targets,
-                "filter_comparisons": {k: sorted(v) for k, v in all_comps.items()},
-                "filter_check_stars": {k: v for k, v in self.filter_check_stars.items() if v is not None},
-            }
-
-            step8_dir = self.params.P.result_dir / "step8_selection"
-            step8_dir.mkdir(parents=True, exist_ok=True)
-            legacy_path = step8_dir / "target_selection.json"
-            with open(legacy_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            self.log(f"Legacy save failed: {e}")
+    def _current_source_to_id_map(self, flt: str, source_ids: Optional[Set[int]] = None) -> Dict[int, int]:
+        if source_ids is None:
+            source_ids = set(self.filter_master_ids.get(flt, set()))
+        if not source_ids:
+            return {}
+        source_to_id: Dict[int, int] = {}
+        self._load_global_id_map(flt)
+        for sid in sorted(int(s) for s in source_ids if s is not None):
+            stable_id = self.sid_to_id.get(int(sid))
+            if stable_id is None:
+                stable_id = self._global_id_map.get(int(sid))
+            if stable_id is not None:
+                source_to_id[int(sid)] = int(stable_id)
+        return source_to_id
 
     def validate_step(self) -> bool:
-        step8_dir = self.params.P.result_dir / "step8_selection"
-        if not step8_dir.exists():
+        step9_out = step9_selection_dir(self.params.P.result_dir)
+        if not step9_out.exists():
             return False
 
         # 적어도 하나의 필터에 타겟이 설정되어야 함 (filter_frames 기준)
         for flt in self.filter_frames.keys():
-            selection_path = step8_dir / f"selection_{flt}.json"
+            selection_path = step9_out / f"selection_{flt}.json"
             if selection_path.exists():
                 try:
                     with open(selection_path, "r", encoding="utf-8") as f:
@@ -3769,6 +3935,7 @@ class MasterIdEditorWindow(StepWindowBase):
             "filter_check_stars": {k: v for k, v in self.filter_check_stars.items() if v is not None},
             "show_selected_only": self.show_selected_only.isChecked(),
             "overlay_colors": dict(self._overlay_colors),
+            "simbad_types": {k: v for k, v in self._simbad_type_cache.items() if isinstance(k, str) and str(v or "").strip()},
         }
         self.project_state.store_step_data("target_selection", state_data)
 
@@ -3796,6 +3963,12 @@ class MasterIdEditorWindow(StepWindowBase):
             for k, v in saved_colors.items():
                 if isinstance(v, str) and v.startswith("#"):
                     self._overlay_colors[k] = v
+
+            saved_simbad = state_data.get("simbad_types", {})
+            if isinstance(saved_simbad, dict):
+                for k, v in saved_simbad.items():
+                    if isinstance(k, str) and isinstance(v, str) and v.strip():
+                        self._simbad_type_cache[k] = v.strip()
 
     def show_log_window(self):
         self.log_window.show()
@@ -3876,10 +4049,12 @@ class MasterIdEditorWindow(StepWindowBase):
     # === Zoom/Pan/Stretch 함수들 ===
 
     def reset_zoom(self):
+        if self._closing or not self._qt_alive(self.canvas) or self.ax is None:
+            return
         if self.xlim_original is not None:
             self.ax.set_xlim(self.xlim_original)
             self.ax.set_ylim(self.ylim_original)
-            self.canvas.draw_idle()
+            self._safe_canvas_draw_idle()
 
     def on_stretch_changed(self, index):
         self._norm_cache.clear()
@@ -4013,7 +4188,7 @@ class MasterIdEditorWindow(StepWindowBase):
                 f"Stretch: {stretch_name} | Min: {vmin:.2f} | Max: {vmax:.2f}"
             )
 
-        self.stretch_plot_canvas.draw_idle()
+        self._safe_stretch_plot_draw_idle()
 
     def _on_stretch_plot_press(self, event):
         """Handle mouse press on stretch plot"""
@@ -4068,7 +4243,7 @@ class MasterIdEditorWindow(StepWindowBase):
 
         if self._imshow_obj is not None:
             self._imshow_obj.set_data(stretched)
-            self.canvas.draw_idle()
+            self._safe_canvas_draw_idle()
 
     def reset_stretch_plot_values(self):
         """Reset stretch plot values when changing image or stretch mode"""
@@ -4133,8 +4308,14 @@ class MasterIdEditorWindow(StepWindowBase):
         return stretched
 
     def closeEvent(self, event):
+        self._closing = True
         try:
             self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            if self.stretch_plot_dialog is not None and self._qt_alive(self.stretch_plot_dialog):
+                self.stretch_plot_dialog.close()
         except Exception:
             pass
         super().closeEvent(event)
@@ -4208,7 +4389,7 @@ class MasterIdEditorWindow(StepWindowBase):
         rely = (ylim[1] - ydata) / (ylim[1] - ylim[0])
         self.ax.set_xlim([xdata - new_width * (1 - relx), xdata + new_width * relx])
         self.ax.set_ylim([ydata - new_height * (1 - rely), ydata + new_height * rely])
-        self.canvas.draw_idle()
+        self._safe_canvas_draw_idle()
 
     def on_button_press(self, event):
         if event.button == 3:
@@ -4234,4 +4415,4 @@ class MasterIdEditorWindow(StepWindowBase):
         ylim = self.ax.get_ylim()
         self.ax.set_xlim([xlim[0] + dx, xlim[1] + dx])
         self.ax.set_ylim([ylim[0] + dy, ylim[1] + dy])
-        self.canvas.draw_idle()
+        self._safe_canvas_draw_idle()

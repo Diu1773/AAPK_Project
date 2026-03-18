@@ -42,8 +42,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
+from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.step_paths import (
-    step8_dir,
+    step9_selection_dir,
     step10_dir,
     step12_period_dir,
     find_best_lightcurve_csv,
@@ -59,6 +60,70 @@ def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
         return check_id, (df if not df.empty else None)
     except Exception:
         return None, None
+
+
+def _load_step9_source_to_id_map(result_dir: Path, flt: str | None = None) -> dict[int, int]:
+    step9_out = step9_selection_dir(result_dir)
+    if not step9_out.exists():
+        return {}
+
+    key = str(flt or "").strip().lower()
+    candidates: list[tuple[Path, str]] = []
+    if key:
+        candidates.extend(
+            [
+                (step9_out / f"master_catalog_{key}.tsv", "\t"),
+                (step9_out / f"id_mapping_{key}.csv", ","),
+            ]
+        )
+    candidates.extend((p, "\t") for p in sorted(step9_out.glob("master_catalog_*.tsv")))
+    candidates.extend((p, ",") for p in sorted(step9_out.glob("id_mapping_*.csv")))
+
+    mapping: dict[int, int] = {}
+    for path, sep in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = read_csv_int64_source_id(path, sep=sep)
+        except Exception:
+            continue
+        if not {"source_id", "ID"} <= set(df.columns):
+            continue
+        sid_vals = coerce_int64_source_id(df["source_id"])
+        id_vals = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
+        for sid_val, id_val in zip(sid_vals, id_vals):
+            if pd.isna(sid_val) or pd.isna(id_val):
+                continue
+            sid_int = int(sid_val)
+            if sid_int not in mapping:
+                mapping[sid_int] = int(id_val)
+    return mapping
+
+
+def _load_step9_target_id(result_dir: Path) -> int | None:
+    step9_out = step9_selection_dir(result_dir)
+    if not step9_out.exists():
+        return None
+
+    target_ids: set[int] = set()
+    for sp in sorted(step9_out.glob("selection_*.json")):
+        try:
+            data = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        tid = data.get("target_id")
+        if tid is None:
+            flt = sp.stem.replace("selection_", "")
+            sid_map = _load_step9_source_to_id_map(result_dir, flt)
+            target_sid = data.get("target_source_id")
+            if target_sid is not None and int(target_sid) in sid_map:
+                tid = int(sid_map[int(target_sid)])
+        if tid is not None:
+            target_ids.add(int(tid))
+
+    if len(target_ids) == 1:
+        return next(iter(target_ids))
+    return None
 
 
 import re as _re
@@ -429,7 +494,7 @@ class PeriodAnalysisWindow(StepWindowBase):
         self._load_light_curve(silent=True)
 
     def _auto_load_target_id(self):
-        """Step 10 → Step 8 per-filter 순서로 target ID 자동 로드."""
+        """Step 10 → Step 9 merged selection 순서로 target ID 자동 로드."""
         rd = Path(self.params.P.result_dir)
         sel_path = step10_dir(rd) / "comp_selection.json"
         if sel_path.exists():
@@ -442,18 +507,11 @@ class PeriodAnalysisWindow(StepWindowBase):
                     return
             except Exception:
                 pass
-        s8 = step8_dir(rd)
-        if s8.exists():
-            for sp in s8.glob("selection_*.json"):
-                try:
-                    data = json.loads(sp.read_text(encoding="utf-8"))
-                    tid = data.get("target_id")
-                    if tid is not None:
-                        self.target_id_spin.setValue(int(tid))
-                        self.target_hint.setText("(Step 8)")
-                        return
-                except Exception:
-                    continue
+        tid = _load_step9_target_id(rd)
+        if tid is not None:
+            self.target_id_spin.setValue(int(tid))
+            self.target_hint.setText("(Step 9)")
+            return
         self.target_hint.setText("")
 
     def setup_step_ui(self):

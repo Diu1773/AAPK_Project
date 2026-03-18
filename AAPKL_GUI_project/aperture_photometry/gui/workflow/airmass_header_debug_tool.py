@@ -28,7 +28,7 @@ from ...utils.astro_utils import (
     airmass_from_alt,
     compute_airmass_from_header,
 )
-from ...utils.step_paths import step1_dir, step5_dir
+from ...utils.step_paths import step1_dir, step5_photometry_dir
 
 
 _DATE_RE = re.compile(r"(\\d{8})")
@@ -593,7 +593,7 @@ class AirmassHeaderDebugToolWindow(QWidget):
     def _export_csv(self):
         if self.data_df.empty:
             return
-        out_dir = step5_dir(self.params.P.result_dir)
+        out_dir = step5_photometry_dir(self.params.P.result_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         default_path = out_dir / "airmass_header_debug.csv"
         path, _ = QFileDialog.getSaveFileName(

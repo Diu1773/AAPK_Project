@@ -21,6 +21,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 
 from PyQt5.QtWidgets import (
+    QApplication,
     QVBoxLayout,
     QHBoxLayout,
     QPushButton,
@@ -59,6 +60,7 @@ from ...utils.io_utils import (
     load_night_assignments as _load_night_assignments_util,
     load_headers_table as _load_headers_table_util,
 )
+from ...utils.photometry_loader import load_frame_photometry
 
 
 class _QcComputeWorker(QThread):
@@ -116,15 +118,13 @@ from ...utils.astro_utils import compute_airmass_from_header, compute_bjd_tdb_ar
 from ...utils.step_paths import (
     step1_dir,
     step2_cropped_dir,
-    step6_dir,
-    step8_dir,
-    step9_dir,
+    step5_photometry_dir,
+    step7_refbuild_dir,
+    step9_selection_dir,
     step10_dir,
     legacy_step11_extinction_dir,
     legacy_step11_zeropoint_dir,
     tool_extinction_dir,
-    legacy_step5_refbuild_dir,
-    legacy_step7_refbuild_dir,
 )
 from ...utils.qc_utils import load_frame_excludes, save_frame_excludes as save_frame_excludes_file
 
@@ -288,9 +288,7 @@ def _compute_star_median_mags(
 
     Returns: {star_id: {"g": mag_g, "r": mag_r, ...}}
     """
-    idx_path = step9_dir(result_dir) / "photometry_index.csv"
-    if not idx_path.exists():
-        idx_path = result_dir / "photometry_index.csv"
+    idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
     if not idx_path.exists():
         return {}
 
@@ -314,9 +312,7 @@ def _compute_star_median_mags(
     frame_info = []
     for _, idx_row in idx_df.iterrows():
         fname = str(idx_row["file"])
-        phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-        if not phot_path.exists():
-            phot_path = result_dir / f"{fname}_photometry.tsv"
+        phot_path = step5_photometry_dir(result_dir) / f"{fname}_photometry.tsv"
         if not phot_path.exists():
             continue
 
@@ -328,24 +324,19 @@ def _compute_star_median_mags(
 
         if not filt or filt not in filters_normalized:
             continue
-        frame_info.append((phot_path, filt))
-
-    # --- Parallel TSV loading ---
-    def _load_tsv(path):
-        try:
-            return pd.read_csv(path, sep="\t")
-        except Exception:
-            try:
-                return pd.read_csv(path)
-            except Exception:
-                return None
+        frame_info.append((fname, filt))
 
     n_workers = min(8, len(frame_info)) if frame_info else 1
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        tsv_dfs = list(pool.map(lambda fi: _load_tsv(fi[0]), frame_info))
+        tsv_dfs = list(
+            pool.map(
+                lambda fi: load_frame_photometry(result_dir, fi[0], fi[1]),
+                frame_info,
+            )
+        )
 
     # --- Process loaded DataFrames ---
-    for (phot_path, filt), df in zip(frame_info, tsv_dfs):
+    for (_, filt), df in zip(frame_info, tsv_dfs):
         if df is None or df.empty:
             continue
         if "ID" not in df.columns:
@@ -653,14 +644,33 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
     # per-filter selection_{filter}.json 우선 (가장 최신)
     filter_sel = _load_selection_ids_by_filter(result_dir)
     if filter_sel:
-        for flt, sel in filter_sel.items():
-            tid = sel.get("target_id")
-            cids = sel.get("comparison_ids", [])
-            if tid is not None:
-                return int(tid), [int(x) for x in cids if x is not None]
+        target_ids = {
+            int(sel["target_id"])
+            for sel in filter_sel.values()
+            if sel.get("target_id") is not None
+        }
+        comp_sets = {
+            tuple(int(x) for x in sel.get("comparison_ids", []) if x is not None)
+            for sel in filter_sel.values()
+            if sel.get("target_id") is not None
+        }
+        if len(target_ids) == 1 and len(comp_sets) == 1:
+            return next(iter(target_ids)), list(next(iter(comp_sets)))
+        if len(target_ids) == 1:
+            # Filters may legitimately carry different comp sets (or some may be
+            # empty). Seed Step 10 with the union so plotting/QC can start from
+            # the full candidate pool without silently preferring one filter.
+            union_comp_ids = sorted({
+                int(x)
+                for sel in filter_sel.values()
+                for x in sel.get("comparison_ids", [])
+                if x is not None
+            })
+            return next(iter(target_ids)), union_comp_ids
+        return None, []
 
     # fallback: legacy target_selection.json + source_id mapping
-    selection_path = step8_dir(result_dir) / "target_selection.json"
+    selection_path = step9_selection_dir(result_dir) / "target_selection.json"
     if not selection_path.exists():
         selection_path = result_dir / "target_selection.json"
     if not selection_path.exists():
@@ -679,13 +689,13 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
             filter_key = data.get("filter")
 
         def _load_step8_final_id_map(flt: str | None) -> dict[int, int]:
-            step8_out = step8_dir(result_dir)
-            if not step8_out.exists():
+            step9_out = step9_selection_dir(result_dir)
+            if not step9_out.exists():
                 return {}
             candidates = []
             if flt:
-                candidates.append(step8_out / f"master_catalog_{_normalize_filter_key(flt)}.tsv")
-            candidates.extend(sorted(step8_out.glob("master_catalog_*.tsv")))
+                candidates.append(step9_out / f"master_catalog_{_normalize_filter_key(flt)}.tsv")
+            candidates.extend(sorted(step9_out.glob("master_catalog_*.tsv")))
             for path in candidates:
                 if not path.exists():
                     continue
@@ -705,13 +715,7 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
             if comp_sids:
                 comp_ids = [final_id_map.get(int(s)) for s in comp_sids if int(s) in final_id_map]
         if target_id is None:
-            src_path = step6_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = legacy_step5_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = legacy_step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = result_dir / "sourceid_to_ID.csv"
+            src_path = step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
             src_id = target_sid
             if src_path.exists() and src_id is not None:
                 try:
@@ -725,13 +729,7 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
                 except Exception:
                     target_id = None
         if (not comp_ids) and comp_sids:
-            src_path = step6_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = legacy_step5_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = legacy_step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
-            if not src_path.exists():
-                src_path = result_dir / "sourceid_to_ID.csv"
+            src_path = step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"
             src_ids = [int(s) for s in comp_sids if s is not None]
             if src_path.exists() and src_ids:
                 try:
@@ -753,10 +751,10 @@ def _load_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
 
 def _load_selection_ids_by_filter(result_dir: Path) -> dict:
     """필터별 selection 로드 (Step 8에서 저장한 selection_{filter}.json)"""
-    step8_out = step8_dir(result_dir)
+    step9_out = step9_selection_dir(result_dir)
     filter_selections = {}
 
-    if not step8_out.exists():
+    if not step9_out.exists():
         return {}
 
     id_map_cache: dict[str, dict[int, int]] = {}
@@ -767,8 +765,8 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
             return id_map_cache[key]
         mapping: dict[int, int] = {}
         candidates = [
-            (step8_out / f"master_catalog_{key}.tsv", "\t"),
-            (step8_out / f"id_mapping_{key}.csv", ","),
+            (step9_out / f"master_catalog_{key}.tsv", "\t"),
+            (step9_out / f"id_mapping_{key}.csv", ","),
         ]
         for path, sep in candidates:
             if not path.exists():
@@ -784,16 +782,11 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
         id_map_cache[key] = mapping
         return mapping
 
-    def _load_step6_id_map() -> dict[int, int]:
-        key = "__step6__"
+    def _load_step7_refbuild_id_map() -> dict[int, int]:
+        key = "__step7_refbuild__"
         if key in id_map_cache:
             return id_map_cache[key]
-        candidates = [
-            step6_dir(result_dir) / "sourceid_to_ID.csv",
-            legacy_step5_refbuild_dir(result_dir) / "sourceid_to_ID.csv",
-            legacy_step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv",
-            result_dir / "sourceid_to_ID.csv",
-        ]
+        candidates = [step7_refbuild_dir(result_dir) / "sourceid_to_ID.csv"]
         mapping: dict[int, int] = {}
         for path in candidates:
             if not path.exists():
@@ -810,7 +803,7 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
         id_map_cache[key] = mapping
         return mapping
 
-    for sel_path in sorted(step8_out.glob("selection_*.json")):
+    for sel_path in sorted(step9_out.glob("selection_*.json")):
         flt = sel_path.stem.replace("selection_", "")
         try:
             data = json.loads(sel_path.read_text(encoding="utf-8"))
@@ -828,9 +821,9 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
                 if int(target_source_id) in sid_map:
                     target_id_val = int(sid_map[int(target_source_id)])
                 else:
-                    step6_map = _load_step6_id_map()
-                    if int(target_source_id) in step6_map:
-                        target_id_val = int(step6_map[int(target_source_id)])
+                    refbuild_map = _load_step7_refbuild_id_map()
+                    if int(target_source_id) in refbuild_map:
+                        target_id_val = int(refbuild_map[int(target_source_id)])
             if not comp_id_vals and comp_source_ids:
                 sid_map = _load_step8_id_map(flt)
                 if sid_map:
@@ -840,11 +833,11 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
                         if x is not None and int(x) in sid_map
                     })
                 if not comp_id_vals:
-                    step6_map = _load_step6_id_map()
+                    refbuild_map = _load_step7_refbuild_id_map()
                     comp_id_vals = sorted({
-                        int(step6_map[int(x)])
+                        int(refbuild_map[int(x)])
                         for x in comp_source_ids
-                        if x is not None and int(x) in step6_map
+                        if x is not None and int(x) in refbuild_map
                     })
 
             # Check star
@@ -856,9 +849,9 @@ def _load_selection_ids_by_filter(result_dir: Path) -> dict:
                 if int(check_source_id) in sid_map:
                     check_id_val = int(sid_map[int(check_source_id)])
                 else:
-                    step6_map = _load_step6_id_map()
-                    if int(check_source_id) in step6_map:
-                        check_id_val = int(step6_map[int(check_source_id)])
+                    refbuild_map = _load_step7_refbuild_id_map()
+                    if int(check_source_id) in refbuild_map:
+                        check_id_val = int(refbuild_map[int(check_source_id)])
 
             filter_selections[flt] = {
                 "target_id": target_id_val,
@@ -980,9 +973,9 @@ def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
 
     Returns (ra_deg, dec_deg), or (nan, nan) if not found.
     """
-    step8_out = step8_dir(result_dir)
-    candidates = list(step8_out.glob("master_catalog_*.tsv")) if step8_out.exists() else []
-    candidates += [step8_out / "master_catalog.tsv"] if step8_out.exists() else []
+    step9_out = step9_selection_dir(result_dir)
+    candidates = list(step9_out.glob("master_catalog_*.tsv")) if step9_out.exists() else []
+    candidates += [step9_out / "master_catalog.tsv"] if step9_out.exists() else []
     for path in candidates:
         if not path.exists():
             continue
@@ -1116,7 +1109,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.target_edit = QLineEdit()
         self.comp_edit = QLineEdit()
 
-        # Read-only info bar for target / comparison IDs (auto-loaded from Step 8)
+        # Read-only info bar for target / comparison IDs (auto-loaded from Step 9)
         self.id_info_label = QLabel("Target / Comp: (loading...)")
         self.id_info_label.setStyleSheet(
             "QLabel { background-color: #E8F5E9; padding: 8px 12px; border-radius: 5px;"
@@ -1371,6 +1364,11 @@ class LightCurveBuilderWindow(StepWindowBase):
         )
         self.qc_progress_bar.hide()
         qc_layout.addWidget(self.qc_progress_bar)
+
+        self.qc_status_label = QLabel("")
+        self.qc_status_label.setStyleSheet("QLabel { color: #546E7A; font-weight: bold; }")
+        self.qc_status_label.hide()
+        qc_layout.addWidget(self.qc_status_label)
 
         self.qc_table = QTableWidget()
         self.qc_table.setColumnCount(7)
@@ -1969,7 +1967,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.build_light_curve()
 
     def _auto_load_ids(self):
-        """Step 8 selection에서 target/comp ID를 자동 로드."""
+        """Step 9 selection에서 target/comp ID를 자동 로드."""
         rd = Path(self.params.P.result_dir)
         target_id, comp_ids = _load_selection_ids(rd)
         if target_id is not None:
@@ -1997,7 +1995,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                 " font-weight: bold; color: #F57C00; }"
             )
         else:
-            self.id_info_label.setText("Target / Comp: Step 8에서 선택해주세요")
+            self.id_info_label.setText("Target / Comp: Step 9에서 선택해주세요")
             self.id_info_label.setStyleSheet(
                 "QLabel { background-color: #FFEBEE; padding: 8px 12px; border-radius: 5px;"
                 " font-weight: bold; color: #C62828; }"
@@ -2091,20 +2089,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         if fname in self._photometry_cache:
             return self._photometry_cache[fname]
 
-        phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-        if not phot_path.exists():
-            phot_path = result_dir / f"{fname}_photometry.tsv"
-        if not phot_path.exists():
-            self._photometry_cache[fname] = None
-            return None
-
-        try:
-            df = read_csv_int64_source_id(phot_path, sep="\t")
-        except Exception:
-            try:
-                df = read_csv_int64_source_id(phot_path)
-            except Exception:
-                df = None
+        df = load_frame_photometry(result_dir, fname)
 
         self._photometry_cache[fname] = df
         return df
@@ -2121,18 +2106,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             return
 
         def _load_one(fname):
-            phot_path = step9_dir(result_dir) / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
-                phot_path = result_dir / f"{fname}_photometry.tsv"
-            if not phot_path.exists():
-                return fname, None
-            try:
-                df = read_csv_int64_source_id(phot_path, sep="\t")
-            except Exception:
-                try:
-                    df = read_csv_int64_source_id(phot_path)
-                except Exception:
-                    df = None
+            df = load_frame_photometry(result_dir, fname)
             return fname, df
 
         n_workers = min(8, len(to_load))
@@ -2149,9 +2123,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         files_override: list[str] | None = None,
         preload: bool = True,
     ) -> pd.DataFrame:
-        idx_path = step9_dir(result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             if verbose:
                 self.log(f"[DEBUG] photometry_index.csv not found in {result_dir}")
@@ -2290,9 +2262,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         verbose: bool = True,
         target_source_id_by_filter: dict[str, int] | None = None,
     ) -> pd.DataFrame:
-        idx_path = step9_dir(result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             if verbose:
                 self.log(f"[DEBUG] photometry_index.csv not found in {result_dir}")
@@ -2585,9 +2555,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                 self.log(f"[CACHE] Using cached diff series for target={target_id}, comp={comp_id}")
             return self._diff_series_cache[cache_key].copy()
 
-        idx_path = step9_dir(result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             if verbose:
                 self.log(f"[DEBUG] photometry_index.csv not found in {result_dir}")
@@ -3107,6 +3075,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self._lc_ever_plotted = True
         self.plot_ax.clear()
         self._plot_point_map = {}
+        plotted_y = []
 
         # X축 선택
         if self.x_axis_mode == "phase":
@@ -3168,11 +3137,13 @@ class LightCurveBuilderWindow(StepWindowBase):
                     x[m_in], y[m_in], s=12, color=c, label=label, alpha=0.7, picker=5
                 )
                 self._plot_point_map[sc] = {"files": files[m_in].tolist()}
+                plotted_y.extend(y[m_in].tolist())
             if np.any(m_ex):
                 scx = self.plot_ax.scatter(
                     x[m_ex], y[m_ex], s=16, color="#9E9E9E", marker="x", alpha=0.9, picker=5
                 )
                 self._plot_point_map[scx] = {"files": files[m_ex].tolist()}
+                plotted_y.extend(y[m_ex].tolist())
 
         # Check star overlay
         try:
@@ -3213,12 +3184,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.plot_ax.grid(True, alpha=0.3)
 
         # Auto-scale y-axis: median-centered with robust range
-        all_y = []
-        for artist, meta in self._plot_point_map.items():
-            offsets = artist.get_offsets()
-            if len(offsets) > 0:
-                all_y.extend(np.asarray(offsets)[:, 1].tolist())
-        all_y = np.array([v for v in all_y if np.isfinite(v)])
+        all_y = np.array([v for v in plotted_y if np.isfinite(v)])
         if len(all_y) >= 2:
             med = float(np.nanmedian(all_y))
             mad = float(np.nanmedian(np.abs(all_y - med)))
@@ -3236,7 +3202,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         if getattr(self, "_selected_point_xy", None) is not None:
             self._draw_selection_indicator()
         else:
-            self.plot_canvas.draw()
+            self.plot_canvas.draw_idle()
 
     def _compute_comp_qc(
         self,
@@ -3347,12 +3313,73 @@ class LightCurveBuilderWindow(StepWindowBase):
         except Exception as e:
             self.log(f"[QC] Failed to save summary: {e}")
 
+    def _qc_summary_meta_path(self, result_dir: Path) -> Path:
+        return step10_dir(result_dir) / "comp_qc_summary.meta.json"
+
+    def _build_qc_signature(
+        self,
+        result_dir: Path,
+        target_id: int,
+        comp_ids: list[int],
+        files_override: list[str] | None = None,
+    ) -> dict:
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
+        try:
+            idx_mtime_ns = int(idx_path.stat().st_mtime_ns)
+        except OSError:
+            idx_mtime_ns = 0
+        current_date = self.qc_date_combo.currentText() if hasattr(self, "qc_date_combo") else "All"
+        return {
+            "target_id": int(target_id),
+            "comp_ids": sorted(int(c) for c in comp_ids),
+            "date_selection": current_date or "All",
+            "files_override": sorted(str(f) for f in files_override) if files_override is not None else None,
+            "excluded_files": sorted(str(k) for k in self._get_frame_exclude_map(result_dir).keys()),
+            "qc_sigma": float(self.qc_sigma),
+            "photometry_index_mtime_ns": idx_mtime_ns,
+        }
+
+    def _load_cached_comp_qc_summary(self, result_dir: Path, signature: dict) -> list[dict] | None:
+        path = step10_dir(result_dir) / "comp_qc_summary.csv"
+        meta_path = self._qc_summary_meta_path(result_dir)
+        if not path.exists() or not meta_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta != signature:
+                return None
+            df = pd.read_csv(path)
+        except Exception:
+            return None
+        if df.empty or "comp_id" not in df.columns:
+            return None
+        rows = df.to_dict(orient="records")
+        for row in rows:
+            try:
+                row["comp_id"] = int(row.get("comp_id"))
+            except Exception:
+                pass
+            row["use"] = bool(row.get("use", False))
+        return rows
+
+    def _save_comp_qc_meta(self, result_dir: Path, signature: dict | None) -> None:
+        if signature is None:
+            return
+        try:
+            self._qc_summary_meta_path(result_dir).write_text(
+                json.dumps(signature, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     def _populate_qc_table(self, rows: list[dict]) -> None:
         self._qc_table_block = True
-        self.qc_table.setRowCount(0)
-        for row in rows:
-            r = self.qc_table.rowCount()
-            self.qc_table.insertRow(r)
+        self.qc_table.blockSignals(True)
+        self.qc_table.setUpdatesEnabled(False)
+        self.qc_table.clearContents()
+        self.qc_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
 
             item_use = QTableWidgetItem()
             item_use.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
@@ -3366,6 +3393,8 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.qc_table.setItem(r, 5, QTableWidgetItem(_fmt_float(row.get("mad"))))
             self.qc_table.setItem(r, 6, QTableWidgetItem(_fmt_percent(row.get("outlier_frac"))))
 
+        self.qc_table.setUpdatesEnabled(True)
+        self.qc_table.blockSignals(False)
         self._qc_table_block = False
         self._update_comp_count_label()
 
@@ -3426,9 +3455,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         idx: pd.DataFrame | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         if idx is None:
-            idx_path = step9_dir(result_dir) / "photometry_index.csv"
-            if not idx_path.exists():
-                idx_path = result_dir / "photometry_index.csv"
+            idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
             if not idx_path.exists():
                 self._qc_date_label_map = {}
                 return [], {}
@@ -3585,9 +3612,35 @@ class LightCurveBuilderWindow(StepWindowBase):
         if date_sel:
             files_for_metrics = [fname for fname in qc_files_all if qc_date_label_map.get(fname) == date_sel]
 
+        qc_signature = self._build_qc_signature(
+            result_dir,
+            target_id,
+            list(self.comp_candidate_ids),
+            files_override=files_for_metrics,
+        )
+        cached_rows = self._load_cached_comp_qc_summary(result_dir, qc_signature)
+        if cached_rows is not None:
+            self.qc_rows = cached_rows
+            self._populate_qc_table(cached_rows)
+            restored = False
+            if prev_comp_id is not None:
+                restored = self._select_qc_comp_id(prev_comp_id)
+            if not restored and self.qc_table.rowCount() > 0:
+                self.qc_table.setCurrentCell(0, 1)
+                self.qc_table.selectRow(0)
+            if hasattr(self, "qc_status_label"):
+                self.qc_status_label.setText("QC loaded")
+                self.qc_status_label.show()
+            self.log(f"[QC] Loaded cached QC for {len(cached_rows)} comp(s).")
+            if getattr(self, "_pending_auto_use", False):
+                self._pending_auto_use = False
+                self._apply_auto_use_thresholds()
+            return
+
         self._qc_running = True
         self._qc_prev_comp_id = prev_comp_id
         self._qc_compute_result_dir = result_dir
+        self._qc_compute_signature = qc_signature
 
         # Disable buttons and show progress bar while running
         if hasattr(self, "btn_qc_run"):
@@ -3597,6 +3650,10 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.btn_qc_auto.setEnabled(False)
         if hasattr(self, "qc_progress_bar"):
             self.qc_progress_bar.show()
+        if hasattr(self, "qc_status_label"):
+            self.qc_status_label.setText("QC running...")
+            self.qc_status_label.show()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.log(f"[QC] Computing QC for {len(self.comp_candidate_ids)} comp(s)...")
 
         comp_candidates = list(self.comp_candidate_ids)
@@ -3622,6 +3679,10 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.btn_qc_auto.setEnabled(True)
         if hasattr(self, "qc_progress_bar"):
             self.qc_progress_bar.hide()
+        if hasattr(self, "qc_status_label"):
+            self.qc_status_label.setText("QC done")
+            self.qc_status_label.show()
+        QApplication.restoreOverrideCursor()
 
         result_dir = getattr(self, "_qc_compute_result_dir", None)
         prev_comp_id = getattr(self, "_qc_prev_comp_id", None)
@@ -3636,6 +3697,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.qc_table.selectRow(0)
         if result_dir is not None:
             self._save_comp_qc_summary(result_dir, rows)
+            self._save_comp_qc_meta(result_dir, getattr(self, "_qc_compute_signature", None))
         self.log(f"[QC] Done. {len(rows)} comp(s) evaluated.")
         # If auto_use was pending (user clicked Auto Use before QC was run)
         if getattr(self, "_pending_auto_use", False):
@@ -3651,6 +3713,10 @@ class LightCurveBuilderWindow(StepWindowBase):
             self.btn_qc_auto.setEnabled(True)
         if hasattr(self, "qc_progress_bar"):
             self.qc_progress_bar.hide()
+        if hasattr(self, "qc_status_label"):
+            self.qc_status_label.setText("QC error")
+            self.qc_status_label.show()
+        QApplication.restoreOverrideCursor()
         self.log(f"[QC] Error: {msg}")
 
     def auto_use_qc(self):
@@ -3857,9 +3923,7 @@ class LightCurveBuilderWindow(StepWindowBase):
 
     def _collect_qc_preview_files(self, result_dir: Path) -> tuple[list[str], list[str], list[str]]:
         """Return (files_all_filters, files_filtered_by_filter_sel, filters_all) for QC preview."""
-        idx_path = step9_dir(result_dir) / "photometry_index.csv"
-        if not idx_path.exists():
-            idx_path = result_dir / "photometry_index.csv"
+        idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
         if not idx_path.exists():
             return [], [], []
 
@@ -3934,7 +3998,7 @@ class LightCurveBuilderWindow(StepWindowBase):
         result_dir = self._get_qc_result_dir()
         files_all, files_use, filters_all = self._collect_qc_preview_files(result_dir)
         self._qc_scope_files_all_filters = files_all
-        # Use cached check star diff series if available; else fall back to absolute mag
+        # Use cached check-star diff series if available; otherwise build on demand.
         cache = getattr(self, "_qc_checkstar_cache", {})
         if int(comp_id) in cache:
             df = cache[int(comp_id)].copy()
@@ -3943,21 +4007,35 @@ class LightCurveBuilderWindow(StepWindowBase):
             if files_use is not None and set(files_use) != set(files_all):
                 df = df[df["file"].isin(set(files_use))].copy()
         else:
-            df = self._build_star_mag_series(
-                result_dir,
-                int(comp_id),
-                verbose=False,
-                include_excluded=True,
-                files_override=files_use,
-                preload=False,
-            )
-            _use_diff = False
+            qc_comp_ids = [int(c) for c in (self.comp_candidate_ids or self.comp_ids_list) if str(c).strip()]
+            other_comps = [cid for cid in qc_comp_ids if int(cid) != int(comp_id)]
+            if other_comps:
+                df = self._build_ensemble_series(
+                    result_dir,
+                    int(comp_id),
+                    other_comps,
+                    verbose=False,
+                )
+                cache[int(comp_id)] = df.copy()
+                if files_use is not None and set(files_use) != set(files_all):
+                    df = df[df["file"].isin(set(files_use))].copy()
+                _use_diff = not df.empty
+            else:
+                df = self._build_star_mag_series(
+                    result_dir,
+                    int(comp_id),
+                    verbose=False,
+                    include_excluded=True,
+                    files_override=files_use,
+                    preload=False,
+                )
+                _use_diff = False
         self.check_plot_ax.clear()
         self._qc_selection_indicator_artist = None  # axes cleared; old artist is detached
         self._qc_plot_point_map = {}
         self._qc_plot_points = {"x": [], "y": [], "file": []}
         if df.empty:
-            self.check_plot_canvas.draw()
+            self.check_plot_canvas.draw_idle()
             return
         if filters_all:
             self._refresh_qc_filter_combo(filters_all)
@@ -4047,7 +4125,7 @@ class LightCurveBuilderWindow(StepWindowBase):
                     self._qc_selection_indicator_artist = sc
             except Exception:
                 pass
-        self.check_plot_canvas.draw()
+        self.check_plot_canvas.draw_idle()
 
     def build_light_curve(self):
         if not self.datasets:

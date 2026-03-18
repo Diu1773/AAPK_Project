@@ -524,21 +524,21 @@ def _build_target_lc(
             lc["diff_mag_corr"] = lc["diff_mag_corr"] - med
 
     lc = lc.rename(columns={"err": "diff_err"})
-    return lc[
-        [
-            "jd",
-            "time_id",
-            "filter",
-            "star_id",
-            "mag",
-            "mag_ensemble_corr",
-            "comp_ref_mean",
-            "diff_mag_raw",
-            "diff_mag_corr",
-            "diff_err",
-            "diff_err_corr",
-        ]
+    core_cols = [
+        "jd",
+        "time_id",
+        "filter",
+        "star_id",
+        "mag",
+        "mag_ensemble_corr",
+        "comp_ref_mean",
+        "diff_mag_raw",
+        "diff_mag_corr",
+        "diff_err",
+        "diff_err_corr",
     ]
+    extra_cols = [c for c in lc.columns if c not in core_cols]
+    return lc[[c for c in core_cols if c in lc.columns] + extra_cols]
 
 
 def _drop_frames_with_few_comps(df: pd.DataFrame, min_comps: int) -> pd.DataFrame:

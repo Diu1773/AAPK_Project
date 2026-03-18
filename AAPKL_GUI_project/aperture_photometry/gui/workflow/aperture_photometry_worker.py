@@ -29,8 +29,7 @@ from ...utils.step_paths import (
     step2_cropped_dir,
     step4_dir,
     step5_dir,
-    step9_dir,
-    legacy_step7_wcs_dir,
+    step5_photometry_dir,
 )
 from ...utils.photometry_utils import phot_one_star as _phot_one_target
 
@@ -120,7 +119,7 @@ class ApertureWorker(QThread):
     def run(self):  # noqa: C901
         try:
             P = self.params.P
-            output_dir = Path(self.output_dir) if self.output_dir is not None else step9_dir(self.result_dir)
+            output_dir = Path(self.output_dir) if self.output_dir is not None else step5_dir(self.result_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
             ap_scale = self._to_float(getattr(P, "phot_aperture_scale", 1.0), 1.0)
@@ -151,9 +150,7 @@ class ApertureWorker(QThread):
             phot_use_qc_pass_only = bool(getattr(P, "phot_use_qc_pass_only", False))
             files = list(self.file_list)
             if phot_use_qc_pass_only:
-                qpath = step5_dir(self.result_dir) / "frame_quality.csv"
-                if not qpath.exists():
-                    qpath = legacy_step7_wcs_dir(self.result_dir) / "frame_quality.csv"
+                qpath = step5_photometry_dir(self.result_dir) / "frame_quality.csv"
                 if not qpath.exists():
                     qpath = self.result_dir / "frame_quality.csv"
                 if qpath.exists():
@@ -793,15 +790,12 @@ class AperturePhotometryWindow(StepWindowBase):
         self.update_navigation_buttons()
 
     def validate_step(self) -> bool:
-        ap_path = step9_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
-        if not ap_path.exists():
-            ap_path = self.params.P.result_dir / "aperture_by_frame.csv"
+        ap_path = step5_dir(self.params.P.result_dir) / "aperture_by_frame.csv"
         return ap_path.exists()
 
     def save_state(self):
         state_data = {
-            "aperture_complete": (step9_dir(self.params.P.result_dir) / "aperture_by_frame.csv").exists()
-            or (self.params.P.result_dir / "aperture_by_frame.csv").exists(),
+            "aperture_complete": (step5_dir(self.params.P.result_dir) / "aperture_by_frame.csv").exists(),
             "phot_aperture_scale": getattr(self.params.P, "phot_aperture_scale", 1.0),
             "fitsky_annulus_scale": getattr(self.params.P, "fitsky_annulus_scale", 4.0),
             "fitsky_dannulus_scale": getattr(self.params.P, "fitsky_dannulus_scale", 2.0),

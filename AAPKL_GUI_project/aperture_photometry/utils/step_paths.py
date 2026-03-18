@@ -1,40 +1,69 @@
-"""Common step output paths for the workflow."""
+"""Common step output paths for the workflow.
+
+Pipeline order (after refactoring):
+  Step 1: File Selection
+  Step 2: Image Crop
+  Step 3: Sky Preview & QC
+  Step 4: Source Detection
+  Step 5: Aperture Photometry   (was step 9, forced photometry)
+  Step 6: WCS Plate Solving     (was step 5)
+  Step 7: Reference Build       (was step 6)
+  Step 8: Star ID Matching      (was step 7)
+  Step 9: Target/Comp Selection (was step 8, master ID editor)
+  Step 10: Light Curve Builder
+  Step 11: Detrend & Night Merge
+  Step 12: Period Analysis
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 
+# ── Current directory names ──────────────────────────────────────────
 STEP1_DIRNAME = "step1_file_selection"
 STEP2_DIRNAME = "step2_crop"
 STEP4_DIRNAME = "step4_detection"
-STEP5_DIRNAME = "step5_wcs"
-STEP6_DIRNAME = "step6_refbuild"
-STEP7_DIRNAME = "step7_idmatch"
-STEP8_DIRNAME = "step8_selection"
-STEP9_DIRNAME = "step9_photometry"
+STEP5_DIRNAME = "step5_photometry"      # Full aperture photometry (was step9_photometry)
+STEP6_DIRNAME = "step6_wcs"             # WCS plate solving (was step5_wcs)
+STEP7_DIRNAME = "step7_refbuild"        # Reference catalog build (was step6_refbuild)
+STEP8_DIRNAME = "step8_idmatch"         # Star ID matching (was step7_idmatch)
+STEP9_DIRNAME = "step9_selection"       # Target/comp selection (was step8_selection)
 STEP10_DIRNAME = "step10_lightcurve"
 STEP11_DIRNAME = "step11_detrend_merge"
 STEP12_PERIOD_DIRNAME = "step12_period_analysis"
-# Legacy directory names (pre-refactor)
+
+# ── Legacy directory names (v2 reorder: phot moved before WCS) ───────
+LEGACY_STEP5_WCS_DIRNAME = "step5_wcs"
+LEGACY_STEP6_REFBUILD_DIRNAME_V2 = "step6_refbuild"
+LEGACY_STEP7_IDMATCH_DIRNAME_V2 = "step7_idmatch"
+LEGACY_STEP8_SELECTION_DIRNAME = "step8_selection"
+LEGACY_STEP9_PHOTOMETRY_DIRNAME = "step9_photometry"
+
+# ── Legacy directory names (v1 reorder: ref↔idmatch swap) ───────────
 LEGACY_STEP5_REFBUILD_DIRNAME = "step5_refbuild"
 LEGACY_STEP6_IDMATCH_DIRNAME = "step6_idmatch"
 LEGACY_STEP7_WCS_DIRNAME = "step7_wcs"
 LEGACY_STEP7_REFBUILD_DIRNAME = "step7_refbuild"
-# Legacy directory names for step renumbering (step11→10, step12→11, step13→12)
+
+# ── Legacy directory names (step renumbering: step11→10 etc.) ────────
 LEGACY_STEP11_LIGHTCURVE_DIRNAME = "step11_lightcurve"
 LEGACY_STEP12_DETREND_DIRNAME = "step12_detrend_merge"
 LEGACY_STEP13_PERIOD_DIRNAME = "step13_period_analysis"
-# Legacy directory names for backward compatibility
 LEGACY_STEP11_ZEROPOINT_DIRNAME = "step11_zeropoint"  # Old step11 (now tool)
-# Tool directories
+
+# ── Tool directories ─────────────────────────────────────────────────
 TOOL_EXTINCTION_DIRNAME = "tool_extinction"
 
+
+# ── Generic helper ───────────────────────────────────────────────────
 
 def step_dir(result_dir: Path, dirname: str) -> Path:
     """Return a step directory path under the result directory."""
     return Path(result_dir) / dirname
 
+
+# ── Step 1–4 (unchanged) ────────────────────────────────────────────
 
 def step1_dir(result_dir: Path) -> Path:
     return step_dir(result_dir, STEP1_DIRNAME)
@@ -60,17 +89,89 @@ def step4_dir(result_dir: Path) -> Path:
     return step_dir(result_dir, STEP4_DIRNAME)
 
 
+# ── Step 5: Aperture Photometry (was step 9) ────────────────────────
+
 def step5_dir(result_dir: Path) -> Path:
+    """Step 5: Full Aperture Photometry output."""
     return step_dir(result_dir, STEP5_DIRNAME)
 
 
+def step5_photometry_dir(result_dir: Path) -> Path:
+    """Preferred explicit alias for Step 5 photometry outputs."""
+    return step5_dir(result_dir)
+
+
+def step5_aperture_dir(result_dir: Path) -> Path:
+    """Compatibility alias for Step 5 aperture photometry outputs."""
+    return step5_photometry_dir(result_dir)
+
+
+# ── Step 6: WCS Plate Solving (was step 5) ──────────────────────────
+
 def step6_dir(result_dir: Path) -> Path:
+    """Step 6: WCS Plate Solving output."""
     return step_dir(result_dir, STEP6_DIRNAME)
 
 
+def step6_wcs_dir(result_dir: Path) -> Path:
+    """Preferred explicit alias for Step 6 WCS outputs."""
+    return step6_dir(result_dir)
+
+
+# ── Step 7: Reference Build (was step 6) ────────────────────────────
+
 def step7_dir(result_dir: Path) -> Path:
+    """Step 7: Reference Catalog Build output."""
     return step_dir(result_dir, STEP7_DIRNAME)
 
+
+def step7_refbuild_dir(result_dir: Path) -> Path:
+    """Preferred explicit alias for Step 7 reference-build outputs."""
+    return step7_dir(result_dir)
+
+
+# ── Step 8: Star ID Matching (was step 7) ───────────────────────────
+
+def step8_dir(result_dir: Path) -> Path:
+    """Step 8: Star ID Matching output."""
+    return step_dir(result_dir, STEP8_DIRNAME)
+
+
+def step8_idmatch_dir(result_dir: Path) -> Path:
+    """Preferred explicit alias for Step 8 star-ID matching outputs."""
+    return step8_dir(result_dir)
+
+
+# ── Step 9: Target/Comp Selection (was step 8) ─────────────────────
+
+def step9_dir(result_dir: Path) -> Path:
+    """Step 9: Target/Comparison Selection (Master ID Editor) output."""
+    return step_dir(result_dir, STEP9_DIRNAME)
+
+
+def step9_selection_dir(result_dir: Path) -> Path:
+    """Preferred explicit alias for Step 9 target/comparison selection outputs."""
+    return step9_dir(result_dir)
+
+
+# ── Step 10–12 ───────────────────────────────────────────────────────
+
+def step10_dir(result_dir: Path) -> Path:
+    """Step 10: Light Curve Builder (was step 11)"""
+    return step_dir(result_dir, STEP10_DIRNAME)
+
+
+def step11_dir(result_dir: Path) -> Path:
+    """Step 11: Detrend & Night Merge (was step 12)"""
+    return step_dir(result_dir, STEP11_DIRNAME)
+
+
+def step12_period_dir(result_dir: Path) -> Path:
+    """Step 12: Period Analysis (was step 13)"""
+    return step_dir(result_dir, STEP12_PERIOD_DIRNAME)
+
+
+# ── Legacy convenience functions (for very old data) ─────────────────
 
 def legacy_step5_refbuild_dir(result_dir: Path) -> Path:
     return step_dir(result_dir, LEGACY_STEP5_REFBUILD_DIRNAME)
@@ -88,43 +189,17 @@ def legacy_step7_refbuild_dir(result_dir: Path) -> Path:
     return step_dir(result_dir, LEGACY_STEP7_REFBUILD_DIRNAME)
 
 
-def step8_dir(result_dir: Path) -> Path:
-    return step_dir(result_dir, STEP8_DIRNAME)
+def legacy_step5_wcs_dir(result_dir: Path) -> Path:
+    """Legacy: step5_wcs/ (WCS was step 5 before v2 reorder)"""
+    return step_dir(result_dir, LEGACY_STEP5_WCS_DIRNAME)
 
 
-def step9_dir(result_dir: Path) -> Path:
-    return step_dir(result_dir, STEP9_DIRNAME)
+def legacy_step9_photometry_dir(result_dir: Path) -> Path:
+    """Legacy: step9_photometry/ (photometry was step 9 before v2 reorder)"""
+    return step_dir(result_dir, LEGACY_STEP9_PHOTOMETRY_DIRNAME)
 
 
-def step10_dir(result_dir: Path) -> Path:
-    """Step 10: Light Curve Builder (was step 11)"""
-    p = step_dir(result_dir, STEP10_DIRNAME)
-    if not p.exists():
-        legacy = step_dir(result_dir, LEGACY_STEP11_LIGHTCURVE_DIRNAME)
-        if legacy.exists():
-            return legacy
-    return p
-
-
-def step11_dir(result_dir: Path) -> Path:
-    """Step 11: Detrend & Night Merge (was step 12)"""
-    p = step_dir(result_dir, STEP11_DIRNAME)
-    if not p.exists():
-        legacy = step_dir(result_dir, LEGACY_STEP12_DETREND_DIRNAME)
-        if legacy.exists():
-            return legacy
-    return p
-
-
-def step12_period_dir(result_dir: Path) -> Path:
-    """Step 12: Period Analysis (was step 13)"""
-    p = step_dir(result_dir, STEP12_PERIOD_DIRNAME)
-    if not p.exists():
-        legacy = step_dir(result_dir, LEGACY_STEP13_PERIOD_DIRNAME)
-        if legacy.exists():
-            return legacy
-    return p
-
+# ── Step 11 helper paths (unchanged) ─────────────────────────────────
 
 def step11_current_lc_path(result_dir: Path, target_id: int) -> Path:
     return step11_dir(result_dir) / f"lightcurve_ID{int(target_id)}_current.csv"
@@ -227,13 +302,13 @@ def find_best_lightcurve_csv(result_dir: Path, target_id: int | None = None) -> 
     return None
 
 
-# Tool directory functions
+# ── Tool directory functions ──────────────────────────────────────────
+
 def tool_extinction_dir(result_dir: Path) -> Path:
     """Extinction & Zeropoint Tool output directory"""
     return step_dir(result_dir, TOOL_EXTINCTION_DIRNAME)
 
 
-# Legacy functions for backward compatibility
 def legacy_step11_zeropoint_dir(result_dir: Path) -> Path:
     """Legacy: Old step11 zeropoint directory (now tool_extinction)"""
     return step_dir(result_dir, LEGACY_STEP11_ZEROPOINT_DIRNAME)
@@ -241,10 +316,8 @@ def legacy_step11_zeropoint_dir(result_dir: Path) -> Path:
 
 def legacy_step11_extinction_dir(result_dir: Path) -> Path:
     """Legacy: Old step11 extinction subdirectory. Now checks tool_extinction first."""
-    # First check new tool directory
     new_path = tool_extinction_dir(result_dir)
     if new_path.exists():
         return new_path
-    # Fall back to legacy path
     legacy_path = legacy_step11_zeropoint_dir(result_dir) / "step11_extinction"
     return legacy_path
