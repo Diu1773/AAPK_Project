@@ -765,6 +765,7 @@ class FileSelectionWindow(StepWindowBase):
             "filename_prefix": self.params.P.filename_prefix,
             "file_count": len(self.file_manager.filenames),
             "reference_frame": self.file_manager.ref_filename,
+            "file_path_map": {k: str(v) for k, v in getattr(self.file_manager, "path_map", {}).items()},
             "night_gap_hours": self.night_gap_spinbox.value(),
             "excluded_nights": sorted(self._excluded_nights),
             "night_assignments": {
@@ -784,6 +785,11 @@ class FileSelectionWindow(StepWindowBase):
                 "excluded_nights": sorted(self._excluded_nights),
             }
             na_path.write_text(json.dumps(na_data, indent=2), encoding="utf-8")
+            path_map_data = {k: str(v) for k, v in getattr(self.file_manager, "path_map", {}).items() if v}
+            (s1_dir / "file_path_map.json").write_text(
+                json.dumps(path_map_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             self._write_run_manifest()
         except Exception:
             pass
@@ -836,6 +842,11 @@ class FileSelectionWindow(StepWindowBase):
             if "reference_frame" in state_data and state_data["reference_frame"]:
                 self.file_manager.ref_filename = state_data["reference_frame"]
                 self.ref_label.setText(state_data["reference_frame"])
+
+            file_path_map = state_data.get("file_path_map")
+            if isinstance(file_path_map, dict) and file_path_map:
+                self.params.P.file_path_map = {str(k): str(v) for k, v in file_path_map.items() if v}
+                self.file_manager.path_map = {str(k): Path(v) for k, v in file_path_map.items() if v}
 
             night_dirs = [Path(p) for p in state_data.get("night_dirs", []) if p]
             if bool(state_data.get("multi_night")) and night_dirs:

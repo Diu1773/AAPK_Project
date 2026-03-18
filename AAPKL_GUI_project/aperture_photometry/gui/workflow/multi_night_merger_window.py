@@ -51,6 +51,7 @@ from ...core.project_state import ProjectState
 from ...utils.io_utils import (
     read_csv_int64_source_id,
     coerce_int64_source_id,
+    load_file_path_map,
     load_headers_table,
     load_night_assignments,
 )
@@ -395,8 +396,8 @@ class MultiNightMergerWindow(QMainWindow):
 
         info_grp = QGroupBox("폴더 스캔")
         info_layout = QVBoxLayout(info_grp)
-        self.folder_info_table = QTableWidget(0, 7)
-        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Type", "Start", "End", "Step 5", "Step 10", "필터"])
+        self.folder_info_table = QTableWidget(0, 9)
+        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Type", "Start", "End", "Step 5", "Step 9", "Step 10", "필터", "상태"])
         self.folder_info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.folder_info_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.folder_info_table.setMinimumHeight(180)
@@ -628,6 +629,9 @@ class MultiNightMergerWindow(QMainWindow):
             selection_payloads = _load_selection_payloads(folder)
             s10 = step10_dir(folder)
             has_step10 = bool(list(s10.glob("lightcurve_ID*_raw.csv"))) or bool(list(s10.glob("lightcurve_combined_ID*_raw.csv")))
+            has_step5 = not idx.empty
+            has_step9 = bool(catalogs) and bool(selection_payloads)
+            merge_ready = bool(has_step5 and has_step9 and has_step10)
 
             filters = sorted(set(catalogs) | set(selection_payloads))
             row_info = {
@@ -635,10 +639,11 @@ class MultiNightMergerWindow(QMainWindow):
                 "run_type": str(meta.get("run_type", "result")),
                 "date_start": meta.get("date_start") or "—",
                 "date_end": meta.get("date_end") or "—",
-                "has_step5": not idx.empty,
-                "has_step9": bool(catalogs),
+                "has_step5": has_step5,
+                "has_step9": has_step9,
                 "has_step10": has_step10,
                 "filters": filters,
+                "merge_ready": merge_ready,
             }
             self.folder_scan_rows.append(row_info)
 
@@ -648,12 +653,15 @@ class MultiNightMergerWindow(QMainWindow):
             self.folder_info_table.setItem(row, 1, QTableWidgetItem(str(row_info["run_type"])))
             self.folder_info_table.setItem(row, 2, QTableWidgetItem(str(row_info["date_start"])))
             self.folder_info_table.setItem(row, 3, QTableWidgetItem(str(row_info["date_end"])))
-            for col_idx, key in enumerate(("has_step5", "has_step10"), start=4):
+            for col_idx, key in enumerate(("has_step5", "has_step9", "has_step10"), start=4):
                 ok = bool(row_info[key])
                 item = QTableWidgetItem("OK" if ok else "없음")
                 item.setForeground(QColor("#2E7D32") if ok else QColor("#C62828"))
                 self.folder_info_table.setItem(row, col_idx, item)
-            self.folder_info_table.setItem(row, 6, QTableWidgetItem(", ".join(filters) if filters else "—"))
+            self.folder_info_table.setItem(row, 7, QTableWidgetItem(", ".join(filters) if filters else "—"))
+            status_item = QTableWidgetItem("사용 가능" if merge_ready else "입력 부족")
+            status_item.setForeground(QColor("#2E7D32") if merge_ready else QColor("#C62828"))
+            self.folder_info_table.setItem(row, 8, status_item)
 
     # ───────────────────────── Step 2: ID match ─────────────────────────
 
@@ -720,8 +728,19 @@ class MultiNightMergerWindow(QMainWindow):
 
         if not self.folder_scan_rows:
             self._scan_folders()
-        if not self.folders:
-            QMessageBox.information(self, "ID Match", "No folders selected.")
+        if len(self.folders) < 2:
+            QMessageBox.information(self, "ID Match", "Merge하려면 최소 2개의 RESULT/MERGED workspace가 필요합니다.")
+            return
+
+        invalid_rows = [row for row in self.folder_scan_rows if not row.get("merge_ready")]
+        if invalid_rows:
+            names = "\n".join(f"- {row['folder'].name}" for row in invalid_rows[:8])
+            QMessageBox.warning(
+                self,
+                "ID Match",
+                "다음 입력은 Step 5 / Step 9 / Step 10 산출물이 부족합니다:\n\n"
+                f"{names}"
+            )
             return
 
         base_folder = self.folders[0]
@@ -1228,6 +1247,7 @@ class MultiNightMergerWindow(QMainWindow):
         for folder in self.folders:
             folder_key = str(folder)
             folder_tag = self.folder_tags.get(folder_key, folder.name)
+            source_path_map = load_file_path_map(folder)
             idx = _read_step5_index(folder)
             if idx.empty or "file" not in idx.columns:
                 continue
@@ -1285,7 +1305,9 @@ class MultiNightMergerWindow(QMainWindow):
                 out_phot_path = s5 / f"{merged_fname}_photometry.tsv"
                 phot_df.to_csv(out_phot_path, sep="\t", index=False, na_rep="NaN")
 
-                merged_path_map[merged_fname] = ""
+                original_path = source_path_map.get(fname)
+                if original_path:
+                    merged_path_map[merged_fname] = str(original_path)
                 merged_night_id = local_to_merged.get(local_night_ids.get(fname, 1), 1)
                 merged_night_assignments[merged_fname] = merged_night_id
 
@@ -1316,6 +1338,10 @@ class MultiNightMergerWindow(QMainWindow):
             pd.DataFrame(merged_headers_rows).drop_duplicates(subset=["Filename"], keep="first").to_csv(s1 / "headers.csv", index=False)
         (s1 / "night_assignments.json").write_text(
             json.dumps({"night_assignments": merged_night_assignments}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (s1 / "file_path_map.json").write_text(
+            json.dumps(merged_path_map, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -1352,6 +1378,7 @@ class MultiNightMergerWindow(QMainWindow):
             return
         out_dir = Path(self.merged_result_dir)
         self.merged_runtime_params = _MergedParamsProxy(self.params, out_dir)
+        self.merged_runtime_params.P.file_path_map = dict(path_map)
         idx = _read_step5_index(out_dir)
         filenames = idx["file"].astype(str).tolist() if not idx.empty and "file" in idx.columns else []
         self.merged_runtime_file_manager = _MergedFileManagerProxy(filenames, night_assignments, path_map)
@@ -1464,6 +1491,16 @@ class MultiNightMergerWindow(QMainWindow):
             self._go_to_step(self._current_step - 1)
 
     def _next_step(self):
+        if self._current_step == 0 and len(self.folders) < 2:
+            QMessageBox.warning(self, "Merger", "Merge하려면 최소 2개의 RESULT/MERGED workspace를 선택하세요.")
+            return
+        if self._current_step == 0:
+            if not self.folder_scan_rows:
+                self._scan_folders()
+            invalid_rows = [row for row in self.folder_scan_rows if not row.get("merge_ready")]
+            if invalid_rows:
+                QMessageBox.warning(self, "Merger", "Step 5 / Step 9 / Step 10이 모두 있는 workspace만 머저할 수 있습니다.")
+                return
         if self._current_step == 0 and not self.folders:
             QMessageBox.warning(self, "Merger", "폴더를 먼저 선택하세요.")
             return

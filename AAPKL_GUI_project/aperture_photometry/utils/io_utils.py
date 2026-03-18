@@ -101,6 +101,28 @@ def load_headers_table(result_dir: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_file_path_map(result_dir: Path) -> dict[str, str]:
+    """Load filename → original FITS path mapping from step1/file_path_map.json."""
+    from .step_paths import step1_dir
+    path = step1_dir(result_dir) / "file_path_map.json"
+    if not path.exists():
+        path = result_dir / "file_path_map.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        if not key or not value:
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
 class TailLogger:
     """
     Logger that maintains a tail buffer of recent messages
