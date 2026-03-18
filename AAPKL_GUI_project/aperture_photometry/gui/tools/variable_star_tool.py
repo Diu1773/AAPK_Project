@@ -872,8 +872,17 @@ class VariableStarToolWindow(QWidget):
         n = int(np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag"])))
         corr_line = f"  [{self.lc_data['corr_tag']}]" if self.lc_data.get("corr_tag") else ""
         workspace_name = Path(self.params.P.result_dir).name
+        workspace_type = ""
+        try:
+            from ...utils.run_workspace import load_run_manifest
+            run_meta = load_run_manifest(Path(self.params.P.result_dir))
+            run_type = str(run_meta.get("run_type") or "").strip().lower()
+            if run_type:
+                workspace_type = f" [{run_type}]"
+        except Exception:
+            pass
         self.lc_status.setText(
-            f"{workspace_name}\n{self.lc_data['source']}\n{n} pts{corr_line}\n{self.mag_col_combo.currentText()}"
+            f"{workspace_name}{workspace_type}\n{self.lc_data['source']}\n{n} pts{corr_line}\n{self.mag_col_combo.currentText()}"
         )
         self.lc_status.setStyleSheet("color: green;")
         filt_label = self.lc_data.get("analysis_filter", "__all__")

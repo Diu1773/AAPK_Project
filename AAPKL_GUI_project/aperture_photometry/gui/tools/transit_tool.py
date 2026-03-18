@@ -813,8 +813,17 @@ class TransitToolWindow(QWidget):
             corr_tag = _detect_corr_mode_from_df(df, path.name)
             corr_line = f"  detrend: {corr_tag}" if corr_tag else ""
             workspace_name = Path(self.params.P.result_dir).name
+            workspace_type = ""
+            try:
+                from ...utils.run_workspace import load_run_manifest
+                run_meta = load_run_manifest(Path(self.params.P.result_dir))
+                run_type = str(run_meta.get("run_type") or "").strip().lower()
+                if run_type:
+                    workspace_type = f" [{run_type}]"
+            except Exception:
+                pass
             self.lc_status.setText(
-                f"{workspace_name}\n{path.name}\n{n} pts, flux{corr_line}\nmag src: {mag_col} [{raw_corr}]"
+                f"{workspace_name}{workspace_type}\n{path.name}\n{n} pts, flux{corr_line}\nmag src: {mag_col} [{raw_corr}]"
             )
             self.lc_status.setStyleSheet("color: green;")
             self.log(f"Loaded: {path.name} ({n} pts, mag→flux, detrend={corr_tag or 'N/A'})")
