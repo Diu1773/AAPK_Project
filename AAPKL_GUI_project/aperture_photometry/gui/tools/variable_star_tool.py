@@ -725,21 +725,9 @@ class VariableStarToolWindow(QWidget):
     def _load_lc_from_step(self):
         """Load all available step outputs and expose them in the Use data combo."""
         try:
-            from ...utils.step_paths import step10_dir, step11_dir
+            from ...utils.step_paths import list_lightcurve_csvs
             rd = Path(self.params.P.result_dir)
-            paths: list[Path] = []
-            seen: set[Path] = set()
-            for d, patterns in [
-                (step11_dir(rd), ["lightcurve_ID*_global.csv", "lightcurve_ID*_color.csv", "lightcurve_ID*_offset.csv"]),
-                (step10_dir(rd), ["lightcurve_combined_ID*_raw.csv", "lightcurve_ID*_raw.csv"]),
-            ]:
-                if not d.exists():
-                    continue
-                for pattern in patterns:
-                    for path in sorted(d.glob(pattern), reverse=True):
-                        if path not in seen:
-                            seen.add(path)
-                            paths.append(path)
+            paths = list_lightcurve_csvs(rd)
             if not paths:
                 self.lc_status.setText("No lightcurve_*.csv found in Step 10/11 output")
                 return
@@ -883,7 +871,10 @@ class VariableStarToolWindow(QWidget):
         }
         n = int(np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag"])))
         corr_line = f"  [{self.lc_data['corr_tag']}]" if self.lc_data.get("corr_tag") else ""
-        self.lc_status.setText(f"{self.lc_data['source']}\n{n} pts{corr_line}\n{self.mag_col_combo.currentText()}")
+        workspace_name = Path(self.params.P.result_dir).name
+        self.lc_status.setText(
+            f"{workspace_name}\n{self.lc_data['source']}\n{n} pts{corr_line}\n{self.mag_col_combo.currentText()}"
+        )
         self.lc_status.setStyleSheet("color: green;")
         filt_label = self.lc_data.get("analysis_filter", "__all__")
         filt_info = f", filter={filt_label}" if filt_label and filt_label != "__all__" else ""

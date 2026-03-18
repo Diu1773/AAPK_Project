@@ -108,9 +108,19 @@ def load_file_path_map(result_dir: Path) -> dict[str, str]:
     if not path.exists():
         path = result_dir / "file_path_map.json"
     if not path.exists():
-        return {}
+        project_state_path = Path(result_dir) / "project_state.json"
+        if not project_state_path.exists():
+            return {}
+        try:
+            state = json.loads(project_state_path.read_text(encoding="utf-8"))
+            step_data = state.get("step_data", {})
+            file_sel = step_data.get("file_selection", {}) if isinstance(step_data, dict) else {}
+            data = file_sel.get("file_path_map", {}) if isinstance(file_sel, dict) else {}
+        except Exception:
+            return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     if not isinstance(data, dict):

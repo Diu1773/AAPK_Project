@@ -105,3 +105,26 @@ def test_load_file_path_map_from_step1_dir(tmp_path: Path) -> None:
         "A.fit": "E:/obs/YZBOOTIS_20250429/A.fit",
         "B.fit": "E:/obs/YZBOOTIS_20250429/B.fit",
     }
+
+
+def test_load_file_path_map_falls_back_to_project_state(tmp_path: Path) -> None:
+    result_dir = tmp_path / "RESULT_YZBOOTIS_20250429"
+    result_dir.mkdir(parents=True)
+    (result_dir / "project_state.json").write_text(
+        """
+        {
+          "step_data": {
+            "file_selection": {
+              "file_path_map": {
+                "C.fit": "E:/obs/YZBOOTIS_20250429/C.fit"
+              }
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    assert load_file_path_map(result_dir) == {
+        "C.fit": "E:/obs/YZBOOTIS_20250429/C.fit",
+    }

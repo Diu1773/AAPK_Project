@@ -812,7 +812,10 @@ class TransitToolWindow(QWidget):
             raw_corr = "corr" if any(x in mag_col for x in ["corr", "cal"]) else "raw"
             corr_tag = _detect_corr_mode_from_df(df, path.name)
             corr_line = f"  detrend: {corr_tag}" if corr_tag else ""
-            self.lc_status.setText(f"{path.name}\n{n} pts, flux{corr_line}\nmag src: {mag_col} [{raw_corr}]")
+            workspace_name = Path(self.params.P.result_dir).name
+            self.lc_status.setText(
+                f"{workspace_name}\n{path.name}\n{n} pts, flux{corr_line}\nmag src: {mag_col} [{raw_corr}]"
+            )
             self.lc_status.setStyleSheet("color: green;")
             self.log(f"Loaded: {path.name} ({n} pts, mag→flux, detrend={corr_tag or 'N/A'})")
             self._draw_lc()

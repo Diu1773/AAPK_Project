@@ -402,8 +402,8 @@ class MultiNightMergerWindow(QMainWindow):
 
         info_grp = QGroupBox("폴더 스캔")
         info_layout = QVBoxLayout(info_grp)
-        self.folder_info_table = QTableWidget(0, 9)
-        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Type", "Start", "End", "Step 5", "Step 9", "Step 10", "필터", "상태"])
+        self.folder_info_table = QTableWidget(0, 10)
+        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Label", "Type", "Start", "End", "Step 5", "Step 9", "Step 10", "필터", "상태"])
         self.folder_info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.folder_info_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.folder_info_table.setMinimumHeight(180)
@@ -579,8 +579,45 @@ class MultiNightMergerWindow(QMainWindow):
                 item.setForeground(QColor("#1565C0"))
             self.folder_list.addItem(item)
 
+    def _invalidate_merger_state(self):
+        self.folder_scan_rows = []
+        self.match_summary_rows = []
+        self.match_records = []
+        self.merged_catalogs = {}
+        self.local_id_maps = {}
+        self.base_selection_by_filter = {}
+        self.selection_target_by_filter = {}
+        self.selection_comp_by_filter = {}
+        self.selection_check_by_filter = {}
+        self._selection_row_to_sid = {}
+        self.merged_result_dir = None
+        self.merged_runtime_params = None
+        self.merged_runtime_project_state = None
+        self.merged_runtime_file_manager = None
+        if hasattr(self, "folder_info_table"):
+            self.folder_info_table.setRowCount(0)
+        if hasattr(self, "match_table"):
+            self.match_table.setRowCount(0)
+        if hasattr(self, "selection_table"):
+            self.selection_table.setRowCount(0)
+        if hasattr(self, "selection_filter_combo"):
+            self.selection_filter_combo.blockSignals(True)
+            self.selection_filter_combo.clear()
+            self.selection_filter_combo.blockSignals(False)
+        if hasattr(self, "match_status_label"):
+            self.match_status_label.setText("매칭 결과: 아직 실행 안 됨")
+        if hasattr(self, "selection_status_label"):
+            self.selection_status_label.setText("선택 상태: 아직 merged catalog 없음")
+        if hasattr(self, "match_log"):
+            self.match_log.clear()
+        if hasattr(self, "selection_log"):
+            self.selection_log.clear()
+        if hasattr(self, "step10_status_label"):
+            self._refresh_runtime_status_labels()
+
     def _refresh_output_dir_default(self, force: bool = False):
         if not self.folders:
+            self.output_dir_edit.clear()
             return
         new_default = build_merged_workspace_dir(self.folders)
         current_text = self.output_dir_edit.text().strip()
@@ -603,6 +640,7 @@ class MultiNightMergerWindow(QMainWindow):
         if any(existing.resolve() == p.resolve() for existing in self.folders):
             return
         self.folders.append(p)
+        self._invalidate_merger_state()
         self._refresh_folder_list()
         self._refresh_output_dir_default(force=True)
 
@@ -611,6 +649,7 @@ class MultiNightMergerWindow(QMainWindow):
         if row < 0:
             return
         self.folders.pop(row)
+        self._invalidate_merger_state()
         self._refresh_folder_list()
         self._refresh_output_dir_default(force=True)
 
@@ -622,6 +661,7 @@ class MultiNightMergerWindow(QMainWindow):
         if new_row < 0 or new_row >= len(self.folders):
             return
         self.folders[row], self.folders[new_row] = self.folders[new_row], self.folders[row]
+        self._invalidate_merger_state()
         self._refresh_folder_list()
         self.folder_list.setCurrentRow(new_row)
         self._refresh_output_dir_default(force=True)
@@ -653,6 +693,7 @@ class MultiNightMergerWindow(QMainWindow):
             filters = sorted(set(catalogs) | set(selection_payloads))
             row_info = {
                 "folder": folder,
+                "label": str(meta.get("label") or folder.name),
                 "run_type": str(meta.get("run_type", "result")),
                 "date_start": meta.get("date_start") or "—",
                 "date_end": meta.get("date_end") or "—",
@@ -667,18 +708,39 @@ class MultiNightMergerWindow(QMainWindow):
             row = self.folder_info_table.rowCount()
             self.folder_info_table.insertRow(row)
             self.folder_info_table.setItem(row, 0, QTableWidgetItem(folder.name))
-            self.folder_info_table.setItem(row, 1, QTableWidgetItem(str(row_info["run_type"])))
-            self.folder_info_table.setItem(row, 2, QTableWidgetItem(str(row_info["date_start"])))
-            self.folder_info_table.setItem(row, 3, QTableWidgetItem(str(row_info["date_end"])))
-            for col_idx, key in enumerate(("has_step5", "has_step9", "has_step10"), start=4):
+            self.folder_info_table.setItem(row, 1, QTableWidgetItem(str(row_info["label"])))
+            self.folder_info_table.setItem(row, 2, QTableWidgetItem(str(row_info["run_type"])))
+            self.folder_info_table.setItem(row, 3, QTableWidgetItem(str(row_info["date_start"])))
+            self.folder_info_table.setItem(row, 4, QTableWidgetItem(str(row_info["date_end"])))
+            for col_idx, key in enumerate(("has_step5", "has_step9", "has_step10"), start=5):
                 ok = bool(row_info[key])
                 item = QTableWidgetItem("OK" if ok else "없음")
                 item.setForeground(QColor("#2E7D32") if ok else QColor("#C62828"))
                 self.folder_info_table.setItem(row, col_idx, item)
-            self.folder_info_table.setItem(row, 7, QTableWidgetItem(", ".join(filters) if filters else "—"))
+            self.folder_info_table.setItem(row, 8, QTableWidgetItem(", ".join(filters) if filters else "—"))
             status_item = QTableWidgetItem("사용 가능" if merge_ready else "입력 부족")
             status_item.setForeground(QColor("#2E7D32") if merge_ready else QColor("#C62828"))
-            self.folder_info_table.setItem(row, 8, status_item)
+            self.folder_info_table.setItem(row, 9, status_item)
+
+    def _validate_selected_workspaces(self) -> tuple[bool, str]:
+        if len(self.folders) < 2:
+            return False, "Merge하려면 최소 2개의 RESULT/MERGED workspace를 선택하세요."
+        if not self.folder_scan_rows:
+            self._scan_folders()
+        invalid_rows = [row for row in self.folder_scan_rows if not row.get("merge_ready")]
+        if invalid_rows:
+            return False, "Step 5 / Step 9 / Step 10이 모두 있는 workspace만 머저할 수 있습니다."
+        labels = []
+        seen = set()
+        for row in self.folder_scan_rows:
+            label = str(row.get("label") or "").strip()
+            key = label.lower()
+            if label and key not in seen:
+                labels.append(label)
+                seen.add(key)
+        if len(labels) > 1:
+            return False, "서로 다른 target/label의 RESULT를 한 번에 머저할 수 없습니다."
+        return True, ""
 
     # ───────────────────────── Step 2: ID match ─────────────────────────
 
@@ -745,19 +807,9 @@ class MultiNightMergerWindow(QMainWindow):
 
         if not self.folder_scan_rows:
             self._scan_folders()
-        if len(self.folders) < 2:
-            QMessageBox.information(self, "ID Match", "Merge하려면 최소 2개의 RESULT/MERGED workspace가 필요합니다.")
-            return
-
-        invalid_rows = [row for row in self.folder_scan_rows if not row.get("merge_ready")]
-        if invalid_rows:
-            names = "\n".join(f"- {row['folder'].name}" for row in invalid_rows[:8])
-            QMessageBox.warning(
-                self,
-                "ID Match",
-                "다음 입력은 Step 5 / Step 9 / Step 10 산출물이 부족합니다:\n\n"
-                f"{names}"
-            )
+        ok, msg = self._validate_selected_workspaces()
+        if not ok:
+            QMessageBox.warning(self, "ID Match", msg)
             return
 
         base_folder = self.folders[0]
@@ -1508,15 +1560,10 @@ class MultiNightMergerWindow(QMainWindow):
             self._go_to_step(self._current_step - 1)
 
     def _next_step(self):
-        if self._current_step == 0 and len(self.folders) < 2:
-            QMessageBox.warning(self, "Merger", "Merge하려면 최소 2개의 RESULT/MERGED workspace를 선택하세요.")
-            return
         if self._current_step == 0:
-            if not self.folder_scan_rows:
-                self._scan_folders()
-            invalid_rows = [row for row in self.folder_scan_rows if not row.get("merge_ready")]
-            if invalid_rows:
-                QMessageBox.warning(self, "Merger", "Step 5 / Step 9 / Step 10이 모두 있는 workspace만 머저할 수 있습니다.")
+            ok, msg = self._validate_selected_workspaces()
+            if not ok:
+                QMessageBox.warning(self, "Merger", msg)
                 return
         if self._current_step == 0 and not self.folders:
             QMessageBox.warning(self, "Merger", "폴더를 먼저 선택하세요.")

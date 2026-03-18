@@ -271,6 +271,15 @@ def find_best_lightcurve_csv(result_dir: Path, target_id: int | None = None) -> 
     2. Legacy Step 11 mode-specific result (global > color > offset)
     3. Step 10 raw combined/raw
     """
+    candidates = list_lightcurve_csvs(result_dir, target_id=target_id)
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
+
+
+def list_lightcurve_csvs(result_dir: Path, target_id: int | None = None) -> list[Path]:
+    """Return candidate light curve CSVs ordered by preferred analysis priority."""
     step10_out = step10_dir(result_dir)
     step11_out = step11_dir(result_dir)
     candidates: list[Path] = []
@@ -295,11 +304,7 @@ def find_best_lightcurve_csv(result_dir: Path, target_id: int | None = None) -> 
             for f in sorted(d.glob("lightcurve_*.csv"), reverse=True):
                 if f not in candidates:
                     candidates.append(f)
-
-    for cand in candidates:
-        if cand.exists():
-            return cand
-    return None
+    return candidates
 
 
 # ── Tool directory functions ──────────────────────────────────────────
