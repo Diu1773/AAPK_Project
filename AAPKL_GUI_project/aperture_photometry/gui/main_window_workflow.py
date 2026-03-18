@@ -262,7 +262,8 @@ class MainWindowWorkflow(QMainWindow):
         data_dir = state_data.get("data_dir")
         if data_dir:
             self.params.P.data_dir = Path(data_dir)
-            self.params.P.result_dir = self.params.P.data_dir / "result"
+            saved_result_dir = state_data.get("result_dir")
+            self.params.P.result_dir = Path(saved_result_dir) if saved_result_dir else (self.params.P.data_dir / "result")
             self.params.P.cache_dir = self.params.P.result_dir / "cache"
             try:
                 self.params.P.result_dir.mkdir(parents=True, exist_ok=True)

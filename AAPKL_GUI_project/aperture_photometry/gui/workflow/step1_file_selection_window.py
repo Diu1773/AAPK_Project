@@ -16,6 +16,7 @@ from typing import Optional
 
 from .step_window_base import StepWindowBase
 from ...utils.step_paths import step1_dir
+from ...utils.run_workspace import build_result_workspace_dir, write_run_manifest
 try:  # Python 3.11+
     import tomllib  # type: ignore
 except Exception:  # Python 3.10 and earlier
@@ -375,6 +376,20 @@ class FileSelectionWindow(StepWindowBase):
             else:
                 self.file_manager.clear_multi_night_dirs()
 
+            self._update_result_workspace()
+            try:
+                self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
+                self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            self._persist_param_file(
+                io_updates={
+                    "data_dir": str(self.params.P.data_dir),
+                    "result_dir": str(self.params.P.result_dir),
+                    "cache_dir": str(self.params.P.cache_dir.name),
+                }
+            )
+
             self.load_files()
             self.update_navigation_buttons()
         except Exception as e:
@@ -575,11 +590,26 @@ class FileSelectionWindow(StepWindowBase):
     # Params / directory helpers
     # -------------------------------------------------------------------------
 
+    def _current_input_dirs(self) -> list[Path]:
+        return [Path(p) for p in getattr(self.file_manager, "selected_dirs", []) if p]
+
+    def _update_result_workspace(self):
+        root_dir = Path(self.root_dir if getattr(self, "root_dir", None) else self.params.P.data_dir)
+        self.params.P.result_dir = build_result_workspace_dir(root_dir, self._current_input_dirs())
+        self.params.P.cache_dir = self.params.P.result_dir / "cache"
+
+    def _write_run_manifest(self):
+        write_run_manifest(
+            self.params.P.result_dir,
+            run_type="result",
+            root_dir=Path(self.root_dir if getattr(self, "root_dir", None) else self.params.P.data_dir),
+            input_dirs=self._current_input_dirs(),
+            target_name=getattr(self.params.P, "target_name", None),
+        )
+
     def _set_data_dir(self, path: Path):
         self.params.P.data_dir = Path(path)
-
-        self.params.P.result_dir = self.params.P.data_dir / "result"
-        self.params.P.cache_dir = self.params.P.result_dir / "cache"
+        self._update_result_workspace()
         try:
             self.params.P.result_dir.mkdir(parents=True, exist_ok=True)
             self.params.P.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -669,6 +699,10 @@ class FileSelectionWindow(StepWindowBase):
                 "ra_deg": ra_deg,
                 "dec_deg": dec_deg,
             })
+            try:
+                self._write_run_manifest()
+            except Exception:
+                pass
 
         except Exception as e:
             QMessageBox.warning(self, "SIMBAD Error", str(e))
@@ -723,8 +757,11 @@ class FileSelectionWindow(StepWindowBase):
         """Save step state to project"""
         state_data = {
             "data_dir": str(self.params.P.data_dir),
+            "result_dir": str(self.params.P.result_dir),
             "root_dir": str(self.root_dir),
             "include_subfolders": bool(self.include_subfolders_check.isChecked()),
+            "multi_night": bool(self.file_manager.selected_dirs),
+            "night_dirs": [str(p) for p in self.file_manager.selected_dirs],
             "filename_prefix": self.params.P.filename_prefix,
             "file_count": len(self.file_manager.filenames),
             "reference_frame": self.file_manager.ref_filename,
@@ -747,6 +784,7 @@ class FileSelectionWindow(StepWindowBase):
                 "excluded_nights": sorted(self._excluded_nights),
             }
             na_path.write_text(json.dumps(na_data, indent=2), encoding="utf-8")
+            self._write_run_manifest()
         except Exception:
             pass
 
@@ -758,8 +796,12 @@ class FileSelectionWindow(StepWindowBase):
         state_data = self.project_state.get_step_data("file_selection")
 
         if state_data:
+            saved_result_dir = state_data.get("result_dir")
             if "data_dir" in state_data:
                 self._set_data_dir(Path(state_data["data_dir"]))
+                if saved_result_dir:
+                    self.params.P.result_dir = Path(saved_result_dir)
+                    self.params.P.cache_dir = self.params.P.result_dir / "cache"
 
             if "root_dir" in state_data:
                 self.root_dir = Path(state_data["root_dir"])
@@ -794,6 +836,13 @@ class FileSelectionWindow(StepWindowBase):
             if "reference_frame" in state_data and state_data["reference_frame"]:
                 self.file_manager.ref_filename = state_data["reference_frame"]
                 self.ref_label.setText(state_data["reference_frame"])
+
+            night_dirs = [Path(p) for p in state_data.get("night_dirs", []) if p]
+            if bool(state_data.get("multi_night")) and night_dirs:
+                root_path = Path(state_data.get("root_dir") or state_data.get("data_dir") or self.params.P.data_dir)
+                self.file_manager.set_multi_night_dirs(root_path, night_dirs)
+            else:
+                self.file_manager.clear_multi_night_dirs()
 
             # Reload files to repopulate tables
             try:

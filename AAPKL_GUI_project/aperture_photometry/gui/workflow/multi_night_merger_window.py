@@ -55,6 +55,15 @@ from ...utils.io_utils import (
     load_night_assignments,
 )
 from ...utils.photometry_loader import load_frame_photometry
+from ...utils.run_workspace import (
+    build_merged_workspace_dir,
+    infer_result_workspace_date_range,
+    infer_result_workspace_label,
+    infer_workspace_date_range,
+    infer_workspace_label,
+    load_run_manifest,
+    write_run_manifest,
+)
 from ...utils.step_paths import (
     step1_dir,
     step5_photometry_dir,
@@ -75,7 +84,22 @@ def _folder_tag(index: int, folder: Path) -> str:
 
 
 def _default_output_dir(base_folder: Path) -> Path:
-    return base_folder.parent / f"{base_folder.name}_merged"
+    return build_merged_workspace_dir([base_folder])
+
+
+def _run_meta(result_dir: Path) -> dict:
+    meta = load_run_manifest(result_dir)
+    if meta:
+        return meta
+    start_date, end_date = infer_workspace_date_range(result_dir)
+    label = infer_workspace_label(result_dir)
+    return {
+        "run_type": "result",
+        "label": label,
+        "date_start": start_date,
+        "date_end": end_date,
+        "result_dir": str(result_dir),
+    }
 
 
 def _read_step5_index(result_dir: Path) -> pd.DataFrame:
@@ -324,7 +348,7 @@ class MultiNightMergerWindow(QMainWindow):
         root.addLayout(nav)
 
         self._current_step = 0
-        self.output_dir_edit.setText(str(_default_output_dir(self.folders[0])))
+        self._refresh_output_dir_default(force=True)
         self._refresh_folder_list()
         self._go_to_step(0)
 
@@ -339,8 +363,8 @@ class MultiNightMergerWindow(QMainWindow):
         layout = QVBoxLayout(page)
 
         layout.addWidget(self._make_info_label(
-            "Step 10까지 처리된 result 폴더들을 선택합니다.\n"
-            "이후 머저용 merged workspace를 별도 결과 폴더에 생성합니다."
+            "RESULT_* 또는 MERGED_* workspace 폴더들을 선택합니다.\n"
+            "이후 MERGED_<target>_<start>_<end> workspace를 새로 생성합니다."
         ))
 
         grp = QGroupBox("입력 result 폴더")
@@ -371,8 +395,8 @@ class MultiNightMergerWindow(QMainWindow):
 
         info_grp = QGroupBox("폴더 스캔")
         info_layout = QVBoxLayout(info_grp)
-        self.folder_info_table = QTableWidget(0, 5)
-        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Step 5", "Step 9", "Step 10", "필터"])
+        self.folder_info_table = QTableWidget(0, 7)
+        self.folder_info_table.setHorizontalHeaderLabels(["폴더", "Type", "Start", "End", "Step 5", "Step 10", "필터"])
         self.folder_info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.folder_info_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.folder_info_table.setMinimumHeight(180)
@@ -549,6 +573,22 @@ class MultiNightMergerWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
             self.folder_list.addItem(item)
 
+    def _refresh_output_dir_default(self, force: bool = False):
+        if not self.folders:
+            return
+        new_default = build_merged_workspace_dir(self.folders)
+        current_text = self.output_dir_edit.text().strip()
+        if force or not current_text:
+            self.output_dir_edit.setText(str(new_default))
+            return
+        try:
+            current_path = Path(current_text)
+        except Exception:
+            current_path = None
+        old_default = _default_output_dir(self.folders[0])
+        if current_path is not None and current_path == old_default:
+            self.output_dir_edit.setText(str(new_default))
+
     def _on_add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "result 폴더 선택", str(self.folders[0].parent))
         if not folder:
@@ -558,6 +598,7 @@ class MultiNightMergerWindow(QMainWindow):
             return
         self.folders.append(p)
         self._refresh_folder_list()
+        self._refresh_output_dir_default(force=True)
 
     def _on_remove_folder(self):
         row = self.folder_list.currentRow()
@@ -565,20 +606,23 @@ class MultiNightMergerWindow(QMainWindow):
             return
         self.folders.pop(row)
         self._refresh_folder_list()
+        self._refresh_output_dir_default(force=True)
 
     def _browse_output_dir(self):
         path = QFileDialog.getExistingDirectory(
             self,
-            "merged result 폴더 선택",
-            str(Path(self.output_dir_edit.text()).parent if self.output_dir_edit.text().strip() else _default_output_dir(self.folders[0]).parent),
+            "MERGED workspace 폴더 선택",
+            str(Path(self.output_dir_edit.text()).parent if self.output_dir_edit.text().strip() else build_merged_workspace_dir(self.folders).parent),
         )
         if path:
-            self.output_dir_edit.setText(path)
+            current_name = build_merged_workspace_dir(self.folders).name if self.folders else "MERGED_workspace"
+            self.output_dir_edit.setText(str(Path(path) / current_name))
 
     def _scan_folders(self):
         self.folder_scan_rows = []
         self.folder_info_table.setRowCount(0)
         for folder in self.folders:
+            meta = _run_meta(folder)
             idx = _read_step5_index(folder)
             catalogs = _load_master_catalogs_by_filter(folder)
             selection_payloads = _load_selection_payloads(folder)
@@ -588,6 +632,9 @@ class MultiNightMergerWindow(QMainWindow):
             filters = sorted(set(catalogs) | set(selection_payloads))
             row_info = {
                 "folder": folder,
+                "run_type": str(meta.get("run_type", "result")),
+                "date_start": meta.get("date_start") or "—",
+                "date_end": meta.get("date_end") or "—",
                 "has_step5": not idx.empty,
                 "has_step9": bool(catalogs),
                 "has_step10": has_step10,
@@ -598,12 +645,15 @@ class MultiNightMergerWindow(QMainWindow):
             row = self.folder_info_table.rowCount()
             self.folder_info_table.insertRow(row)
             self.folder_info_table.setItem(row, 0, QTableWidgetItem(folder.name))
-            for col_idx, key in enumerate(("has_step5", "has_step9", "has_step10"), start=1):
+            self.folder_info_table.setItem(row, 1, QTableWidgetItem(str(row_info["run_type"])))
+            self.folder_info_table.setItem(row, 2, QTableWidgetItem(str(row_info["date_start"])))
+            self.folder_info_table.setItem(row, 3, QTableWidgetItem(str(row_info["date_end"])))
+            for col_idx, key in enumerate(("has_step5", "has_step10"), start=4):
                 ok = bool(row_info[key])
                 item = QTableWidgetItem("OK" if ok else "없음")
                 item.setForeground(QColor("#2E7D32") if ok else QColor("#C62828"))
                 self.folder_info_table.setItem(row, col_idx, item)
-            self.folder_info_table.setItem(row, 4, QTableWidgetItem(", ".join(filters) if filters else "—"))
+            self.folder_info_table.setItem(row, 6, QTableWidgetItem(", ".join(filters) if filters else "—"))
 
     # ───────────────────────── Step 2: ID match ─────────────────────────
 
@@ -1281,6 +1331,14 @@ class MultiNightMergerWindow(QMainWindow):
         }
         (out_dir / "merge_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         pd.DataFrame(self.match_records).to_csv(out_dir / "merge_id_map.csv", index=False)
+        write_run_manifest(
+            out_dir,
+            run_type="merged",
+            root_dir=out_dir.parent,
+            input_result_dirs=self.folders,
+            target_name=infer_result_workspace_label(self.folders),
+            storage_mode="full",
+        )
 
         self.merged_result_dir = out_dir
         self._build_merged_runtime_context(merged_night_assignments, merged_path_map)
@@ -1298,6 +1356,7 @@ class MultiNightMergerWindow(QMainWindow):
         filenames = idx["file"].astype(str).tolist() if not idx.empty and "file" in idx.columns else []
         self.merged_runtime_file_manager = _MergedFileManagerProxy(filenames, night_assignments, path_map)
         self.merged_runtime_project_state = ProjectState(out_dir)
+        self.merged_runtime_project_state.state["project_name"] = out_dir.name
         self.merged_runtime_project_state.state["completed_steps"] = sorted(set(range(9)))
         self.merged_runtime_project_state.state["current_step"] = 9
         self.merged_runtime_project_state.save()
