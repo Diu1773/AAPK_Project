@@ -4,11 +4,13 @@ Popup window with Previous/Next navigation
 """
 
 import json
+import os
 from collections import defaultdict
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QGroupBox, QLineEdit,
-    QFileDialog, QMessageBox, QHeaderView, QCheckBox, QDoubleSpinBox
+    QFileDialog, QMessageBox, QHeaderView, QCheckBox, QDoubleSpinBox,
+    QListWidget, QListWidgetItem, QListView, QTreeView
 )
 from PyQt5.QtCore import Qt
 from pathlib import Path
@@ -152,6 +154,7 @@ class FileSelectionWindow(StepWindowBase):
         self.file_manager = file_manager
         self.root_dir = Path(params.P.data_dir)
         self.last_data_dir = Path(params.P.data_dir)
+        self._manual_input_dirs: list[Path] = []
 
         # Night classification state
         self._night_records: list = []       # records with night_id
@@ -196,6 +199,30 @@ class FileSelectionWindow(StepWindowBase):
         btn_browse.clicked.connect(self.browse_directory)
         root_row.addWidget(btn_browse)
         dir_layout.addLayout(root_row)
+
+        pick_row = QHBoxLayout()
+        btn_add_inputs = QPushButton("입력 폴더 추가...")
+        btn_add_inputs.clicked.connect(self.add_input_directories)
+        pick_row.addWidget(btn_add_inputs)
+
+        btn_remove_input = QPushButton("선택 제거")
+        btn_remove_input.clicked.connect(self.remove_selected_input_directory)
+        pick_row.addWidget(btn_remove_input)
+
+        btn_clear_inputs = QPushButton("입력 초기화")
+        btn_clear_inputs.clicked.connect(self.clear_input_directories)
+        pick_row.addWidget(btn_clear_inputs)
+        pick_row.addStretch()
+        dir_layout.addLayout(pick_row)
+
+        self.input_dir_list = QListWidget()
+        self.input_dir_list.setMaximumHeight(90)
+        self.input_dir_list.setSelectionMode(QListWidget.SingleSelection)
+        dir_layout.addWidget(self.input_dir_list)
+
+        self.input_dir_info = QLabel("입력 폴더: 루트 폴더 단일 사용")
+        self.input_dir_info.setStyleSheet("QLabel { color: #555; }")
+        dir_layout.addWidget(self.input_dir_info)
 
         # Options row: checkbox + gap spinbox + rescan + file count
         options_row = QHBoxLayout()
@@ -356,7 +383,85 @@ class FileSelectionWindow(StepWindowBase):
             self.file_manager.filenames = []
             self.file_manager.df_headers = None
             self.file_manager.ref_filename = None
+            self._manual_input_dirs = []
             self.file_manager.clear_multi_night_dirs()
+            self._sync_input_dir_widgets()
+
+    def _pick_multiple_directories(self, start_dir: Path) -> list[Path]:
+        dialog = QFileDialog(self, "입력 폴더 선택", str(start_dir))
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        for view in dialog.findChildren((QListView, QTreeView)):
+            view.setSelectionMode(view.ExtendedSelection)
+        if dialog.exec_() != QFileDialog.Accepted:
+            return []
+        return [Path(p) for p in dialog.selectedFiles() if p]
+
+    def _sync_input_dir_widgets(self):
+        self.input_dir_list.clear()
+        for path in self._manual_input_dirs:
+            self.input_dir_list.addItem(QListWidgetItem(str(path)))
+        if self._manual_input_dirs:
+            self.input_dir_info.setText(
+                f"입력 폴더: {len(self._manual_input_dirs)}개 직접 선택 "
+                f"(하위폴더 포함보다 우선)"
+            )
+        else:
+            self.input_dir_info.setText("입력 폴더: 루트 폴더 단일 사용")
+
+    def _apply_manual_input_dirs(self):
+        if not self._manual_input_dirs:
+            self.file_manager.clear_multi_night_dirs()
+            self._sync_input_dir_widgets()
+            self._update_result_workspace()
+        else:
+            common_root = Path(os.path.commonpath([str(p) for p in self._manual_input_dirs]))
+            self.root_dir = common_root
+            self.dir_edit.setText(str(self.root_dir))
+            self._set_data_dir(self.root_dir)
+            self.file_manager.set_multi_night_dirs(self.root_dir, self._manual_input_dirs)
+            self._sync_input_dir_widgets()
+            self._update_result_workspace()
+        try:
+            self.save_state()
+            self.update_navigation_buttons()
+        except Exception:
+            pass
+
+    def add_input_directories(self):
+        picked = self._pick_multiple_directories(self.root_dir)
+        if not picked:
+            return
+        existing = {str(p.resolve()) for p in self._manual_input_dirs}
+        added = False
+        for path in picked:
+            try:
+                key = str(path.resolve())
+            except Exception:
+                key = str(path)
+            if key in existing:
+                continue
+            self._manual_input_dirs.append(Path(path))
+            existing.add(key)
+            added = True
+        if not added:
+            return
+        self._manual_input_dirs = sorted(self._manual_input_dirs, key=lambda p: str(p))
+        self._apply_manual_input_dirs()
+
+    def remove_selected_input_directory(self):
+        row = self.input_dir_list.currentRow()
+        if row < 0 or row >= len(self._manual_input_dirs):
+            return
+        self._manual_input_dirs.pop(row)
+        self._apply_manual_input_dirs()
+
+    def clear_input_directories(self):
+        self._manual_input_dirs = []
+        self.file_manager.clear_multi_night_dirs()
+        self._sync_input_dir_widgets()
+        self._update_result_workspace()
 
     def rescan_files(self):
         """Rescan files then re-classify nights by JD gap."""
@@ -371,7 +476,9 @@ class FileSelectionWindow(StepWindowBase):
         self._persist_param_file(io_updates={"night_gap_hours": gap})
 
         try:
-            if self.include_subfolders_check.isChecked():
+            if self._manual_input_dirs:
+                self.file_manager.set_multi_night_dirs(self.root_dir, self._manual_input_dirs)
+            elif self.include_subfolders_check.isChecked():
                 self._setup_subdirectory_scan()
             else:
                 self.file_manager.clear_multi_night_dirs()
@@ -762,6 +869,7 @@ class FileSelectionWindow(StepWindowBase):
             "include_subfolders": bool(self.include_subfolders_check.isChecked()),
             "multi_night": bool(self.file_manager.selected_dirs),
             "night_dirs": [str(p) for p in self.file_manager.selected_dirs],
+            "manual_input_dirs": [str(p) for p in self._manual_input_dirs],
             "filename_prefix": self.params.P.filename_prefix,
             "file_count": len(self.file_manager.filenames),
             "reference_frame": self.file_manager.ref_filename,
@@ -848,8 +956,18 @@ class FileSelectionWindow(StepWindowBase):
                 self.params.P.file_path_map = {str(k): str(v) for k, v in file_path_map.items() if v}
                 self.file_manager.path_map = {str(k): Path(v) for k, v in file_path_map.items() if v}
 
+            manual_input_dirs = [Path(p) for p in state_data.get("manual_input_dirs", []) if p]
+            self._manual_input_dirs = manual_input_dirs
+            self._sync_input_dir_widgets()
+
             night_dirs = [Path(p) for p in state_data.get("night_dirs", []) if p]
-            if bool(state_data.get("multi_night")) and night_dirs:
+            if self._manual_input_dirs:
+                root_path = Path(state_data.get("root_dir") or state_data.get("data_dir") or self.params.P.data_dir)
+                self.root_dir = root_path
+                self.dir_edit.setText(str(self.root_dir))
+                self.file_manager.set_multi_night_dirs(root_path, self._manual_input_dirs)
+                self._update_result_workspace()
+            elif bool(state_data.get("multi_night")) and night_dirs:
                 root_path = Path(state_data.get("root_dir") or state_data.get("data_dir") or self.params.P.data_dir)
                 self.file_manager.set_multi_night_dirs(root_path, night_dirs)
             else:
