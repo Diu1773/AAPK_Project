@@ -131,7 +131,11 @@ def infer_run_parent_dir(root_dir: Path, input_dirs: list[Path] | None = None) -
     if dirs:
         if len(dirs) == 1:
             return dirs[0].parent
-        return Path(os.path.commonpath([str(p) for p in dirs]))
+        try:
+            return Path(os.path.commonpath([str(p) for p in dirs]))
+        except ValueError:
+            # Mixed-drive Windows inputs have no commonpath; fall back to the first input parent.
+            return dirs[0].parent
 
     if _date_tokens_from_name(root_dir.name):
         return root_dir.parent
@@ -183,7 +187,10 @@ def build_merged_workspace_dir(result_dirs: list[Path]) -> Path:
     dirs = [Path(p) for p in result_dirs if p]
     if not dirs:
         return Path("MERGED_workspace")
-    parent = Path(os.path.commonpath([str(p.parent) for p in dirs]))
+    try:
+        parent = Path(os.path.commonpath([str(p.parent) for p in dirs]))
+    except ValueError:
+        parent = dirs[0].parent
     label = infer_result_workspace_label(dirs)
     start_date, end_date = infer_result_workspace_date_range(dirs)
     if start_date and end_date:

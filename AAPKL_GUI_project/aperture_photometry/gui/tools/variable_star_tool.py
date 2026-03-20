@@ -24,6 +24,7 @@ import pandas as pd
 from scipy.optimize import curve_fit
 
 _CORR_MODE_RE = re.compile(r"lightcurve_.*?_(global|color|offset|raw)\b", re.IGNORECASE)
+_TARGET_ID_RE = re.compile(r"lightcurve_(?:combined_)?ID(\d+)_", re.IGNORECASE)
 _CORR_MODE_LABELS = {
     "global": "Global ensemble",
     "color": "Color-dependent",
@@ -43,6 +44,23 @@ def _detect_corr_mode_from_df(df: pd.DataFrame, filename: str) -> str:
     if m:
         return _CORR_MODE_LABELS.get(m.group(1).lower(), m.group(1))
     return ""
+
+
+def _detect_target_id_from_df(df: pd.DataFrame, filename: str) -> int | None:
+    m = _TARGET_ID_RE.search(filename)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    for col in ("target_id", "star_id", "ID"):
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").dropna().astype(int)
+        uniq = sorted(set(vals.tolist()))
+        if len(uniq) == 1:
+            return int(uniq[0])
+    return None
 
 
 def _collect_mag_options(df: pd.DataFrame, time_mask: np.ndarray, corr_tag: str = "") -> list[tuple[str, str, np.ndarray]]:
@@ -750,11 +768,29 @@ class VariableStarToolWindow(QWidget):
             rd = self._current_workspace_dir()
             paths = list_lightcurve_csvs(rd)
             if not paths:
-                self.lc_status.setText(f"No lightcurve_*.csv found in\n{rd}")
+                self._clear_loaded_workspace_state(f"No lightcurve_*.csv found in\n{rd}")
                 return
             self._load_paths(paths)
         except Exception as e:
-            self.lc_status.setText(f"Workspace load failed: {e}")
+            self._clear_loaded_workspace_state(f"Workspace load failed: {e}")
+
+    def _clear_loaded_workspace_state(self, status: str):
+        self.lc_data = None
+        self.series_options = {}
+        self.scan_result = None
+        self.refined_period = None
+        self.sigma_period = None
+        self.mag_col_combo.blockSignals(True)
+        self.mag_col_combo.clear()
+        self.mag_col_combo.setEnabled(False)
+        self.mag_col_combo.blockSignals(False)
+        self.analysis_filter_combo.blockSignals(True)
+        self.analysis_filter_combo.clear()
+        self.analysis_filter_combo.addItem("All", "__all__")
+        self.analysis_filter_combo.setEnabled(False)
+        self.analysis_filter_combo.blockSignals(False)
+        self.lc_status.setText(status)
+        self.lc_status.setStyleSheet("color: #C62828;")
 
     def _load_paths(self, paths: list[Path]):
         try:
@@ -794,13 +830,12 @@ class VariableStarToolWindow(QWidget):
                 )
                 filters = df[filter_col].astype(str).to_numpy()[time_mask] if filter_col else None
                 corr_tag = _detect_corr_mode_from_df(df, path.name)
+                target_id = _detect_target_id_from_df(df, path.name)
 
                 for label, col, arr in _collect_mag_options(df, time_mask, corr_tag=corr_tag):
                     key = f"{path.name}::{col}"
-                    series_label = _describe_series(corr_tag, col)
                     series_items.append({
                         "key": key,
-                        "combo_label": series_label,
                         "time": t,
                         "mag": arr,
                         "mag_col": col,
@@ -808,12 +843,21 @@ class VariableStarToolWindow(QWidget):
                         "filters": filters,
                         "source": path.name,
                         "corr_tag": corr_tag,
-                        "series_label": series_label,
+                        "series_label": _describe_series(corr_tag, col),
+                        "target_id": target_id,
                     })
 
             if not series_items:
-                self.lc_status.setText("No usable light curve series found")
+                self._clear_loaded_workspace_state("No usable light curve series found")
                 return
+
+            multi_target = len({item["target_id"] for item in series_items if item.get("target_id") is not None}) > 1
+            for item in series_items:
+                if multi_target:
+                    tid = item.get("target_id")
+                    item["combo_label"] = f"ID{tid} | {item['series_label']}" if tid is not None else f"{item['source']} | {item['series_label']}"
+                else:
+                    item["combo_label"] = item["series_label"]
 
             unique_series: dict[str, dict] = {}
             for item in series_items:
@@ -854,7 +898,7 @@ class VariableStarToolWindow(QWidget):
             self.mag_col_combo.blockSignals(False)
             self._apply_series_option(self.mag_col_combo.currentData())
         except Exception as e:
-            self.lc_status.setText(f"Error: {e}")
+            self._clear_loaded_workspace_state(f"Error: {e}")
             self.log(f"[ERROR] {e}")
 
     def _apply_series_option(self, key: str | None):

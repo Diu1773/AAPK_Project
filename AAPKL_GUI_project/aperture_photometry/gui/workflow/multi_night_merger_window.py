@@ -757,7 +757,8 @@ class MultiNightMergerWindow(QMainWindow):
             self.output_dir_edit.setText(str(new_default))
 
     def _on_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "result 폴더 선택", str(self.folders[0].parent))
+        start_dir = self.folders[0].parent if self.folders else Path(self.params.P.result_dir).parent
+        folder = QFileDialog.getExistingDirectory(self, "result 폴더 선택", str(start_dir))
         if not folder:
             return
         p = Path(folder)
@@ -826,6 +827,8 @@ class MultiNightMergerWindow(QMainWindow):
                 item = QTableWidgetItem("OK" if ok else "없음")
                 item.setForeground(QColor("#2E7D32") if ok else QColor("#C62828"))
                 self.folder_info_table.setItem(row, col_idx, item)
+            filters = list(row_info.get("filters") or [])
+            merge_ready = bool(row_info.get("merge_ready"))
             self.folder_info_table.setItem(row, 8, QTableWidgetItem(", ".join(filters) if filters else "—"))
             status_item = QTableWidgetItem("사용 가능" if merge_ready else "입력 부족")
             status_item.setForeground(QColor("#2E7D32") if merge_ready else QColor("#C62828"))
@@ -1147,17 +1150,16 @@ class MultiNightMergerWindow(QMainWindow):
 
     # ───────────────────────── child workflow launch ─────────────────────────
 
-    def _attach_runtime_log(self, window, append_fn):
+    def _attach_runtime_log(self, window, append_fn, *, forward_original: bool = False):
         if getattr(window, "_merger_log_attached", False):
             return
         original_log = getattr(window, "log", None)
 
         def _wrapped_log(msg, *args, **kwargs):
-            if callable(original_log):
+            if forward_original and callable(original_log):
                 original_log(msg, *args, **kwargs)
             text = str(msg)
             append_fn(text)
-            QApplication.processEvents()
 
         window.log = _wrapped_log
         window._merger_log_attached = True
@@ -1179,10 +1181,12 @@ class MultiNightMergerWindow(QMainWindow):
             self.merged_runtime_file_manager,
             self.merged_runtime_project_state,
             self,
+            runtime_mode=True,
         )
+        window._auto_load_ids()
         window.show_log_window = lambda: None
         window.plot_current_comparison = lambda *args, **kwargs: None
-        self._attach_runtime_log(window, self._step10_log_append)
+        self._attach_runtime_log(window, self._step10_log_append, forward_original=False)
         self.step10_runtime_window = window
         return window
 
@@ -1195,11 +1199,12 @@ class MultiNightMergerWindow(QMainWindow):
             self.merged_runtime_file_manager,
             self.merged_runtime_project_state,
             self,
+            runtime_mode=True,
         )
+        window._auto_load_ids()
         window._update_results_table = lambda *args, **kwargs: None
-        window._update_plots = lambda *args, **kwargs: None
-        window._update_analysis_panel = lambda *args, **kwargs: None
-        self._attach_runtime_log(window, self._step11_log_append)
+        self._attach_runtime_log(window, self._step11_log_append, forward_original=False)
+        window.load_raw_data(silent=True)
         self.step11_runtime_window = window
         return window
 
@@ -1236,6 +1241,7 @@ class MultiNightMergerWindow(QMainWindow):
         try:
             window = self._get_or_create_step11_runtime_window()
             mode = str(self.step11_mode_combo.currentData() or "offset")
+            window.mode = mode
             if mode == "global":
                 window.mode_global.setChecked(True)
             elif mode == "color":

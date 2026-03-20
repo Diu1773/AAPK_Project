@@ -24,6 +24,7 @@ import pandas as pd
 from scipy.optimize import curve_fit
 
 _CORR_MODE_RE = re.compile(r"lightcurve_.*?_(global|color|offset|raw)\b", re.IGNORECASE)
+_TARGET_ID_RE = re.compile(r"lightcurve_(?:combined_)?ID(\d+)_", re.IGNORECASE)
 _CORR_MODE_LABELS = {
     "global": "Global ensemble",
     "color": "Color-dependent",
@@ -43,6 +44,23 @@ def _detect_corr_mode_from_df(df: pd.DataFrame, filename: str) -> str:
     if m:
         return _CORR_MODE_LABELS.get(m.group(1).lower(), m.group(1))
     return ""
+
+
+def _detect_target_id_from_df(df: pd.DataFrame, filename: str) -> int | None:
+    m = _TARGET_ID_RE.search(filename)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    for col in ("target_id", "star_id", "ID"):
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").dropna().astype(int)
+        uniq = sorted(set(vals.tolist()))
+        if len(uniq) == 1:
+            return int(uniq[0])
+    return None
 
 
 def _collect_mag_options(df: pd.DataFrame, time_mask: np.ndarray, corr_tag: str = "") -> list[tuple[str, str, np.ndarray]]:
@@ -235,6 +253,10 @@ class EclipsingBinaryToolWindow(QWidget):
         self.mag_col_combo.setEnabled(False)
         self.mag_col_combo.currentIndexChanged.connect(self._on_mag_col_changed)
         lc_form.addRow("Use data:", self.mag_col_combo)
+        self.analysis_filter_combo = QComboBox()
+        self.analysis_filter_combo.setEnabled(False)
+        self.analysis_filter_combo.currentIndexChanged.connect(self._on_analysis_filter_changed)
+        lc_form.addRow("Filter:", self.analysis_filter_combo)
         ll.addWidget(lc_group)
 
         # Filter display controls
@@ -469,11 +491,27 @@ class EclipsingBinaryToolWindow(QWidget):
             rd = self._current_workspace_dir()
             paths = list_lightcurve_csvs(rd)
             if not paths:
-                self.lc_status.setText(f"No lightcurve_*.csv found in\n{rd}")
+                self._clear_loaded_workspace_state(f"No lightcurve_*.csv found in\n{rd}")
                 return
             self._load_paths(paths)
         except Exception as e:
-            self.lc_status.setText(f"Workspace load failed: {e}")
+            self._clear_loaded_workspace_state(f"Workspace load failed: {e}")
+
+    def _clear_loaded_workspace_state(self, status: str):
+        self.lc_data = None
+        self.series_options = {}
+        self.scan_result = None
+        self.mag_col_combo.blockSignals(True)
+        self.mag_col_combo.clear()
+        self.mag_col_combo.setEnabled(False)
+        self.mag_col_combo.blockSignals(False)
+        self.analysis_filter_combo.blockSignals(True)
+        self.analysis_filter_combo.clear()
+        self.analysis_filter_combo.addItem("All", "__all__")
+        self.analysis_filter_combo.setEnabled(False)
+        self.analysis_filter_combo.blockSignals(False)
+        self.lc_status.setText(status)
+        self.lc_status.setStyleSheet("color: #C62828;")
 
     def _load_paths(self, paths: list[Path]):
         try:
@@ -508,12 +546,11 @@ class EclipsingBinaryToolWindow(QWidget):
                 )
                 filters = df[filter_col].astype(str).to_numpy()[time_mask] if filter_col else None
                 corr_tag = _detect_corr_mode_from_df(df, path.name)
+                target_id = _detect_target_id_from_df(df, path.name)
                 for label, col, arr in _collect_mag_options(df, time_mask, corr_tag=corr_tag):
                     key = f"{path.name}::{col}"
-                    series_label = _describe_series(corr_tag, col)
                     series_items.append({
                         "key": key,
-                        "combo_label": series_label,
                         "time": t,
                         "mag": arr,
                         "mag_col": col,
@@ -521,12 +558,21 @@ class EclipsingBinaryToolWindow(QWidget):
                         "filters": filters,
                         "source": path.name,
                         "corr_tag": corr_tag,
-                        "series_label": series_label,
+                        "series_label": _describe_series(corr_tag, col),
+                        "target_id": target_id,
                     })
 
             if not series_items:
-                self.lc_status.setText("No usable light curve series found")
+                self._clear_loaded_workspace_state("No usable light curve series found")
                 return
+
+            multi_target = len({item["target_id"] for item in series_items if item.get("target_id") is not None}) > 1
+            for item in series_items:
+                if multi_target:
+                    tid = item.get("target_id")
+                    item["combo_label"] = f"ID{tid} | {item['series_label']}" if tid is not None else f"{item['source']} | {item['series_label']}"
+                else:
+                    item["combo_label"] = item["series_label"]
 
             unique_series: dict[str, dict] = {}
             for item in series_items:
@@ -567,21 +613,33 @@ class EclipsingBinaryToolWindow(QWidget):
             self.mag_col_combo.blockSignals(False)
             self._apply_series_option(self.mag_col_combo.currentData())
         except Exception as e:
-            self.lc_status.setText(f"Error: {e}")
+            self._clear_loaded_workspace_state(f"Error: {e}")
             self.log(f"[ERROR] {e}")
 
     def _apply_series_option(self, key: str | None):
         if not key or key not in self.series_options:
             return
         item = self.series_options[key]
+        selected_filter = self._refresh_analysis_filter_combo(item.get("filters"))
+        t = item["time"]
+        mag = item["mag"]
+        mag_err = item.get("mag_err")
+        filters = item.get("filters")
+        if selected_filter and selected_filter != "__all__" and filters is not None:
+            mask = (filters == selected_filter)
+            t = t[mask]
+            mag = mag[mask]
+            mag_err = mag_err[mask] if mag_err is not None else None
+            filters = filters[mask]
         self.lc_data = {
-            "time": item["time"],
-            "mag": item["mag"],
+            "time": t,
+            "mag": mag,
             "mag_col": item["mag_col"],
-            "mag_err": item.get("mag_err"),
-            "filters": item.get("filters"),
+            "mag_err": mag_err,
+            "filters": filters,
             "source": item["source"],
             "corr_tag": item.get("corr_tag", ""),
+            "analysis_filter": selected_filter,
             "series_label": item.get("series_label", item["mag_col"]),
         }
         n = int(np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag"])))
@@ -601,8 +659,8 @@ class EclipsingBinaryToolWindow(QWidget):
             f"{workspace_name}{workspace_type}\n{self.lc_data['source']}\n{n} pts{corr_line}\n{self.mag_col_combo.currentText()}"
         )
         self.lc_status.setStyleSheet("color: green;")
-        filters = self.lc_data.get("filters")
-        filt_info = f" [{'/' .join(sorted(set(filters)))}]" if filters is not None and len(filters) else ""
+        filt_label = self.lc_data.get("analysis_filter", "__all__")
+        filt_info = f", filter={filt_label}" if filt_label and filt_label != "__all__" else ""
         self.log(
             f"Loaded: {self.lc_data['source']} ({n} pts, {self.lc_data.get('series_label', self.lc_data['mag_col'])}{filt_info}, "
             f"detrend={self.lc_data.get('corr_tag') or 'N/A'})"
@@ -612,6 +670,33 @@ class EclipsingBinaryToolWindow(QWidget):
         self.oc_t0.setValue(t0)
 
     def _on_mag_col_changed(self):
+        key = self.mag_col_combo.currentData()
+        if not key:
+            return
+        self._apply_series_option(key)
+        self._update_phase_plot()
+
+    def _refresh_analysis_filter_combo(self, filters) -> str:
+        current = self.analysis_filter_combo.currentData()
+        filter_values = filters.tolist() if filters is not None else []
+        unique_filters = sorted({str(f) for f in filter_values if str(f).strip() and str(f).lower() != "nan"})
+        self.analysis_filter_combo.blockSignals(True)
+        self.analysis_filter_combo.clear()
+        if unique_filters:
+            for f in unique_filters:
+                self.analysis_filter_combo.addItem(f, f)
+            self.analysis_filter_combo.addItem("All", "__all__")
+            target = current if current in unique_filters or current == "__all__" else unique_filters[0]
+        else:
+            self.analysis_filter_combo.addItem("All", "__all__")
+            target = "__all__"
+        idx = max(self.analysis_filter_combo.findData(target), 0)
+        self.analysis_filter_combo.setCurrentIndex(idx)
+        self.analysis_filter_combo.setEnabled(self.analysis_filter_combo.count() > 0)
+        self.analysis_filter_combo.blockSignals(False)
+        return self.analysis_filter_combo.currentData()
+
+    def _on_analysis_filter_changed(self):
         key = self.mag_col_combo.currentData()
         if not key:
             return

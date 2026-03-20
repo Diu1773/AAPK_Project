@@ -1018,8 +1018,9 @@ FILTER_COLORS = {
 class LightCurveBuilderWindow(StepWindowBase):
     """Step 10: Light curve builder (diff/abs)."""
 
-    def __init__(self, params, file_manager, project_state, main_window):
+    def __init__(self, params, file_manager, project_state, main_window, runtime_mode: bool = False):
         self.file_manager = file_manager
+        self.runtime_mode = bool(runtime_mode)
         self.datasets = []  # will be set to single entry in setup
         self.dataset_panel_expanded = False
         self.comp_ids_list = []
@@ -1098,9 +1099,35 @@ class LightCurveBuilderWindow(StepWindowBase):
             main_window=main_window,
         )
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setup_step_ui()
-        self.restore_state()
-        self._auto_load_ids()
+        if self.runtime_mode:
+            self._setup_runtime_ui()
+        else:
+            self.setup_step_ui()
+            self.restore_state()
+            self._auto_load_ids()
+
+    def _setup_runtime_ui(self):
+        """Build a lightweight runtime-only UI for merger inline execution."""
+        note = QLabel("Runtime mode: merger inline Step10 execution")
+        note.setStyleSheet("QLabel { color: #607D8B; font-size: 9pt; }")
+        self.content_layout.addWidget(note)
+
+        self.target_edit = QLineEdit()
+        self.comp_edit = QLineEdit()
+        self.id_info_label = QLabel("Target / Comp: (runtime)")
+        self.id_info_label.setWordWrap(True)
+        self.plot_info_label = QLabel("Comparison: (none)")
+        self.lbl_comp_count = QLabel("Active comps: 0")
+
+        rd = Path(self.params.P.result_dir)
+        self.datasets = [(rd.name, rd)]
+
+        self.log_window = QWidget(self, Qt.Window)
+        self.log_window.setWindowTitle("Light Curve Log")
+        log_layout = QVBoxLayout(self.log_window)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
 
     def setup_step_ui(self):
         info = QLabel(

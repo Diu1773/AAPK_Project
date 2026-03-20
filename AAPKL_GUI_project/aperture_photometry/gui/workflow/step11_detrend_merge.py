@@ -218,8 +218,9 @@ def _load_step9_selection_ids(result_dir: Path) -> tuple[int | None, list[int]]:
 class DetrendNightMergeWindow(StepWindowBase):
     """Step 11: Nightly detrend + merge"""
 
-    def __init__(self, params, file_manager, project_state, main_window):
+    def __init__(self, params, file_manager, project_state, main_window, runtime_mode: bool = False):
         self.file_manager = file_manager
+        self.runtime_mode = bool(runtime_mode)
         self.datasets: list[tuple[str, Path]] = []
         self.raw_df = pd.DataFrame()
         self.corrected_df = pd.DataFrame()
@@ -269,10 +270,117 @@ class DetrendNightMergeWindow(StepWindowBase):
             project_state=project_state,
             main_window=main_window,
         )
-        self.setup_step_ui()
-        self.restore_state()
-        self._auto_load_ids()
-        self.load_raw_data(silent=True)
+        if self.runtime_mode:
+            self._setup_runtime_ui()
+        else:
+            self.setup_step_ui()
+            self.restore_state()
+            self._auto_load_ids()
+            self.load_raw_data(silent=True)
+
+    def _setup_runtime_ui(self):
+        """Build a lightweight runtime-only UI for merger inline execution."""
+        note = QLabel("Runtime mode: merger inline Step11 execution")
+        note.setStyleSheet("QLabel { color: #607D8B; font-size: 9pt; }")
+        self.content_layout.addWidget(note)
+
+        rd = Path(self.params.P.result_dir)
+        self.datasets = [(rd.name, rd)]
+
+        self.target_edit = QLineEdit()
+        self.id_info_label = QLabel("Target / Comp: (runtime)")
+        self.id_info_label.setWordWrap(True)
+        self.date_list = QListWidget()
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("All")
+        self.color_by_combo = QComboBox()
+        self.color_by_combo.addItems(["Date", "Filter"])
+        self.analysis_text = QLabel("Runtime analysis")
+        self.analysis_text.setWordWrap(True)
+        self.recommendation_label = QLabel("")
+        self.recommendation_label.setWordWrap(True)
+        self.color_status_label = QLabel("")
+        self.color_map_group = QGroupBox("Color Index")
+        self.left_tabs = QTabWidget()
+
+        self.mode_offset = QRadioButton("Offset")
+        self.mode_color = QRadioButton("Color")
+        self.mode_global = QRadioButton("Global")
+        self.mode_offset.setChecked(True)
+        self.chk_global_k2 = QCheckBox("Global k''")
+        self.chk_global_k2.setChecked(True)
+
+        self.phase_mode_combo = QComboBox()
+        self.phase_mode_combo.addItems(["Time (JD)", "Phase"])
+        self.spin_period = QDoubleSpinBox()
+        self.spin_period.setDecimals(6)
+        self.spin_period.setRange(0.0, 1000.0)
+        self.spin_t0 = QDoubleSpinBox()
+        self.spin_t0.setDecimals(6)
+        self.spin_t0.setRange(0.0, 3000000.0)
+        self.spin_cycles = QDoubleSpinBox()
+        self.spin_cycles.setDecimals(2)
+        self.spin_cycles.setRange(1.0, 5.0)
+        self.spin_cycles.setValue(self.phase_cycles)
+
+        self.chk_clip = QCheckBox()
+        self.chk_clip.setChecked(self.sigma_clip)
+        self.spin_clip = QDoubleSpinBox()
+        self.spin_clip.setDecimals(1)
+        self.spin_clip.setRange(1.0, 10.0)
+        self.spin_clip.setValue(self.clip_sigma)
+        self.spin_iters = QSpinBox()
+        self.spin_iters.setRange(1, 5)
+        self.spin_iters.setValue(self.clip_iters)
+
+        self.spin_global_min_comps = QSpinBox()
+        self.spin_global_min_comps.setRange(1, 50)
+        self.spin_global_min_comps.setValue(self.global_min_comps)
+        self.spin_global_sigma = QDoubleSpinBox()
+        self.spin_global_sigma.setRange(1.0, 10.0)
+        self.spin_global_sigma.setDecimals(1)
+        self.spin_global_sigma.setValue(self.global_sigma)
+        self.spin_global_iters = QSpinBox()
+        self.spin_global_iters.setRange(1, 5)
+        self.spin_global_iters.setValue(self.global_iters)
+        self.spin_global_rms_pct = QDoubleSpinBox()
+        self.spin_global_rms_pct.setRange(0.0, 80.0)
+        self.spin_global_rms_pct.setDecimals(1)
+        self.spin_global_rms_pct.setValue(self.global_rms_pct)
+        self.spin_global_rms_thr = QDoubleSpinBox()
+        self.spin_global_rms_thr.setRange(0.0, 1.0)
+        self.spin_global_rms_thr.setDecimals(4)
+        self.spin_global_rms_thr.setValue(self.global_rms_threshold)
+        self.spin_global_frame_sigma = QDoubleSpinBox()
+        self.spin_global_frame_sigma.setRange(1.0, 10.0)
+        self.spin_global_frame_sigma.setDecimals(1)
+        self.spin_global_frame_sigma.setValue(self.global_frame_sigma)
+        self.combo_global_gauge = QComboBox()
+        self.combo_global_gauge.addItems(["meanZ0", "ref"])
+        self.combo_global_gauge.setCurrentText(self.global_gauge)
+        self.chk_global_robust = QCheckBox("Robust (MAD)")
+        self.chk_global_robust.setChecked(self.global_robust)
+        self.chk_global_interp = QCheckBox("Z_t 보간")
+        self.chk_global_interp.setChecked(self.global_interp_missing)
+        self.chk_global_normalize = QCheckBox("Target 중앙값 0")
+        self.chk_global_normalize.setChecked(self.global_normalize)
+        self.chk_global_rescale_err = QCheckBox("Chi²_red 오차 보정")
+        self.chk_global_rescale_err.setChecked(self.global_rescale_errors)
+
+        self.btn_apply = QPushButton("Fit && Apply")
+        self.btn_revert = QPushButton("Revert")
+        self.busy_status_label = QLabel("")
+        self.busy_progress_bar = QProgressBar()
+        self.busy_progress_bar.setRange(0, 0)
+        self.busy_progress_bar.hide()
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+
+        self.plot_canvas = FigureCanvas(Figure(figsize=(9, 7)))
+        self.ax_raw = self.plot_canvas.figure.add_subplot(311)
+        self.ax_corr = self.plot_canvas.figure.add_subplot(312)
+        self.ax_diag = self.plot_canvas.figure.add_subplot(313)
 
     def setup_step_ui(self):
         # Main horizontal splitter

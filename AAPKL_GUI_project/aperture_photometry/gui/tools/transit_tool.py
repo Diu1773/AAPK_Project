@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 _CORR_MODE_RE = re.compile(r"lightcurve_.*?_(global|color|offset|raw)\b", re.IGNORECASE)
+_TARGET_ID_RE = re.compile(r"lightcurve_(?:combined_)?ID(\d+)_", re.IGNORECASE)
 _CORR_MODE_LABELS = {
     "global": "Global ensemble",
     "color": "Color-dependent",
@@ -42,6 +43,78 @@ def _detect_corr_mode_from_df(df: pd.DataFrame, filename: str) -> str:
     if m:
         return _CORR_MODE_LABELS.get(m.group(1).lower(), m.group(1))
     return ""
+
+
+def _detect_target_id_from_df(df: pd.DataFrame, filename: str) -> int | None:
+    m = _TARGET_ID_RE.search(filename)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    for col in ("target_id", "star_id", "ID"):
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").dropna().astype(int)
+        uniq = sorted(set(vals.tolist()))
+        if len(uniq) == 1:
+            return int(uniq[0])
+    return None
+
+
+def _collect_mag_options(df: pd.DataFrame, time_mask: np.ndarray, corr_tag: str = "") -> list[tuple[str, str, np.ndarray]]:
+    options: list[tuple[str, str, np.ndarray]] = []
+
+    if corr_tag == "Raw":
+        for col in ("diff_mag_raw", "diff_mag"):
+            if col in df.columns:
+                arr = pd.to_numeric(df[col], errors="coerce").to_numpy(float)[time_mask]
+                if np.any(np.isfinite(arr)):
+                    return [(f"Raw: {col}", col, arr)]
+
+    if "diff_mag_raw" in df.columns or "diff_mag_corr" in df.columns:
+        for col, label in (("diff_mag_raw", "raw"), ("diff_mag_corr", "corrected")):
+            if col in df.columns:
+                arr = pd.to_numeric(df[col], errors="coerce").to_numpy(float)[time_mask]
+                if np.any(np.isfinite(arr)):
+                    options.append((label, col, arr))
+        if options:
+            return options
+
+    fallback_raw = ["mag_raw", "raw_mag", "inst_mag", "mag"]
+    fallback_corr = ["mag_corr", "corr_mag", "calibrated_mag", "mag_ensemble_corr"]
+    for col in fallback_raw:
+        if col in df.columns:
+            arr = pd.to_numeric(df[col], errors="coerce").to_numpy(float)[time_mask]
+            if np.any(np.isfinite(arr)):
+                options.append((f"Raw: {col}", col, arr))
+    for col in fallback_corr:
+        if col in df.columns:
+            arr = pd.to_numeric(df[col], errors="coerce").to_numpy(float)[time_mask]
+            if np.any(np.isfinite(arr)):
+                options.append((f"Corr: {col}", col, arr))
+    return options
+
+
+def _source_priority(source_name: str) -> tuple[int, int, str]:
+    lower = source_name.lower()
+    is_combined = 1 if "_combined_" in lower else 0
+    is_current = 0 if "_current" in lower else 1
+    return is_combined, is_current, lower
+
+
+def _describe_series(corr_tag: str, mag_col: str) -> str:
+    if corr_tag == "Raw":
+        return "Raw"
+    if corr_tag == "Nightly offset":
+        return "Offset | corrected" if mag_col == "diff_mag_corr" else "Offset | raw"
+    if corr_tag == "Color-dependent":
+        return "Color | corrected" if mag_col == "diff_mag_corr" else "Color | raw"
+    if corr_tag == "Global ensemble":
+        return "Global | corrected" if mag_col == "diff_mag_corr" else "Global | raw"
+    if "corr" in mag_col or "cal" in mag_col:
+        return "Corrected"
+    return "Raw"
 
 
 def _resolve_check_filter(filters) -> str | None:
@@ -402,6 +475,7 @@ class TransitToolWindow(QWidget):
         self.params = params
         self.project_state = project_state
         self.lc_data: Optional[dict] = None
+        self.series_options: dict[str, dict] = {}
         self.prior_params: dict = {
             "t0": 2458000.0, "per": 1.0, "rp": 0.1, "a": 10.0,
             "inc": 88.0, "ecc": 0.0, "w": 90.0, "u1": 0.3, "u2": 0.1,
@@ -510,6 +584,14 @@ class TransitToolWindow(QWidget):
         ws_layout.addWidget(btn_workspace)
         ws_layout.addWidget(btn_reload)
         lc_form.addRow("Workspace:", ws_row)
+        self.data_combo = QComboBox()
+        self.data_combo.setEnabled(False)
+        self.data_combo.currentIndexChanged.connect(self._on_series_changed)
+        lc_form.addRow("Use data:", self.data_combo)
+        self.analysis_filter_combo = QComboBox()
+        self.analysis_filter_combo.setEnabled(False)
+        self.analysis_filter_combo.currentIndexChanged.connect(self._on_analysis_filter_changed)
+        lc_form.addRow("Filter:", self.analysis_filter_combo)
         # Trim
         trim_row = QHBoxLayout()
         self.trim_start = QDoubleSpinBox()
@@ -756,96 +838,210 @@ class TransitToolWindow(QWidget):
 
     def _load_lc_from_workspace(self):
         try:
-            from ...utils.step_paths import find_best_lightcurve_csv
+            from ...utils.step_paths import list_lightcurve_csvs
             rd = self._current_workspace_dir()
-            path = find_best_lightcurve_csv(rd)
-            if path is None:
-                self.lc_status.setText(f"No lightcurve_*.csv found in\n{rd}")
+            paths = list_lightcurve_csvs(rd)
+            if not paths:
+                self._clear_loaded_workspace_state(f"No lightcurve_*.csv found in\n{rd}")
                 return
-            self._load_csv(path)
+            self._load_paths(paths)
         except Exception as e:
-            self.lc_status.setText(f"Workspace load failed: {e}")
+            self._clear_loaded_workspace_state(f"Workspace load failed: {e}")
 
-    def _load_csv(self, path: Path):
+    def _clear_loaded_workspace_state(self, status: str):
+        self.lc_data = None
+        self.series_options = {}
+        self.scan_result = None
+        self.fit_result = None
+        self.data_combo.blockSignals(True)
+        self.data_combo.clear()
+        self.data_combo.setEnabled(False)
+        self.data_combo.blockSignals(False)
+        self.analysis_filter_combo.blockSignals(True)
+        self.analysis_filter_combo.clear()
+        self.analysis_filter_combo.addItem("All", "__all__")
+        self.analysis_filter_combo.setEnabled(False)
+        self.analysis_filter_combo.blockSignals(False)
+        self.lc_status.setText(status)
+        self.lc_status.setStyleSheet("color: #C62828;")
+
+    def _load_paths(self, paths: list[Path]):
         try:
-            df = pd.read_csv(path)
-            # Apply step10 frame exclusions
+            rd = self._current_workspace_dir()
             try:
                 from ...utils.qc_utils import load_frame_excludes as _lfe
-                rd = self._current_workspace_dir()
                 excl = set(_lfe(rd).keys())
+            except Exception:
+                excl = set()
+
+            series_items: list[dict] = []
+            for path in paths:
+                df = pd.read_csv(path)
                 if excl and "file" in df.columns:
-                    before = len(df)
                     df = df[~df["file"].astype(str).isin(excl)].reset_index(drop=True)
-                    if len(df) < before:
-                        self.lc_status.setText(f"Frame QC: {before - len(df)} frame(s) excluded")
-            except Exception:
-                pass
-            time_col = next(
-                (c for c in ["BJD", "bjd", "HJD", "hjd", "JD", "jd", "time"] if c in df.columns),
-                None
-            )
-            if time_col is None:
-                self.lc_status.setText("No time column found")
+                time_col = next(
+                    (c for c in ["BJD_TDB", "BJD", "bjd", "HJD", "hjd", "JD", "jd", "time"] if c in df.columns),
+                    None
+                )
+                if time_col is None:
+                    continue
+                t = pd.to_numeric(df[time_col], errors="coerce").to_numpy(float)
+                time_mask = np.isfinite(t)
+                if not np.any(time_mask):
+                    continue
+                t = t[time_mask]
+                err_col = next(
+                    (c for c in ["diff_err_corr", "diff_err", "mag_err", "err", "sigma"] if c in df.columns),
+                    None
+                )
+                e = pd.to_numeric(df[err_col], errors="coerce").to_numpy(float)[time_mask] if err_col else None
+                filter_col = next(
+                    (c for c in ["filter", "Filter", "FILTER", "band", "Band"] if c in df.columns),
+                    None
+                )
+                filters = df[filter_col].astype(str).to_numpy()[time_mask] if filter_col else None
+                corr_tag = _detect_corr_mode_from_df(df, path.name)
+                target_id = _detect_target_id_from_df(df, path.name)
+                for _, mag_col, mag_arr in _collect_mag_options(df, time_mask, corr_tag=corr_tag):
+                    key = f"{path.name}::{mag_col}"
+                    series_items.append({
+                        "key": key,
+                        "time": t,
+                        "mag": mag_arr,
+                        "mag_col": mag_col,
+                        "mag_err": e,
+                        "filters": filters,
+                        "source": path.name,
+                        "corr_tag": corr_tag,
+                        "series_label": _describe_series(corr_tag, mag_col),
+                        "target_id": target_id,
+                    })
+
+            if not series_items:
+                self._clear_loaded_workspace_state("No usable light curve series found")
                 return
-            mag_col = next(
-                (c for c in ["diff_mag_corr", "diff_mag", "mag_corr", "diff_mag_raw", "mag_raw", "mag"]
-                 if c in df.columns), None
-            )
-            if mag_col is None:
-                self.lc_status.setText("No magnitude column found")
-                return
-            err_col = next(
-                (c for c in ["diff_err", "diff_err_corr", "mag_err", "err", "sigma"] if c in df.columns),
-                None
-            )
-            t_raw = df[time_col].to_numpy(float)
-            m_raw = df[mag_col].to_numpy(float)
-            e_raw = df[err_col].to_numpy(float) if err_col else None
 
-            # Convert mag to relative flux (normalise to out-of-transit baseline)
-            mask = np.isfinite(t_raw) & np.isfinite(m_raw)
-            t_v = t_raw[mask]
-            m_v = m_raw[mask]
-            e_v = e_raw[mask] if e_raw is not None else None
+            multi_target = len({item["target_id"] for item in series_items if item.get("target_id") is not None}) > 1
+            for item in series_items:
+                if multi_target:
+                    tid = item.get("target_id")
+                    item["combo_label"] = f"ID{tid} | {item['series_label']}" if tid is not None else f"{item['source']} | {item['series_label']}"
+                else:
+                    item["combo_label"] = item["series_label"]
 
-            # Normalize: flux = 10^(-(mag - mag_median)/2.5)
-            med_mag = np.nanmedian(m_v)
-            flux = 10.0 ** (-(m_v - med_mag) / 2.5)
-            flux_err = (np.log(10) / 2.5) * flux * e_v if e_v is not None else None
+            unique_series: dict[str, dict] = {}
+            for item in series_items:
+                label = item["combo_label"]
+                prev = unique_series.get(label)
+                if prev is None or _source_priority(item["source"]) < _source_priority(prev["source"]):
+                    unique_series[label] = item
+            series_items = list(unique_series.values())
+            series_items.sort(key=lambda item: (_source_priority(item["source"]), item["combo_label"]))
+            self.series_options = {item["key"]: item for item in series_items}
 
-            self.lc_data = {
-                "time": t_v, "flux": flux, "flux_err": flux_err,
-                "mag": m_v, "mag_err": e_v, "source": path.name,
-            }
-            # Set trim defaults
-            self.trim_start.setValue(float(t_v.min()))
-            self.trim_end.setValue(float(t_v.max()))
-
-            n = len(t_v)
-            raw_corr = "corr" if any(x in mag_col for x in ["corr", "cal"]) else "raw"
-            corr_tag = _detect_corr_mode_from_df(df, path.name)
-            corr_line = f"  detrend: {corr_tag}" if corr_tag else ""
-            workspace_dir = self._current_workspace_dir()
-            workspace_name = workspace_dir.name
-            workspace_type = ""
-            try:
-                from ...utils.run_workspace import load_run_manifest
-                run_meta = load_run_manifest(workspace_dir)
-                run_type = str(run_meta.get("run_type") or "").strip().lower()
-                if run_type:
-                    workspace_type = f" [{run_type}]"
-            except Exception:
-                pass
-            self.lc_status.setText(
-                f"{workspace_name}{workspace_type}\n{path.name}\n{n} pts, flux{corr_line}\nmag src: {mag_col} [{raw_corr}]"
-            )
-            self.lc_status.setStyleSheet("color: green;")
-            self.log(f"Loaded: {path.name} ({n} pts, mag→flux, detrend={corr_tag or 'N/A'})")
-            self._draw_lc()
+            self.data_combo.blockSignals(True)
+            self.data_combo.clear()
+            for item in series_items:
+                self.data_combo.addItem(item["combo_label"], item["key"])
+            self.data_combo.setCurrentIndex(0)
+            self.data_combo.setEnabled(True)
+            self.data_combo.blockSignals(False)
+            self._apply_series_option(self.data_combo.currentData())
         except Exception as e:
-            self.lc_status.setText(f"Error: {e}")
+            self._clear_loaded_workspace_state(f"Error: {e}")
             self.log(f"[ERROR] {e}")
+
+    def _apply_series_option(self, key: str | None):
+        if not key or key not in self.series_options:
+            return
+        item = self.series_options[key]
+        selected_filter = self._refresh_analysis_filter_combo(item.get("filters"))
+        t_v = np.asarray(item["time"], dtype=float)
+        m_v = np.asarray(item["mag"], dtype=float)
+        e_v = np.asarray(item["mag_err"], dtype=float) if item.get("mag_err") is not None else None
+        filters = item.get("filters")
+        if selected_filter and selected_filter != "__all__" and filters is not None:
+            mask = (filters == selected_filter)
+            t_v = t_v[mask]
+            m_v = m_v[mask]
+            e_v = e_v[mask] if e_v is not None else None
+            filters = filters[mask]
+
+        med_mag = np.nanmedian(m_v)
+        flux = 10.0 ** (-(m_v - med_mag) / 2.5)
+        flux_err = (np.log(10) / 2.5) * flux * e_v if e_v is not None else None
+
+        self.lc_data = {
+            "time": t_v,
+            "flux": flux,
+            "flux_err": flux_err,
+            "mag": m_v,
+            "mag_err": e_v,
+            "filters": filters,
+            "source": item["source"],
+            "corr_tag": item.get("corr_tag", ""),
+            "mag_col": item["mag_col"],
+            "series_label": item.get("series_label", item["mag_col"]),
+            "target_id": item.get("target_id"),
+            "analysis_filter": selected_filter,
+        }
+        self.trim_start.setValue(float(t_v.min()))
+        self.trim_end.setValue(float(t_v.max()))
+
+        n = len(t_v)
+        raw_corr = "corr" if any(x in item["mag_col"] for x in ["corr", "cal"]) else "raw"
+        corr_tag = item.get("corr_tag", "")
+        corr_line = f"  detrend: {corr_tag}" if corr_tag else ""
+        workspace_dir = self._current_workspace_dir()
+        workspace_name = workspace_dir.name
+        workspace_type = ""
+        try:
+            from ...utils.run_workspace import load_run_manifest
+            run_meta = load_run_manifest(workspace_dir)
+            run_type = str(run_meta.get("run_type") or "").strip().lower()
+            if run_type:
+                workspace_type = f" [{run_type}]"
+        except Exception:
+            pass
+        self.lc_status.setText(
+            f"{workspace_name}{workspace_type}\n{item['source']}\n{n} pts, flux{corr_line}\nmag src: {item['mag_col']} [{raw_corr}]"
+        )
+        self.lc_status.setStyleSheet("color: green;")
+        filt_info = f", filter={selected_filter}" if selected_filter and selected_filter != "__all__" else ""
+        self.log(f"Loaded: {item['source']} ({n} pts, {item.get('series_label', item['mag_col'])}{filt_info}, detrend={corr_tag or 'N/A'})")
+        self._draw_lc()
+
+    def _on_series_changed(self):
+        key = self.data_combo.currentData()
+        if not key:
+            return
+        self._apply_series_option(key)
+
+    def _refresh_analysis_filter_combo(self, filters) -> str:
+        current = self.analysis_filter_combo.currentData()
+        filter_values = filters.tolist() if filters is not None else []
+        unique_filters = sorted({str(f) for f in filter_values if str(f).strip() and str(f).lower() != "nan"})
+        self.analysis_filter_combo.blockSignals(True)
+        self.analysis_filter_combo.clear()
+        if unique_filters:
+            for f in unique_filters:
+                self.analysis_filter_combo.addItem(f, f)
+            self.analysis_filter_combo.addItem("All", "__all__")
+            target = current if current in unique_filters or current == "__all__" else unique_filters[0]
+        else:
+            self.analysis_filter_combo.addItem("All", "__all__")
+            target = "__all__"
+        idx = max(self.analysis_filter_combo.findData(target), 0)
+        self.analysis_filter_combo.setCurrentIndex(idx)
+        self.analysis_filter_combo.setEnabled(self.analysis_filter_combo.count() > 0)
+        self.analysis_filter_combo.blockSignals(False)
+        return self.analysis_filter_combo.currentData()
+
+    def _on_analysis_filter_changed(self):
+        key = self.data_combo.currentData()
+        if not key:
+            return
+        self._apply_series_option(key)
 
     def _apply_trim(self):
         if self.lc_data is None:
