@@ -838,6 +838,23 @@ class DetrendNightMergeWindow(StepWindowBase):
         self._busy_log_buffer = []
 
     def _set_busy_state(self, busy: bool, message: str = "") -> None:
+        if self.runtime_mode:
+            if busy:
+                if self._busy_active:
+                    self._busy_message = message or self._busy_message
+                    return
+                self._busy_active = True
+                self._busy_log_buffer = []
+                self._busy_message = message or "Working..."
+                return
+            if not self._busy_active:
+                return
+            self._flush_busy_log_buffer()
+            self._busy_log_buffer = None
+            self._busy_active = False
+            self._busy_message = ""
+            return
+
         if busy:
             if self._busy_active:
                 self._set_busy_message(message)
@@ -874,6 +891,8 @@ class DetrendNightMergeWindow(StepWindowBase):
         if not self._busy_active:
             return
         self._busy_message = message or self._busy_message
+        if self.runtime_mode:
+            return
         self.busy_status_label.setText(self._busy_message)
         QApplication.processEvents()
 
@@ -1360,13 +1379,14 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         self._populate_date_list()
         self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
         self._rebuild_color_map_controls(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
-        self._update_plots()
         self.log(f"[LOAD] Raw points: {len(self.raw_df)}")
 
         self._refresh_delta_c_map()
         self._log_color_index_info()
         self._update_color_mode_enabled()
-        self._update_analysis_panel()
+        if not self.runtime_mode:
+            self._update_plots()
+            self._update_analysis_panel()
         return True
 
     def _load_global_ensemble_df(self) -> pd.DataFrame:
