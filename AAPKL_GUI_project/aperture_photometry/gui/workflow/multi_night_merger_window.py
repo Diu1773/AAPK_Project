@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from PyQt5.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
@@ -210,6 +211,8 @@ class MultiNightMergerWindow(QMainWindow):
         self.merged_runtime_params = None
         self.merged_runtime_project_state: ProjectState | None = None
         self.merged_runtime_file_manager = None
+        self.step10_runtime_window = None
+        self.step11_runtime_window = None
         self.step12_worker: _MergerPeriodWorker | None = None
         self.step12_lc_data: dict | None = None
 
@@ -476,21 +479,90 @@ class MultiNightMergerWindow(QMainWindow):
         return page, status
 
     def _make_step4(self) -> QWidget:
-        page, label = self._make_child_step_page(
-            "Merged workspace의 Step 10 Light Curve Builder를 엽니다.",
-            "Step 10 열기",
-            lambda: self.open_step(9),
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._make_info_label(
+            "Merged workspace에서 직접 Step 10 raw light curve를 생성합니다.\n"
+            "간단 실행은 여기서 처리하고, 세부 QC/플롯이 필요할 때만 Step 10 창을 엽니다."
+        ))
+        self.step10_status_label = QLabel("Merged workspace 없음")
+        self.step10_status_label.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(self.step10_status_label)
+
+        btn_row = QHBoxLayout()
+        self.btn_step10_run = QPushButton("빠른 생성 실행")
+        self.btn_step10_run.setStyleSheet(
+            "QPushButton { background:#2E7D32; color:white; font-weight:bold; padding:6px 18px; }"
+            "QPushButton:hover { background:#1B5E20; }"
         )
-        self.step10_status_label = label
+        self.btn_step10_run.clicked.connect(self._run_step10_inline)
+        btn_row.addWidget(self.btn_step10_run)
+
+        btn_open = QPushButton("Step 10 창 열기")
+        btn_open.clicked.connect(lambda: self.open_step(9))
+        btn_row.addWidget(btn_open)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.step10_progress_label = QLabel("")
+        self.step10_progress_label.setStyleSheet("QLabel { color:#1565C0; }")
+        layout.addWidget(self.step10_progress_label)
+
+        self.step10_log = QTextEdit()
+        self.step10_log.setReadOnly(True)
+        self.step10_log.setMinimumHeight(180)
+        self.step10_log.setStyleSheet("font-size:8pt; font-family:monospace;")
+        layout.addWidget(self.step10_log)
         return page
 
     def _make_step5(self) -> QWidget:
-        page, label = self._make_child_step_page(
-            "Merged workspace의 Step 11 Detrend window를 엽니다.",
-            "Step 11 열기",
-            lambda: self.open_step(10),
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._make_info_label(
+            "Merged workspace에서 직접 Step 11 detrend를 실행합니다.\n"
+            "빠른 실행은 여기서 처리하고, 세부 옵션 조정이 필요할 때만 Step 11 창을 엽니다."
+        ))
+        self.step11_status_label = QLabel("Merged workspace 없음")
+        self.step11_status_label.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(self.step11_status_label)
+
+        opts = QGroupBox("빠른 보정 옵션")
+        opts_layout = QHBoxLayout(opts)
+        self.step11_mode_combo = QComboBox()
+        self.step11_mode_combo.addItem("Offset", "offset")
+        self.step11_mode_combo.addItem("Color", "color")
+        self.step11_mode_combo.addItem("Global Ensemble", "global")
+        self.step11_global_k2_quick = QCheckBox("Global k''")
+        opts_layout.addWidget(QLabel("Mode"))
+        opts_layout.addWidget(self.step11_mode_combo)
+        opts_layout.addWidget(self.step11_global_k2_quick)
+        opts_layout.addStretch()
+        layout.addWidget(opts)
+
+        btn_row = QHBoxLayout()
+        self.btn_step11_run = QPushButton("빠른 보정 실행")
+        self.btn_step11_run.setStyleSheet(
+            "QPushButton { background:#6A1B9A; color:white; font-weight:bold; padding:6px 18px; }"
+            "QPushButton:hover { background:#4A148C; }"
         )
-        self.step11_status_label = label
+        self.btn_step11_run.clicked.connect(self._run_step11_inline)
+        btn_row.addWidget(self.btn_step11_run)
+
+        btn_open = QPushButton("Step 11 창 열기")
+        btn_open.clicked.connect(lambda: self.open_step(10))
+        btn_row.addWidget(btn_open)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.step11_progress_label = QLabel("")
+        self.step11_progress_label.setStyleSheet("QLabel { color:#6A1B9A; }")
+        layout.addWidget(self.step11_progress_label)
+
+        self.step11_log = QTextEdit()
+        self.step11_log.setReadOnly(True)
+        self.step11_log.setMinimumHeight(180)
+        self.step11_log.setStyleSheet("font-size:8pt; font-family:monospace;")
+        layout.addWidget(self.step11_log)
         return page
 
     def _make_step6(self) -> QWidget:
@@ -596,6 +668,8 @@ class MultiNightMergerWindow(QMainWindow):
         self.merged_runtime_params = None
         self.merged_runtime_project_state = None
         self.merged_runtime_file_manager = None
+        self.step10_runtime_window = None
+        self.step11_runtime_window = None
         self.step12_lc_data = None
         if hasattr(self, "folder_info_table"):
             self.folder_info_table.setRowCount(0)
@@ -619,6 +693,14 @@ class MultiNightMergerWindow(QMainWindow):
             self.step12_log.clear()
         if hasattr(self, "step12_progress_label"):
             self.step12_progress_label.setText("")
+        if hasattr(self, "step10_log"):
+            self.step10_log.clear()
+        if hasattr(self, "step11_log"):
+            self.step11_log.clear()
+        if hasattr(self, "step10_progress_label"):
+            self.step10_progress_label.setText("")
+        if hasattr(self, "step11_progress_label"):
+            self.step11_progress_label.setText("")
         if hasattr(self, "step10_status_label"):
             self._refresh_runtime_status_labels()
 
@@ -1049,6 +1131,8 @@ class MultiNightMergerWindow(QMainWindow):
     def _build_merged_runtime_context(self, night_assignments: dict[str, int], path_map: dict[str, str]):
         if self.merged_result_dir is None:
             return
+        self.step10_runtime_window = None
+        self.step11_runtime_window = None
         out_dir = Path(self.merged_result_dir)
         self.merged_runtime_params = _MergedParamsProxy(self.params, out_dir)
         self.merged_runtime_params.P.file_path_map = dict(path_map)
@@ -1063,12 +1147,122 @@ class MultiNightMergerWindow(QMainWindow):
 
     # ───────────────────────── child workflow launch ─────────────────────────
 
+    def _attach_runtime_log(self, window, append_fn):
+        if getattr(window, "_merger_log_attached", False):
+            return
+        original_log = getattr(window, "log", None)
+
+        def _wrapped_log(msg, *args, **kwargs):
+            if callable(original_log):
+                original_log(msg, *args, **kwargs)
+            text = str(msg)
+            append_fn(text)
+            QApplication.processEvents()
+
+        window.log = _wrapped_log
+        window._merger_log_attached = True
+
+    def _step10_log_append(self, msg: str):
+        if hasattr(self, "step10_log"):
+            self.step10_log.append(msg)
+
+    def _step11_log_append(self, msg: str):
+        if hasattr(self, "step11_log"):
+            self.step11_log.append(msg)
+
+    def _get_or_create_step10_runtime_window(self):
+        if self.step10_runtime_window is not None:
+            return self.step10_runtime_window
+        from .step10_light_curve_builder import LightCurveBuilderWindow
+        window = LightCurveBuilderWindow(
+            self.merged_runtime_params,
+            self.merged_runtime_file_manager,
+            self.merged_runtime_project_state,
+            self,
+        )
+        window.show_log_window = lambda: None
+        self._attach_runtime_log(window, self._step10_log_append)
+        self.step10_runtime_window = window
+        return window
+
+    def _get_or_create_step11_runtime_window(self):
+        if self.step11_runtime_window is not None:
+            return self.step11_runtime_window
+        from .step11_detrend_merge import DetrendNightMergeWindow
+        window = DetrendNightMergeWindow(
+            self.merged_runtime_params,
+            self.merged_runtime_file_manager,
+            self.merged_runtime_project_state,
+            self,
+        )
+        self._attach_runtime_log(window, self._step11_log_append)
+        self.step11_runtime_window = window
+        return window
+
+    def _run_step10_inline(self):
+        if self.merged_result_dir is None:
+            QMessageBox.warning(self, "Light Curve", "Merged workspace를 먼저 생성하세요.")
+            return
+        self.btn_step10_run.setEnabled(False)
+        self.step10_progress_label.setText("Building...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            window = self._get_or_create_step10_runtime_window()
+            self._step10_log_append(f"[MERGER] Building Step10 in {self.merged_result_dir}")
+            window.build_light_curve()
+            self.step11_runtime_window = None
+            self.step12_lc_data = None
+            self._refresh_runtime_status_labels()
+            self.step10_progress_label.setText("Done")
+        except Exception as e:
+            self.step10_progress_label.setText("Error")
+            self._step10_log_append(f"[ERROR] {e}")
+            QMessageBox.warning(self, "Light Curve", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_step10_run.setEnabled(True)
+
+    def _run_step11_inline(self):
+        if self.merged_result_dir is None:
+            QMessageBox.warning(self, "Detrend", "Merged workspace를 먼저 생성하세요.")
+            return
+        self.btn_step11_run.setEnabled(False)
+        self.step11_progress_label.setText("Running...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            window = self._get_or_create_step11_runtime_window()
+            mode = str(self.step11_mode_combo.currentData() or "offset")
+            if mode == "global":
+                window.mode_global.setChecked(True)
+            elif mode == "color":
+                window.mode_color.setChecked(True)
+            else:
+                window.mode_offset.setChecked(True)
+            if hasattr(window, "chk_global_k2"):
+                window.chk_global_k2.setChecked(bool(self.step11_global_k2_quick.isChecked()))
+            self._step11_log_append(f"[MERGER] Running Step11 mode={mode}")
+            window.fit_and_apply()
+            self.step12_lc_data = None
+            self._refresh_runtime_status_labels()
+            self.step11_progress_label.setText("Done")
+        except Exception as e:
+            self.step11_progress_label.setText("Error")
+            self._step11_log_append(f"[ERROR] {e}")
+            QMessageBox.warning(self, "Detrend", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_step11_run.setEnabled(True)
+
     def _refresh_runtime_status_labels(self):
         merged_dir = self.merged_result_dir
         if merged_dir is None:
             self.step10_status_label.setText("Merged workspace 없음")
             self.step11_status_label.setText("Merged workspace 없음")
             self.step12_status_label.setText("Merged workspace 없음")
+            if hasattr(self, "btn_step10_run"):
+                self.btn_step10_run.setEnabled(False)
+            if hasattr(self, "btn_step11_run"):
+                self.btn_step11_run.setEnabled(False)
             self._refresh_step12_filter_options()
             return
 
@@ -1089,6 +1283,10 @@ class MultiNightMergerWindow(QMainWindow):
         self.step12_status_label.setText(
             f"Workspace: {merged_dir}\nStep12 outputs: {'있음' if s12_ready else '없음'}"
         )
+        if hasattr(self, "btn_step10_run"):
+            self.btn_step10_run.setEnabled(True)
+        if hasattr(self, "btn_step11_run"):
+            self.btn_step11_run.setEnabled(True)
         self._refresh_step12_filter_options()
 
     def _merged_step12_target_id(self) -> int | None:
@@ -1262,21 +1460,9 @@ class MultiNightMergerWindow(QMainWindow):
             self.current_step_window.close()
 
         if step_index == 9:
-            from .step10_light_curve_builder import LightCurveBuilderWindow
-            self.current_step_window = LightCurveBuilderWindow(
-                self.merged_runtime_params,
-                self.merged_runtime_file_manager,
-                self.merged_runtime_project_state,
-                self,
-            )
+            self.current_step_window = self._get_or_create_step10_runtime_window()
         elif step_index == 10:
-            from .step11_detrend_merge import DetrendNightMergeWindow
-            self.current_step_window = DetrendNightMergeWindow(
-                self.merged_runtime_params,
-                self.merged_runtime_file_manager,
-                self.merged_runtime_project_state,
-                self,
-            )
+            self.current_step_window = self._get_or_create_step11_runtime_window()
         elif step_index == 11:
             from .step12_period_analysis import PeriodAnalysisWindow
             self.current_step_window = PeriodAnalysisWindow(
