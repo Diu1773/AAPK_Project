@@ -1702,10 +1702,14 @@ class QCInspectionPanel(QWidget):
             if not row.empty:
                 r = row.iloc[0]
                 x_sel = float(x_vals[df["file"].tolist().index(sel)])
-                self.ax_sky.scatter(x_sel, r["sky_med"], s=34, marker="o",
-                                    color="#1976D2", zorder=6)
-                self.ax_fwhm.scatter(x_sel, r["fwhm_med"], s=34, marker="o",
-                                     color="#1976D2", zorder=6)
+                self.ax_sky.scatter(
+                    [x_sel], [r["sky_med"]], s=220, facecolors="none",
+                    edgecolors="red", linewidths=2.0, zorder=20
+                )
+                self.ax_fwhm.scatter(
+                    [x_sel], [r["fwhm_med"]], s=220, facecolors="none",
+                    edgecolors="red", linewidths=2.0, zorder=20
+                )
 
         n_total = len(df)
         n_exc = int(excluded.sum())
@@ -1716,7 +1720,7 @@ class QCInspectionPanel(QWidget):
             hidden_note = f" | hidden(outlier) sky={hidden_sky} fwhm={hidden_fwhm}"
         self.plot_status.setText(
             f"Filter={filter_label} | frames={n_total} | excluded={n_exc} ({rate:.1f}%) | "
-            f"outlier=red dot, excluded=gray x{hidden_note}"
+            f"outlier=red dot, selected=red circle, excluded=gray x{hidden_note}"
         )
         self.fig.tight_layout()
         self.canvas.draw_idle()

@@ -21,8 +21,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from astropy.coordinates import SkyCoord
-import astropy.units as u
 
 from PyQt5.QtWidgets import (
     QMainWindow,
@@ -47,9 +45,24 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
 
+from ...analysis.merge.id_match import (
+    append_folder_tag,
+    best_positional_match,
+    canonicalize_catalog_row,
+    extract_row_float,
+)
+from ...analysis.merge.workspace_scan import (
+    default_merged_output_dir as _default_output_dir,
+    folder_tag as _folder_tag,
+    load_master_catalogs_by_filter as _load_master_catalogs_by_filter,
+    load_selection_payloads as _load_selection_payloads,
+    normalize_filter_key as _normalize_filter_key,
+    read_step5_index as _read_step5_index,
+    scan_merge_input_workspace,
+    workspace_scan_signature,
+)
 from ...core.project_state import ProjectState
 from ...utils.io_utils import (
-    read_csv_int64_source_id,
     coerce_int64_source_id,
     load_file_path_map,
     load_headers_table,
@@ -58,11 +71,7 @@ from ...utils.io_utils import (
 from ...utils.photometry_loader import load_frame_photometry
 from ...utils.run_workspace import (
     build_merged_workspace_dir,
-    infer_result_workspace_date_range,
     infer_result_workspace_label,
-    infer_workspace_date_range,
-    infer_workspace_label,
-    load_run_manifest,
     write_run_manifest,
 )
 from ...utils.step_paths import (
@@ -73,127 +82,6 @@ from ...utils.step_paths import (
     step11_dir,
     step12_period_dir,
 )
-
-
-def _normalize_filter_key(value) -> str:
-    return str(value or "").strip().lower() or "unknown"
-
-
-def _folder_tag(index: int, folder: Path) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in folder.name)
-    return f"F{index + 1:02d}_{safe}"
-
-
-def _default_output_dir(base_folder: Path) -> Path:
-    return build_merged_workspace_dir([base_folder])
-
-
-def _run_meta(result_dir: Path) -> dict:
-    meta = load_run_manifest(result_dir)
-    if meta:
-        return meta
-    start_date, end_date = infer_workspace_date_range(result_dir)
-    label = infer_workspace_label(result_dir)
-    return {
-        "run_type": "result",
-        "label": label,
-        "date_start": start_date,
-        "date_end": end_date,
-        "result_dir": str(result_dir),
-    }
-
-
-def _read_step5_index(result_dir: Path) -> pd.DataFrame:
-    idx_path = step5_photometry_dir(result_dir) / "photometry_index.csv"
-    if not idx_path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(idx_path)
-    except Exception:
-        return pd.DataFrame()
-
-
-def _load_selection_payloads(result_dir: Path) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    s9 = step9_selection_dir(result_dir)
-    if not s9.exists():
-        return out
-    for path in sorted(s9.glob("selection_*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        flt = _normalize_filter_key(data.get("filter") or path.stem.replace("selection_", ""))
-        out[flt] = data
-    return out
-
-
-def _load_master_catalogs_by_filter(result_dir: Path) -> dict[str, pd.DataFrame]:
-    catalogs: dict[str, pd.DataFrame] = {}
-    s9 = step9_selection_dir(result_dir)
-    if not s9.exists():
-        return catalogs
-    for path in sorted(s9.glob("master_catalog_*.tsv")):
-        flt = _normalize_filter_key(path.stem.replace("master_catalog_", ""))
-        try:
-            df = read_csv_int64_source_id(path, sep="\t")
-        except Exception:
-            continue
-        if df is None or df.empty or "ID" not in df.columns:
-            continue
-        df = df.copy()
-        if "source_id" in df.columns:
-            df["source_id"] = coerce_int64_source_id(df["source_id"]).astype("Int64")
-        df["ID"] = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
-        for col in ("ra_deg", "dec_deg", "gaia_G", "gaia_id"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        catalogs[flt] = df
-    return catalogs
-
-
-def _first_valid(series) -> float:
-    vals = pd.to_numeric(series, errors="coerce")
-    vals = vals[np.isfinite(vals)]
-    return float(vals.iloc[0]) if len(vals) else float("nan")
-
-
-def _extract_row_float(row: pd.Series, *cols: str) -> float:
-    for col in cols:
-        if col in row.index:
-            val = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
-            if np.isfinite(val):
-                return float(val)
-    return float("nan")
-
-
-def _row_radec(row: pd.Series) -> tuple[float, float]:
-    return (
-        _extract_row_float(row, "ra_deg", "ra", "RA"),
-        _extract_row_float(row, "dec_deg", "dec", "DEC"),
-    )
-
-
-def _append_folder_tag(existing: str, tag: str) -> str:
-    parts = [p for p in str(existing or "").split(",") if p]
-    if tag not in parts:
-        parts.append(tag)
-    return ",".join(parts)
-
-
-def _load_target_radec(result_dir: Path, target_id: int) -> tuple[float, float]:
-    catalogs = _load_master_catalogs_by_filter(result_dir)
-    for df in catalogs.values():
-        row = df[pd.to_numeric(df["ID"], errors="coerce") == int(target_id)]
-        if row.empty:
-            continue
-        ra = _first_valid(row["ra_deg"]) if "ra_deg" in row.columns else float("nan")
-        dec = _first_valid(row["dec_deg"]) if "dec_deg" in row.columns else float("nan")
-        if np.isfinite(ra) and np.isfinite(dec):
-            return ra, dec
-    return float("nan"), float("nan")
-
-
 class _MergedParamsProxy:
     """Read-only-ish params wrapper for merged runtime windows."""
 
@@ -261,6 +149,9 @@ class MultiNightMergerWindow(QMainWindow):
         self.folders: list[Path] = [Path(params.P.result_dir)]
         self.folder_tags: dict[str, str] = {}
         self.folder_scan_rows: list[dict] = []
+        self._workspace_scan_cache: dict[str, tuple[tuple, dict]] = {}
+        self._catalog_cache: dict[str, tuple[tuple, dict[str, pd.DataFrame]]] = {}
+        self._selection_payload_cache: dict[str, tuple[tuple, dict[str, dict]]] = {}
 
         self.match_summary_rows: list[dict] = []
         self.match_records: list[dict] = []
@@ -615,6 +506,34 @@ class MultiNightMergerWindow(QMainWindow):
         if hasattr(self, "step10_status_label"):
             self._refresh_runtime_status_labels()
 
+    def _step9_signature(self, result_dir: Path) -> tuple:
+        s9 = step9_selection_dir(result_dir)
+        return (
+            str(result_dir.resolve()),
+            max((p.stat().st_mtime for p in s9.glob("master_catalog_*.tsv")), default=None),
+            max((p.stat().st_mtime for p in s9.glob("selection_*.json")), default=None),
+        )
+
+    def _get_cached_selection_payloads(self, result_dir: Path) -> dict[str, dict]:
+        cache_key = str(result_dir.resolve())
+        signature = self._step9_signature(result_dir)
+        cached = self._selection_payload_cache.get(cache_key)
+        if cached and cached[0] == signature:
+            return cached[1]
+        payloads = _load_selection_payloads(result_dir)
+        self._selection_payload_cache[cache_key] = (signature, payloads)
+        return payloads
+
+    def _get_cached_master_catalogs(self, result_dir: Path) -> dict[str, pd.DataFrame]:
+        cache_key = str(result_dir.resolve())
+        signature = self._step9_signature(result_dir)
+        cached = self._catalog_cache.get(cache_key)
+        if cached and cached[0] == signature:
+            return cached[1]
+        catalogs = _load_master_catalogs_by_filter(result_dir)
+        self._catalog_cache[cache_key] = (signature, catalogs)
+        return catalogs
+
     def _refresh_output_dir_default(self, force: bool = False):
         if not self.folders:
             self.output_dir_edit.clear()
@@ -680,29 +599,14 @@ class MultiNightMergerWindow(QMainWindow):
         self.folder_scan_rows = []
         self.folder_info_table.setRowCount(0)
         for folder in self.folders:
-            meta = _run_meta(folder)
-            idx = _read_step5_index(folder)
-            catalogs = _load_master_catalogs_by_filter(folder)
-            selection_payloads = _load_selection_payloads(folder)
-            s10 = step10_dir(folder)
-            has_step10 = bool(list(s10.glob("lightcurve_ID*_raw.csv"))) or bool(list(s10.glob("lightcurve_combined_ID*_raw.csv")))
-            has_step5 = not idx.empty
-            has_step9 = bool(catalogs) and bool(selection_payloads)
-            merge_ready = bool(has_step5 and has_step9 and has_step10)
-
-            filters = sorted(set(catalogs) | set(selection_payloads))
-            row_info = {
-                "folder": folder,
-                "label": str(meta.get("label") or folder.name),
-                "run_type": str(meta.get("run_type", "result")),
-                "date_start": meta.get("date_start") or "—",
-                "date_end": meta.get("date_end") or "—",
-                "has_step5": has_step5,
-                "has_step9": has_step9,
-                "has_step10": has_step10,
-                "filters": filters,
-                "merge_ready": merge_ready,
-            }
+            cache_key = str(folder.resolve())
+            signature = workspace_scan_signature(folder)
+            cached = self._workspace_scan_cache.get(cache_key)
+            if cached and cached[0] == signature:
+                row_info = dict(cached[1])
+            else:
+                row_info = scan_merge_input_workspace(folder)
+                self._workspace_scan_cache[cache_key] = (signature, dict(row_info))
             self.folder_scan_rows.append(row_info)
 
             row = self.folder_info_table.rowCount()
@@ -754,48 +658,6 @@ class MultiNightMergerWindow(QMainWindow):
                 min_sid = min(min_sid, int(sid_vals.min()))
         return min_sid - 1 if min_sid <= 0 else -1
 
-    def _best_positional_match(self, row: pd.Series, canonical_df: pd.DataFrame, tol_arcsec: float) -> tuple[int | None, float]:
-        ra, dec = _row_radec(row)
-        if not (np.isfinite(ra) and np.isfinite(dec)):
-            return None, float("nan")
-        if canonical_df is None or canonical_df.empty or "ra_deg" not in canonical_df.columns or "dec_deg" not in canonical_df.columns:
-            return None, float("nan")
-
-        cand = canonical_df.copy()
-        cand_ra = pd.to_numeric(cand["ra_deg"], errors="coerce")
-        cand_dec = pd.to_numeric(cand["dec_deg"], errors="coerce")
-        mask = cand_ra.notna() & cand_dec.notna()
-        if not mask.any():
-            return None, float("nan")
-
-        sc = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
-        csc = SkyCoord(cand_ra[mask].to_numpy(float) * u.deg, cand_dec[mask].to_numpy(float) * u.deg, frame="icrs")
-        sep = sc.separation(csc).arcsec
-        if len(sep) == 0:
-            return None, float("nan")
-        best_i = int(np.argmin(sep))
-        best_sep = float(sep[best_i])
-        if not np.isfinite(best_sep) or best_sep > tol_arcsec:
-            return None, best_sep
-        best_rows = cand.loc[mask].reset_index(drop=True)
-        return int(pd.to_numeric(best_rows.loc[best_i, "source_id"], errors="coerce")), best_sep
-
-    def _canonicalize_catalog_row(
-        self,
-        row: pd.Series,
-        merged_id: int,
-        merged_source_id: int,
-        folder_tag: str,
-    ) -> dict:
-        data = row.to_dict()
-        data["ID"] = int(merged_id)
-        data["source_id"] = int(merged_source_id)
-        data["gaia_id"] = int(merged_source_id) if int(merged_source_id) > 0 else np.nan
-        data["match_status"] = "matched" if int(merged_source_id) > 0 else "no_gaia_match"
-        data["folder_count"] = 1
-        data["folder_tags"] = folder_tag
-        return data
-
     def _run_id_match(self):
         self.match_log.clear()
         self.match_table.setRowCount(0)
@@ -813,8 +675,8 @@ class MultiNightMergerWindow(QMainWindow):
             return
 
         base_folder = self.folders[0]
-        self.base_selection_by_filter = _load_selection_payloads(base_folder)
-        catalogs_by_folder = {str(folder): _load_master_catalogs_by_filter(folder) for folder in self.folders}
+        self.base_selection_by_filter = self._get_cached_selection_payloads(base_folder)
+        catalogs_by_folder = {str(folder): self._get_cached_master_catalogs(folder) for folder in self.folders}
         self.folder_tags = {str(folder): _folder_tag(i, folder) for i, folder in enumerate(self.folders)}
 
         all_filters = sorted({
@@ -868,7 +730,7 @@ class MultiNightMergerWindow(QMainWindow):
                             sid = int(sid_val)
                         merged_id = int(local_id)
                         max_id = max(max_id, merged_id)
-                        seeded_rows.append(self._canonicalize_catalog_row(row, merged_id, sid, folder_tag))
+                        seeded_rows.append(canonicalize_catalog_row(row, merged_id, sid, folder_tag))
                         local_map[int(local_id)] = {
                             "merged_id": merged_id,
                             "merged_source_id": sid,
@@ -924,7 +786,7 @@ class MultiNightMergerWindow(QMainWindow):
                         matched_sid = sid_int
                         match_method = "source_id"
                     else:
-                        matched_sid, sep_arcsec = self._best_positional_match(row, canon, pos_tol)
+                        matched_sid, sep_arcsec = best_positional_match(row, canon, pos_tol)
                         if matched_sid is not None and matched_sid not in used_canonical_sids:
                             match_method = "position"
                         else:
@@ -943,7 +805,7 @@ class MultiNightMergerWindow(QMainWindow):
                         else:
                             n_pos += 1
                         canon.at[canon_idx, "folder_count"] = int(pd.to_numeric(pd.Series([canon.iloc[canon_idx].get("folder_count", 1)]), errors="coerce").iloc[0] or 1) + 1
-                        canon.at[canon_idx, "folder_tags"] = _append_folder_tag(canon.iloc[canon_idx].get("folder_tags", ""), folder_tag)
+                        canon.at[canon_idx, "folder_tags"] = append_folder_tag(canon.iloc[canon_idx].get("folder_tags", ""), folder_tag)
                         self.match_records.append({
                             "folder": folder.name,
                             "folder_tag": folder_tag,
@@ -968,7 +830,7 @@ class MultiNightMergerWindow(QMainWindow):
                         merged_source_id = next_negative_sid
                         next_negative_sid -= 1
 
-                    new_row = self._canonicalize_catalog_row(row, merged_id, merged_source_id, folder_tag)
+                    new_row = canonicalize_catalog_row(row, merged_id, merged_source_id, folder_tag)
                     canon = pd.concat([canon, pd.DataFrame([new_row])], ignore_index=True, sort=False)
                     canon_sid_map[int(merged_source_id)] = len(canon) - 1
                     local_map[local_id] = {
@@ -1116,7 +978,7 @@ class MultiNightMergerWindow(QMainWindow):
 
             stable_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
             gaia_text = "Gaia" if sid > 0 else "Local"
-            gmag = _extract_row_float(row, "gaia_G", "gaia_g")
+            gmag = extract_row_float(row, "gaia_G", "gaia_g")
             folder_count = int(pd.to_numeric(pd.Series([row.get("folder_count", 1)]), errors="coerce").iloc[0] or 1)
             note = str(row.get("match_status", ""))
 

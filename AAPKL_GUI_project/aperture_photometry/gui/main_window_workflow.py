@@ -967,9 +967,9 @@ class MainWindowWorkflow(QMainWindow):
 
     def open_multi_night_merger(self):
         """Open Multi-Night Light Curve Merger (hides main window)."""
-        from .workflow.multi_night_merger_window import MultiNightMergerWindow
+        from .tools.multi_night_merger_tool import MultiNightMergerToolWindow
 
-        self.merger_window = MultiNightMergerWindow(
+        self.merger_window = MultiNightMergerToolWindow(
             self.params,
             self.project_state,
             main_window=self,
