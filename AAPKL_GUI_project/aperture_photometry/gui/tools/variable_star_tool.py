@@ -123,7 +123,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QPushButton, QLabel, QDoubleSpinBox, QSpinBox,
     QCheckBox, QTabWidget, QTextEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFileDialog, QSplitter, QMessageBox, QComboBox,
+    QHeaderView, QFileDialog, QSplitter, QMessageBox, QComboBox, QLineEdit,
     QColorDialog, QDialog, QGridLayout,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -359,11 +359,12 @@ class VariableStarToolWindow(QWidget):
         self._refine_worker: Optional[RefineBootstrapWorker] = None
         self.filter_colors: dict = {}      # user-customized per-filter colors
         self.filter_visibility: dict = {}  # True=visible, False=hidden
+        self.workspace_dir = Path(self.params.P.result_dir)
 
         self.setWindowTitle("Variable Star Analysis")
         self.resize(1200, 800)
         self._build_ui()
-        self._load_lc_from_step()
+        self._load_lc_from_workspace()
 
     # ------------------------------------------------------------------
     # UI
@@ -396,12 +397,18 @@ class VariableStarToolWindow(QWidget):
         self.lc_status = QLabel("Not loaded")
         self.lc_status.setWordWrap(True)
         lc_form.addRow("Status:", self.lc_status)
-        btn_load = QPushButton("Load from Step 10/11…")
-        btn_load.clicked.connect(self._load_lc_from_step)
-        lc_form.addRow(btn_load)
-        btn_open = QPushButton("Open CSV…")
-        btn_open.clicked.connect(self._open_csv)
-        lc_form.addRow(btn_open)
+        ws_row = QWidget()
+        ws_layout = QHBoxLayout(ws_row)
+        ws_layout.setContentsMargins(0, 0, 0, 0)
+        self.workspace_edit = QLineEdit(str(self.workspace_dir))
+        btn_workspace = QPushButton("Browse…")
+        btn_workspace.clicked.connect(self._browse_workspace)
+        btn_reload = QPushButton("Load")
+        btn_reload.clicked.connect(self._load_lc_from_workspace)
+        ws_layout.addWidget(self.workspace_edit, 1)
+        ws_layout.addWidget(btn_workspace)
+        ws_layout.addWidget(btn_reload)
+        lc_form.addRow("Workspace:", ws_row)
         self.mag_col_combo = QComboBox()
         self.mag_col_combo.setEnabled(False)
         self.mag_col_combo.currentIndexChanged.connect(self._on_mag_col_changed)
@@ -722,29 +729,36 @@ class VariableStarToolWindow(QWidget):
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_lc_from_step(self):
-        """Load all available step outputs and expose them in the Use data combo."""
+    def _current_workspace_dir(self) -> Path:
+        text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        path = Path(text) if text else Path(self.workspace_dir)
+        self.workspace_dir = path
+        return path
+
+    def _browse_workspace(self):
+        start_dir = self._current_workspace_dir()
+        start = str(start_dir.parent if start_dir.exists() else Path(self.params.P.result_dir).parent)
+        path = QFileDialog.getExistingDirectory(self, "Workspace 선택", start)
+        if path:
+            self.workspace_edit.setText(path)
+            self._load_lc_from_workspace()
+
+    def _load_lc_from_workspace(self):
+        """Load all available workspace outputs and expose them in the Use data combo."""
         try:
             from ...utils.step_paths import list_lightcurve_csvs
-            rd = Path(self.params.P.result_dir)
+            rd = self._current_workspace_dir()
             paths = list_lightcurve_csvs(rd)
             if not paths:
-                self.lc_status.setText("No lightcurve_*.csv found in Step 10/11 output")
+                self.lc_status.setText(f"No lightcurve_*.csv found in\n{rd}")
                 return
             self._load_paths(paths)
         except Exception as e:
-            self.lc_status.setText(f"Auto-load failed: {e}")
-
-    def _open_csv(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Light Curve CSV", "", "CSV Files (*.csv);;All Files (*)"
-        )
-        if path:
-            self._load_paths([Path(path)])
+            self.lc_status.setText(f"Workspace load failed: {e}")
 
     def _load_paths(self, paths: list[Path]):
         try:
-            rd = Path(self.params.P.result_dir)
+            rd = self._current_workspace_dir()
             try:
                 from ...utils.qc_utils import load_frame_excludes as _lfe
                 excl = set(_lfe(rd).keys())
@@ -871,11 +885,12 @@ class VariableStarToolWindow(QWidget):
         }
         n = int(np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag"])))
         corr_line = f"  [{self.lc_data['corr_tag']}]" if self.lc_data.get("corr_tag") else ""
-        workspace_name = Path(self.params.P.result_dir).name
+        workspace_dir = self._current_workspace_dir()
+        workspace_name = workspace_dir.name
         workspace_type = ""
         try:
             from ...utils.run_workspace import load_run_manifest
-            run_meta = load_run_manifest(Path(self.params.P.result_dir))
+            run_meta = load_run_manifest(workspace_dir)
             run_type = str(run_meta.get("run_type") or "").strip().lower()
             if run_type:
                 workspace_type = f" [{run_type}]"
@@ -1230,7 +1245,7 @@ class VariableStarToolWindow(QWidget):
 
         # Check star phase-folded overlay
         try:
-            _rd = Path(self.params.P.result_dir)
+            _rd = self._current_workspace_dir()
             _check_filter = _resolve_check_filter(
                 self.lc_data.get("filters"),
                 self.lc_data.get("analysis_filter"),

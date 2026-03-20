@@ -412,11 +412,12 @@ class TransitToolWindow(QWidget):
         self._fetch_worker: Optional[FetchParamsWorker] = None
         self._fit_worker: Optional[BatmanFitWorker] = None
         self._mcmc_worker: Optional[MCMCWorker] = None
+        self.workspace_dir = Path(self.params.P.result_dir)
 
         self.setWindowTitle("Exoplanet Transit Analysis")
         self.resize(1300, 850)
         self._build_ui()
-        self._load_lc_from_step()
+        self._load_lc_from_workspace()
 
     # ------------------------------------------------------------------
     # UI
@@ -497,12 +498,18 @@ class TransitToolWindow(QWidget):
         self.lc_status = QLabel("Not loaded")
         self.lc_status.setWordWrap(True)
         lc_form.addRow("Status:", self.lc_status)
-        btn_auto = QPushButton("Load from Step 10/11")
-        btn_auto.clicked.connect(self._load_lc_from_step)
-        lc_form.addRow(btn_auto)
-        btn_open = QPushButton("Open CSV…")
-        btn_open.clicked.connect(self._open_csv)
-        lc_form.addRow(btn_open)
+        ws_row = QWidget()
+        ws_layout = QHBoxLayout(ws_row)
+        ws_layout.setContentsMargins(0, 0, 0, 0)
+        self.workspace_edit = QLineEdit(str(self.workspace_dir))
+        btn_workspace = QPushButton("Browse…")
+        btn_workspace.clicked.connect(self._browse_workspace)
+        btn_reload = QPushButton("Load")
+        btn_reload.clicked.connect(self._load_lc_from_workspace)
+        ws_layout.addWidget(self.workspace_edit, 1)
+        ws_layout.addWidget(btn_workspace)
+        ws_layout.addWidget(btn_reload)
+        lc_form.addRow("Workspace:", ws_row)
         # Trim
         trim_row = QHBoxLayout()
         self.trim_start = QDoubleSpinBox()
@@ -733,24 +740,31 @@ class TransitToolWindow(QWidget):
         for key, spin in self._param_spins.items():
             self.prior_params[key] = spin.value()
 
-    def _load_lc_from_step(self):
+    def _current_workspace_dir(self) -> Path:
+        text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        path = Path(text) if text else Path(self.workspace_dir)
+        self.workspace_dir = path
+        return path
+
+    def _browse_workspace(self):
+        start_dir = self._current_workspace_dir()
+        start = str(start_dir.parent if start_dir.exists() else Path(self.params.P.result_dir).parent)
+        path = QFileDialog.getExistingDirectory(self, "Workspace 선택", start)
+        if path:
+            self.workspace_edit.setText(path)
+            self._load_lc_from_workspace()
+
+    def _load_lc_from_workspace(self):
         try:
             from ...utils.step_paths import find_best_lightcurve_csv
-            rd = Path(self.params.P.result_dir)
+            rd = self._current_workspace_dir()
             path = find_best_lightcurve_csv(rd)
             if path is None:
-                self.lc_status.setText("No lightcurve_*.csv found in Step 10/11")
+                self.lc_status.setText(f"No lightcurve_*.csv found in\n{rd}")
                 return
             self._load_csv(path)
         except Exception as e:
-            self.lc_status.setText(f"Auto-load failed: {e}")
-
-    def _open_csv(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Light Curve CSV", "", "CSV Files (*.csv);;All Files (*)"
-        )
-        if path:
-            self._load_csv(Path(path))
+            self.lc_status.setText(f"Workspace load failed: {e}")
 
     def _load_csv(self, path: Path):
         try:
@@ -758,7 +772,7 @@ class TransitToolWindow(QWidget):
             # Apply step10 frame exclusions
             try:
                 from ...utils.qc_utils import load_frame_excludes as _lfe
-                rd = Path(self.params.P.result_dir)
+                rd = self._current_workspace_dir()
                 excl = set(_lfe(rd).keys())
                 if excl and "file" in df.columns:
                     before = len(df)
@@ -812,11 +826,12 @@ class TransitToolWindow(QWidget):
             raw_corr = "corr" if any(x in mag_col for x in ["corr", "cal"]) else "raw"
             corr_tag = _detect_corr_mode_from_df(df, path.name)
             corr_line = f"  detrend: {corr_tag}" if corr_tag else ""
-            workspace_name = Path(self.params.P.result_dir).name
+            workspace_dir = self._current_workspace_dir()
+            workspace_name = workspace_dir.name
             workspace_type = ""
             try:
                 from ...utils.run_workspace import load_run_manifest
-                run_meta = load_run_manifest(Path(self.params.P.result_dir))
+                run_meta = load_run_manifest(workspace_dir)
                 run_type = str(run_meta.get("run_type") or "").strip().lower()
                 if run_type:
                     workspace_type = f" [{run_type}]"
@@ -872,7 +887,7 @@ class TransitToolWindow(QWidget):
 
         # Check star overlay (flux-normalised)
         try:
-            _rd = Path(self.params.P.result_dir)
+            _rd = self._current_workspace_dir()
             _check_filter = _resolve_check_filter(self.lc_data.get("filters") if self.lc_data else None)
             _ck_id, _ck_df = _load_check_star_for_plot(_rd, filt=_check_filter)
             if _ck_df is not None and not _ck_df.empty:
@@ -1109,7 +1124,7 @@ class TransitToolWindow(QWidget):
 
         # Check star overlay on residual plot (if check star shows a dip → systematic)
         try:
-            _rd = Path(self.params.P.result_dir)
+            _rd = self._current_workspace_dir()
             _check_filter = _resolve_check_filter(self.lc_data.get("filters") if self.lc_data else None)
             _ck_id, _ck_df = _load_check_star_for_plot(_rd, filt=_check_filter)
             if _ck_df is not None and not _ck_df.empty:
