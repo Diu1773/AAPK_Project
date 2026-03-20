@@ -272,6 +272,7 @@ class DetrendNightMergeWindow(StepWindowBase):
         )
         if self.runtime_mode:
             self._setup_runtime_ui()
+            self.restore_state()
         else:
             self.setup_step_ui()
             self.restore_state()

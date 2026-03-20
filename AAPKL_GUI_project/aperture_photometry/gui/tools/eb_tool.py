@@ -182,6 +182,30 @@ def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
         return None, None
 
 
+def _pick_check_overlay_cols(df: pd.DataFrame, preferred_mag_col: str | None = None) -> tuple[str | None, str | None]:
+    time_col = next((c for c in ["BJD_TDB", "BJD", "bjd", "HJD", "hjd", "JD", "jd", "time"] if c in df.columns), None)
+    mag_candidates: list[str] = []
+    preferred = str(preferred_mag_col or "").strip()
+    if preferred:
+        if preferred == "diff_mag_corr":
+            mag_candidates.extend(["diff_mag_corr", "diff_mag_raw", "diff_mag", "mag"])
+        elif preferred == "diff_mag_raw":
+            mag_candidates.extend(["diff_mag_raw", "diff_mag_corr", "diff_mag", "mag"])
+        else:
+            mag_candidates.append(preferred)
+    mag_candidates.extend(["diff_mag_corr", "diff_mag_raw", "diff_mag", "mag_ensemble_corr", "mag"])
+    seen: set[str] = set()
+    mag_col = None
+    for col in mag_candidates:
+        if col in seen:
+            continue
+        seen.add(col)
+        if col in df.columns:
+            mag_col = col
+            break
+    return time_col, mag_col
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -512,6 +536,15 @@ class EclipsingBinaryToolWindow(QWidget):
         self.analysis_filter_combo.blockSignals(False)
         self.lc_status.setText(status)
         self.lc_status.setStyleSheet("color: #C62828;")
+        for canvas_name in ("pg_canvas", "ph_canvas", "oc_canvas"):
+            canvas = getattr(self, canvas_name, None)
+            if canvas is None:
+                continue
+            fig = getattr(canvas, "figure", None)
+            if fig is None:
+                continue
+            fig.clear()
+            canvas.draw_idle()
 
     def _load_paths(self, paths: list[Path]):
         try:
@@ -895,8 +928,7 @@ class EclipsingBinaryToolWindow(QWidget):
             _check_filter = _resolve_check_filter(self.lc_data.get("filters"))
             _ck_id, _ck_df = _load_check_star_for_plot(_rd, filt=_check_filter)
             if _ck_df is not None and not _ck_df.empty:
-                _t_col = next((c for c in ["JD", "bjd", "hjd", "time"] if c in _ck_df.columns), None)
-                _y_col = next((c for c in ["diff_mag_raw", "diff_mag", "mag"] if c in _ck_df.columns), None)
+                _t_col, _y_col = _pick_check_overlay_cols(_ck_df, self.lc_data.get("mag_col"))
                 if _t_col and _y_col:
                     _ct = pd.to_numeric(_ck_df[_t_col], errors="coerce").to_numpy(float)
                     _cm = pd.to_numeric(_ck_df[_y_col], errors="coerce").to_numpy(float)

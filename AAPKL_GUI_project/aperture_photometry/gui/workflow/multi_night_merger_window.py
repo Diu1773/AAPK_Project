@@ -1215,6 +1215,7 @@ class MultiNightMergerWindow(QMainWindow):
         self.btn_step10_run.setEnabled(False)
         self.step10_progress_label.setText("Building...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
         try:
             window = self._get_or_create_step10_runtime_window()
             self._step10_log_append(f"[MERGER] Building Step10 in {self.merged_result_dir}")
@@ -1238,8 +1239,10 @@ class MultiNightMergerWindow(QMainWindow):
         self.btn_step11_run.setEnabled(False)
         self.step11_progress_label.setText("Running...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
         try:
             window = self._get_or_create_step11_runtime_window()
+            window.restore_state()
             mode = str(self.step11_mode_combo.currentData() or "offset")
             window.mode = mode
             if mode == "global":
