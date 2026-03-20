@@ -1181,6 +1181,7 @@ class MultiNightMergerWindow(QMainWindow):
             self,
         )
         window.show_log_window = lambda: None
+        window.plot_current_comparison = lambda *args, **kwargs: None
         self._attach_runtime_log(window, self._step10_log_append)
         self.step10_runtime_window = window
         return window
@@ -1195,6 +1196,9 @@ class MultiNightMergerWindow(QMainWindow):
             self.merged_runtime_project_state,
             self,
         )
+        window._update_results_table = lambda *args, **kwargs: None
+        window._update_plots = lambda *args, **kwargs: None
+        window._update_analysis_panel = lambda *args, **kwargs: None
         self._attach_runtime_log(window, self._step11_log_append)
         self.step11_runtime_window = window
         return window
@@ -1460,9 +1464,21 @@ class MultiNightMergerWindow(QMainWindow):
             self.current_step_window.close()
 
         if step_index == 9:
-            self.current_step_window = self._get_or_create_step10_runtime_window()
+            from .step10_light_curve_builder import LightCurveBuilderWindow
+            self.current_step_window = LightCurveBuilderWindow(
+                self.merged_runtime_params,
+                self.merged_runtime_file_manager,
+                self.merged_runtime_project_state,
+                self,
+            )
         elif step_index == 10:
-            self.current_step_window = self._get_or_create_step11_runtime_window()
+            from .step11_detrend_merge import DetrendNightMergeWindow
+            self.current_step_window = DetrendNightMergeWindow(
+                self.merged_runtime_params,
+                self.merged_runtime_file_manager,
+                self.merged_runtime_project_state,
+                self,
+            )
         elif step_index == 11:
             from .step12_period_analysis import PeriodAnalysisWindow
             self.current_step_window = PeriodAnalysisWindow(
