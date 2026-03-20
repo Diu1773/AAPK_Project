@@ -4188,9 +4188,11 @@ class LightCurveBuilderWindow(StepWindowBase):
         self.log(f"[BUILD] Datasets: {len(self.datasets)}")
 
         # QC 요약 저장
-        if active_comp_ids:
+        if active_comp_ids and not self.runtime_mode:
             qc_rows = self._compute_comp_qc(self.datasets[0][1], target_id, active_comp_ids, verbose=False)
             self._save_comp_qc_summary(Path(self.datasets[0][1]), qc_rows)
+        elif active_comp_ids and self.runtime_mode:
+            self.log("[BUILD] Runtime mode: skip precomputing QC summary")
 
         combined_raw = []
         single_dataset_mode = len(self.datasets) == 1
