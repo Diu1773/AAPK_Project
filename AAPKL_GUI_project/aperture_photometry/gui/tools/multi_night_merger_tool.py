@@ -1758,8 +1758,3 @@ class MultiNightMergerWindow(QMainWindow):
         self._go_back()
         event.ignore()
 
-
-class MultiNightMergerToolWindow(MultiNightMergerWindow):
-    """Tool-facing alias kept for stable imports."""
-
-    pass

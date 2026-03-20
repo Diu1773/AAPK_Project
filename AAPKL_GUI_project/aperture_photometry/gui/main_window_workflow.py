@@ -533,7 +533,7 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 4:
-            from .workflow.step5_aperture_photometry import ForcedPhotometryWindow
+            from .workflow.step9_forced_photometry import ForcedPhotometryWindow
             self.current_step_window = ForcedPhotometryWindow(
                 self.params, self.file_manager, self.project_state, self
             )
@@ -543,12 +543,12 @@ class MainWindowWorkflow(QMainWindow):
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 6:
-            from .workflow.step7_ref_build import RefBuildWindow
+            from .workflow.step6_ref_build import RefBuildWindow
             self.current_step_window = RefBuildWindow(
                 self.params, self.file_manager, self.project_state, self
             )
         elif step_index == 7:
-            from .workflow.step8_star_id_matching import StarIdMatchingWindow
+            from .workflow.step7_star_id_matching import StarIdMatchingWindow
             self.current_step_window = StarIdMatchingWindow(
                 self.params, self.file_manager, self.project_state, self
             )
@@ -967,9 +967,9 @@ class MainWindowWorkflow(QMainWindow):
 
     def open_multi_night_merger(self):
         """Open Multi-Night Light Curve Merger (hides main window)."""
-        from .tools.multi_night_merger_tool import MultiNightMergerToolWindow
+        from .tools.multi_night_merger_tool import MultiNightMergerWindow
 
-        self.merger_window = MultiNightMergerToolWindow(
+        self.merger_window = MultiNightMergerWindow(
             self.params,
             self.project_state,
             main_window=self,
