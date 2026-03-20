@@ -46,10 +46,8 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
 
 from ...analysis.merge.id_match import (
-    append_folder_tag,
-    best_positional_match,
-    canonicalize_catalog_row,
     extract_row_float,
+    reconcile_workspace_catalogs,
 )
 from ...analysis.merge.workspace_scan import (
     default_merged_output_dir as _default_output_dir,
@@ -152,6 +150,7 @@ class MultiNightMergerWindow(QMainWindow):
         self._workspace_scan_cache: dict[str, tuple[tuple, dict]] = {}
         self._catalog_cache: dict[str, tuple[tuple, dict[str, pd.DataFrame]]] = {}
         self._selection_payload_cache: dict[str, tuple[tuple, dict[str, dict]]] = {}
+        self._id_match_cache: dict[tuple, dict] = {}
 
         self.match_summary_rows: list[dict] = []
         self.match_records: list[dict] = []
@@ -534,6 +533,13 @@ class MultiNightMergerWindow(QMainWindow):
         self._catalog_cache[cache_key] = (signature, catalogs)
         return catalogs
 
+    def _id_match_signature(self) -> tuple:
+        return (
+            tuple(str(folder.resolve()) for folder in self.folders),
+            tuple(self._step9_signature(folder) for folder in self.folders),
+            float(self.match_radius_combo.currentText()),
+        )
+
     def _refresh_output_dir_default(self, force: bool = False):
         if not self.folders:
             self.output_dir_edit.clear()
@@ -648,16 +654,6 @@ class MultiNightMergerWindow(QMainWindow):
 
     # ───────────────────────── Step 2: ID match ─────────────────────────
 
-    def _next_generated_negative_source_id(self, current_catalogs: dict[str, pd.DataFrame]) -> int:
-        min_sid = 0
-        for df in current_catalogs.values():
-            if df is None or df.empty or "source_id" not in df.columns:
-                continue
-            sid_vals = coerce_int64_source_id(df["source_id"]).dropna().astype("int64")
-            if not sid_vals.empty:
-                min_sid = min(min_sid, int(sid_vals.min()))
-        return min_sid - 1 if min_sid <= 0 else -1
-
     def _run_id_match(self):
         self.match_log.clear()
         self.match_table.setRowCount(0)
@@ -688,186 +684,24 @@ class MultiNightMergerWindow(QMainWindow):
             self.match_log.append("[ERR] 어떤 폴더에서도 master_catalog_*.tsv 를 찾지 못했습니다.")
             return
 
-        pos_tol = float(self.match_radius_combo.currentText())
-        next_negative_sid = self._next_generated_negative_source_id({})
-        canonical_by_filter: dict[str, pd.DataFrame] = {}
-        next_id_by_filter: dict[str, int] = {}
+        id_sig = self._id_match_signature()
+        cached = self._id_match_cache.get(id_sig)
+        if cached is None:
+            cached = reconcile_workspace_catalogs(
+                self.folders,
+                catalogs_by_folder,
+                self.folder_tags,
+                float(self.match_radius_combo.currentText()),
+                logger=self.match_log.append,
+            )
+            self._id_match_cache[id_sig] = cached
+        else:
+            self.match_log.append("[MATCH] Using cached ID match result")
 
-        for folder in self.folders:
-            folder_key = str(folder)
-            folder_tag = self.folder_tags[folder_key]
-            self.local_id_maps.setdefault(folder_key, {})
-            filter_catalogs = catalogs_by_folder.get(folder_key, {})
-
-            for flt in all_filters:
-                df = filter_catalogs.get(flt)
-                if df is None or df.empty:
-                    continue
-
-                if flt not in canonical_by_filter:
-                    canonical_by_filter[flt] = pd.DataFrame()
-                    next_id_by_filter[flt] = 1
-
-                canon = canonical_by_filter[flt].copy()
-                local_map: dict[int, dict[str, int]] = {}
-                n_exact = 0
-                n_pos = 0
-                n_new = 0
-
-                # Base folder seeds the canonical catalog and preserves its IDs/source_ids when possible.
-                if folder == base_folder and canon.empty:
-                    seeded_rows = []
-                    max_id = 0
-                    for _, row in df.iterrows():
-                        local_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
-                        if not np.isfinite(local_id):
-                            continue
-                        sid_val = coerce_int64_source_id(pd.Series([row.get("source_id")])).iloc[0]
-                        if pd.isna(sid_val):
-                            sid = next_negative_sid
-                            next_negative_sid -= 1
-                        else:
-                            sid = int(sid_val)
-                        merged_id = int(local_id)
-                        max_id = max(max_id, merged_id)
-                        seeded_rows.append(canonicalize_catalog_row(row, merged_id, sid, folder_tag))
-                        local_map[int(local_id)] = {
-                            "merged_id": merged_id,
-                            "merged_source_id": sid,
-                        }
-                        self.match_records.append({
-                            "folder": folder.name,
-                            "folder_tag": folder_tag,
-                            "filter": flt,
-                            "local_id": int(local_id),
-                            "local_source_id": None if pd.isna(sid_val) else int(sid_val),
-                            "merged_id": merged_id,
-                            "merged_source_id": sid,
-                            "method": "base",
-                            "sep_arcsec": np.nan,
-                            "status": "base",
-                        })
-                    canon = pd.DataFrame(seeded_rows)
-                    next_id_by_filter[flt] = max_id + 1 if max_id > 0 else 1
-                    canonical_by_filter[flt] = canon
-                    self.local_id_maps[folder_key][flt] = local_map
-                    self.match_summary_rows.append({
-                        "folder": folder.name,
-                        "filter": flt,
-                        "exact": len(seeded_rows),
-                        "pos": 0,
-                        "new": 0,
-                        "total": len(seeded_rows),
-                        "status": "base",
-                    })
-                    continue
-
-                canon_sid_map = {}
-                if not canon.empty and "source_id" in canon.columns:
-                    sid_vals = coerce_int64_source_id(canon["source_id"]).astype("Int64")
-                    for idx_row, sid_val in enumerate(sid_vals):
-                        if pd.notna(sid_val) and int(sid_val) not in canon_sid_map:
-                            canon_sid_map[int(sid_val)] = idx_row
-
-                used_canonical_sids: set[int] = set()
-                for _, row in df.iterrows():
-                    local_id = pd.to_numeric(pd.Series([row.get("ID")]), errors="coerce").iloc[0]
-                    if not np.isfinite(local_id):
-                        continue
-                    local_id = int(local_id)
-                    sid_val = coerce_int64_source_id(pd.Series([row.get("source_id")])).iloc[0]
-                    sid_int = None if pd.isna(sid_val) else int(sid_val)
-
-                    matched_sid = None
-                    match_method = ""
-                    sep_arcsec = float("nan")
-
-                    if sid_int is not None and sid_int in canon_sid_map:
-                        matched_sid = sid_int
-                        match_method = "source_id"
-                    else:
-                        matched_sid, sep_arcsec = best_positional_match(row, canon, pos_tol)
-                        if matched_sid is not None and matched_sid not in used_canonical_sids:
-                            match_method = "position"
-                        else:
-                            matched_sid = None
-
-                    if matched_sid is not None and matched_sid in canon_sid_map:
-                        canon_idx = canon_sid_map[matched_sid]
-                        merged_id = int(pd.to_numeric(pd.Series([canon.iloc[canon_idx]["ID"]]), errors="coerce").iloc[0])
-                        local_map[local_id] = {
-                            "merged_id": merged_id,
-                            "merged_source_id": int(matched_sid),
-                        }
-                        used_canonical_sids.add(int(matched_sid))
-                        if match_method == "source_id":
-                            n_exact += 1
-                        else:
-                            n_pos += 1
-                        canon.at[canon_idx, "folder_count"] = int(pd.to_numeric(pd.Series([canon.iloc[canon_idx].get("folder_count", 1)]), errors="coerce").iloc[0] or 1) + 1
-                        canon.at[canon_idx, "folder_tags"] = append_folder_tag(canon.iloc[canon_idx].get("folder_tags", ""), folder_tag)
-                        self.match_records.append({
-                            "folder": folder.name,
-                            "folder_tag": folder_tag,
-                            "filter": flt,
-                            "local_id": local_id,
-                            "local_source_id": sid_int,
-                            "merged_id": merged_id,
-                            "merged_source_id": int(matched_sid),
-                            "method": match_method,
-                            "sep_arcsec": sep_arcsec,
-                            "status": "matched",
-                        })
-                        continue
-
-                    # New canonical source.
-                    merged_id = next_id_by_filter.get(flt, 1)
-                    next_id_by_filter[flt] = merged_id + 1
-
-                    if sid_int is not None and sid_int not in canon_sid_map:
-                        merged_source_id = sid_int
-                    else:
-                        merged_source_id = next_negative_sid
-                        next_negative_sid -= 1
-
-                    new_row = canonicalize_catalog_row(row, merged_id, merged_source_id, folder_tag)
-                    canon = pd.concat([canon, pd.DataFrame([new_row])], ignore_index=True, sort=False)
-                    canon_sid_map[int(merged_source_id)] = len(canon) - 1
-                    local_map[local_id] = {
-                        "merged_id": merged_id,
-                        "merged_source_id": int(merged_source_id),
-                    }
-                    n_new += 1
-                    self.match_records.append({
-                        "folder": folder.name,
-                        "folder_tag": folder_tag,
-                        "filter": flt,
-                        "local_id": local_id,
-                        "local_source_id": sid_int,
-                        "merged_id": merged_id,
-                        "merged_source_id": int(merged_source_id),
-                        "method": "new",
-                        "sep_arcsec": np.nan,
-                        "status": "new",
-                    })
-
-                canon = canon.sort_values("ID").reset_index(drop=True)
-                canonical_by_filter[flt] = canon
-                self.local_id_maps[folder_key][flt] = local_map
-                self.match_summary_rows.append({
-                    "folder": folder.name,
-                    "filter": flt,
-                    "exact": n_exact,
-                    "pos": n_pos,
-                    "new": n_new,
-                    "total": len(local_map),
-                    "status": "OK" if local_map else "empty",
-                })
-                self.match_log.append(
-                    f"[MATCH] {folder.name} / {flt}: exact={n_exact} positional={n_pos} new={n_new} total={len(local_map)}"
-                )
-
-        self.merged_catalogs = canonical_by_filter
+        self.merged_catalogs = cached["canonical_by_filter"]
+        self.local_id_maps = cached["local_id_maps"]
+        self.match_summary_rows = cached["match_summary_rows"]
+        self.match_records = cached["match_records"]
         self._update_match_table()
         self._load_selection_defaults_from_base()
         self._refresh_selection_filter_combo()
