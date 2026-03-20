@@ -39,10 +39,18 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QComboBox,
     QAbstractItemView,
+    QCheckBox,
+    QDoubleSpinBox,
+    QSpinBox,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 
+from ...analysis.light_curve.period_analysis_service import run_period_analysis
+from ...analysis.light_curve.period_io_service import (
+    load_period_lightcurve_csv,
+    save_period_analysis_outputs,
+)
 from ...analysis.merge.id_match import (
     extract_row_float,
     reconcile_workspace_catalogs,
@@ -70,6 +78,7 @@ from ...utils.step_paths import (
     step10_dir,
     step11_dir,
     step12_period_dir,
+    find_best_lightcurve_csv,
 )
 class _MergedParamsProxy:
     """Read-only-ish params wrapper for merged runtime windows."""
@@ -98,6 +107,48 @@ class _MergedFileManagerProxy:
     def get_file_path(self, filename: str) -> Path | None:
         p = self.path_map.get(filename)
         return Path(p) if p else None
+
+
+class _MergerPeriodWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        lc_data: dict,
+        min_period: float,
+        max_period: float,
+        samples_per_peak: int,
+        methods: list[str],
+        pdm_n_bins: int,
+    ):
+        super().__init__()
+        self.lc_data = lc_data
+        self.min_period = min_period
+        self.max_period = max_period
+        self.samples_per_peak = samples_per_peak
+        self.methods = methods
+        self.pdm_n_bins = pdm_n_bins
+
+    def run(self):
+        try:
+            results = run_period_analysis(
+                time=self.lc_data["time"],
+                mag_raw=self.lc_data["mag_raw"],
+                mag_corr=self.lc_data["mag_corr"],
+                mag_err=self.lc_data["mag_err"],
+                min_period=self.min_period,
+                max_period=self.max_period,
+                samples_per_peak=self.samples_per_peak,
+                methods=self.methods,
+                pdm_n_bins=self.pdm_n_bins,
+                progress_cb=self.progress.emit,
+            )
+            self.finished.emit(results)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 class MultiNightMergerWindow(QMainWindow):
@@ -159,6 +210,8 @@ class MultiNightMergerWindow(QMainWindow):
         self.merged_runtime_params = None
         self.merged_runtime_project_state: ProjectState | None = None
         self.merged_runtime_file_manager = None
+        self.step12_worker: _MergerPeriodWorker | None = None
+        self.step12_lc_data: dict | None = None
 
         self.setWindowTitle("Multi-Night Merger Workflow")
         self.resize(1200, 820)
@@ -441,12 +494,80 @@ class MultiNightMergerWindow(QMainWindow):
         return page
 
     def _make_step6(self) -> QWidget:
-        page, label = self._make_child_step_page(
-            "Merged workspace의 Step 12 Period Analysis window를 엽니다.",
-            "Step 12 열기",
-            lambda: self.open_step(11),
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._make_info_label(
+            "Merged workspace에서 직접 Period Analysis를 실행합니다.\n"
+            "간단한 분석은 여기서 바로 돌리고, 고급 옵션은 Step 12 창을 열어 계속 작업할 수 있습니다."
+        ))
+
+        self.step12_status_label = QLabel("Merged workspace 없음")
+        self.step12_status_label.setStyleSheet("QLabel { background:#FAFAFA; padding:6px; border-radius:4px; }")
+        layout.addWidget(self.step12_status_label)
+
+        opts = QGroupBox("빠른 분석 옵션")
+        opts_layout = QHBoxLayout(opts)
+        self.step12_filter_combo = QComboBox()
+        self.step12_filter_combo.setMinimumWidth(90)
+        self.step12_filter_combo.addItem("(no data)")
+        self.step12_min_period_spin = QDoubleSpinBox()
+        self.step12_min_period_spin.setDecimals(6)
+        self.step12_min_period_spin.setRange(1e-6, 1e6)
+        self.step12_min_period_spin.setValue(0.01)
+        self.step12_max_period_spin = QDoubleSpinBox()
+        self.step12_max_period_spin.setDecimals(6)
+        self.step12_max_period_spin.setRange(1e-6, 1e6)
+        self.step12_max_period_spin.setValue(10.0)
+        self.step12_samples_spin = QSpinBox()
+        self.step12_samples_spin.setRange(2, 1000)
+        self.step12_samples_spin.setValue(10)
+        self.step12_pdm_bins_spin = QSpinBox()
+        self.step12_pdm_bins_spin.setRange(4, 100)
+        self.step12_pdm_bins_spin.setValue(10)
+        self.step12_chk_ls = QCheckBox("LS")
+        self.step12_chk_ls.setChecked(True)
+        self.step12_chk_pdm = QCheckBox("PDM")
+        self.step12_chk_bls = QCheckBox("BLS")
+        opts_layout.addWidget(QLabel("Filter"))
+        opts_layout.addWidget(self.step12_filter_combo)
+        opts_layout.addWidget(QLabel("Min P"))
+        opts_layout.addWidget(self.step12_min_period_spin)
+        opts_layout.addWidget(QLabel("Max P"))
+        opts_layout.addWidget(self.step12_max_period_spin)
+        opts_layout.addWidget(QLabel("Samples"))
+        opts_layout.addWidget(self.step12_samples_spin)
+        opts_layout.addWidget(QLabel("PDM bins"))
+        opts_layout.addWidget(self.step12_pdm_bins_spin)
+        opts_layout.addWidget(self.step12_chk_ls)
+        opts_layout.addWidget(self.step12_chk_pdm)
+        opts_layout.addWidget(self.step12_chk_bls)
+        opts_layout.addStretch()
+        layout.addWidget(opts)
+
+        btn_row = QHBoxLayout()
+        self.btn_step12_run = QPushButton("빠른 분석 실행")
+        self.btn_step12_run.setStyleSheet(
+            "QPushButton { background:#2E7D32; color:white; font-weight:bold; padding:6px 18px; }"
+            "QPushButton:hover { background:#1B5E20; }"
         )
-        self.step12_status_label = label
+        self.btn_step12_run.clicked.connect(self._run_step12_headless)
+        btn_row.addWidget(self.btn_step12_run)
+
+        btn_open = QPushButton("Step 12 창 열기")
+        btn_open.clicked.connect(lambda: self.open_step(11))
+        btn_row.addWidget(btn_open)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.step12_progress_label = QLabel("")
+        self.step12_progress_label.setStyleSheet("QLabel { color:#1565C0; }")
+        layout.addWidget(self.step12_progress_label)
+
+        self.step12_log = QTextEdit()
+        self.step12_log.setReadOnly(True)
+        self.step12_log.setMinimumHeight(180)
+        self.step12_log.setStyleSheet("font-size:8pt; font-family:monospace;")
+        layout.addWidget(self.step12_log)
         return page
 
     # ───────────────────────── folder scan ─────────────────────────
@@ -475,6 +596,7 @@ class MultiNightMergerWindow(QMainWindow):
         self.merged_runtime_params = None
         self.merged_runtime_project_state = None
         self.merged_runtime_file_manager = None
+        self.step12_lc_data = None
         if hasattr(self, "folder_info_table"):
             self.folder_info_table.setRowCount(0)
         if hasattr(self, "match_table"):
@@ -493,6 +615,10 @@ class MultiNightMergerWindow(QMainWindow):
             self.match_log.clear()
         if hasattr(self, "selection_log"):
             self.selection_log.clear()
+        if hasattr(self, "step12_log"):
+            self.step12_log.clear()
+        if hasattr(self, "step12_progress_label"):
+            self.step12_progress_label.setText("")
         if hasattr(self, "step10_status_label"):
             self._refresh_runtime_status_labels()
 
@@ -943,6 +1069,7 @@ class MultiNightMergerWindow(QMainWindow):
             self.step10_status_label.setText("Merged workspace 없음")
             self.step11_status_label.setText("Merged workspace 없음")
             self.step12_status_label.setText("Merged workspace 없음")
+            self._refresh_step12_filter_options()
             return
 
         s10 = step10_dir(merged_dir)
@@ -962,6 +1089,155 @@ class MultiNightMergerWindow(QMainWindow):
         self.step12_status_label.setText(
             f"Workspace: {merged_dir}\nStep12 outputs: {'있음' if s12_ready else '없음'}"
         )
+        self._refresh_step12_filter_options()
+
+    def _merged_step12_target_id(self) -> int | None:
+        if self.merged_result_dir is None:
+            return None
+        payloads = _load_selection_payloads(self.merged_result_dir)
+        target_ids = {
+            int(payload["target_id"])
+            for payload in payloads.values()
+            if payload.get("target_id") is not None
+        }
+        if len(target_ids) == 1:
+            return next(iter(target_ids))
+        return None
+
+    def _refresh_step12_filter_options(self):
+        if not hasattr(self, "step12_filter_combo"):
+            return
+        combo = self.step12_filter_combo
+        combo.blockSignals(True)
+        combo.clear()
+
+        merged_dir = self.merged_result_dir
+        target_id = self._merged_step12_target_id()
+        if merged_dir is None or target_id is None:
+            combo.addItem("(no data)")
+            combo.blockSignals(False)
+            self.btn_step12_run.setEnabled(False)
+            return
+
+        lc_path = find_best_lightcurve_csv(merged_dir, target_id)
+        filters: list[str] = []
+        if lc_path is not None and lc_path.exists():
+            try:
+                df = pd.read_csv(lc_path, usecols=lambda c: c == "filter")
+                if "filter" in df.columns:
+                    filters = sorted({
+                        str(v).strip()
+                        for v in df["filter"].dropna().astype(str).tolist()
+                        if str(v).strip()
+                    })
+            except Exception:
+                filters = []
+
+        if not filters:
+            combo.addItem("(no data)")
+            self.btn_step12_run.setEnabled(False)
+        else:
+            combo.addItems(filters)
+            self.btn_step12_run.setEnabled(True)
+        combo.blockSignals(False)
+
+    def _step12_log_append(self, msg: str):
+        if hasattr(self, "step12_log"):
+            self.step12_log.append(msg)
+
+    def _run_step12_headless(self):
+        merged_dir = self.merged_result_dir
+        if merged_dir is None:
+            QMessageBox.warning(self, "Period Analysis", "Merged workspace를 먼저 생성하세요.")
+            return
+        if self.step12_worker is not None and self.step12_worker.isRunning():
+            return
+
+        target_id = self._merged_step12_target_id()
+        if target_id is None:
+            QMessageBox.warning(self, "Period Analysis", "Merged target ID를 결정하지 못했습니다.")
+            return
+        flt = self.step12_filter_combo.currentText().strip()
+        if not flt or flt == "(no data)":
+            QMessageBox.warning(self, "Period Analysis", "분석할 필터가 없습니다.")
+            return
+
+        lc_path = find_best_lightcurve_csv(merged_dir, target_id)
+        if lc_path is None or not lc_path.exists():
+            QMessageBox.warning(self, "Period Analysis", "Step10/11 light curve를 찾지 못했습니다.")
+            return
+
+        min_period = self.step12_min_period_spin.value()
+        max_period = self.step12_max_period_spin.value()
+        if min_period >= max_period:
+            QMessageBox.warning(self, "Period Analysis", "Min period must be less than max period.")
+            return
+
+        methods: list[str] = []
+        if self.step12_chk_ls.isChecked():
+            methods.append("ls")
+        if self.step12_chk_pdm.isChecked():
+            methods.append("pdm")
+        if self.step12_chk_bls.isChecked():
+            methods.append("bls")
+        if not methods:
+            QMessageBox.warning(self, "Period Analysis", "최소 1개 방법을 선택하세요.")
+            return
+
+        try:
+            self.step12_lc_data = load_period_lightcurve_csv(lc_path, flt, target_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Period Analysis", str(e))
+            self._step12_log_append(f"[ERROR] {e}")
+            return
+
+        self.btn_step12_run.setEnabled(False)
+        self.step12_progress_label.setText("Computing...")
+        self._step12_log_append(f"Loading: {lc_path}")
+        self._step12_log_append(
+            f"Filter: {flt}, Target ID: {target_id}, "
+            f"Detrend: {self.step12_lc_data.get('corr_mode_label', 'Unknown')}"
+        )
+        self.step12_worker = _MergerPeriodWorker(
+            lc_data=self.step12_lc_data,
+            min_period=min_period,
+            max_period=max_period,
+            samples_per_peak=self.step12_samples_spin.value(),
+            methods=methods,
+            pdm_n_bins=self.step12_pdm_bins_spin.value(),
+        )
+        self.step12_worker.progress.connect(self._on_step12_run_progress)
+        self.step12_worker.finished.connect(self._on_step12_run_finished)
+        self.step12_worker.error.connect(self._on_step12_run_error)
+        self.step12_worker.start()
+
+    def _on_step12_run_progress(self, msg: str):
+        self.step12_progress_label.setText(msg)
+        self._step12_log_append(msg)
+
+    def _on_step12_run_error(self, msg: str):
+        self.step12_worker = None
+        self.btn_step12_run.setEnabled(True)
+        self.step12_progress_label.setText("Error")
+        self._step12_log_append(f"[ERROR] {msg}")
+        QMessageBox.warning(self, "Period Analysis", msg)
+
+    def _on_step12_run_finished(self, results: dict):
+        self.step12_worker = None
+        self.btn_step12_run.setEnabled(True)
+        self.step12_progress_label.setText("Done")
+        if self.merged_result_dir is None or self.step12_lc_data is None:
+            return
+        summary_path = save_period_analysis_outputs(
+            result_dir=self.merged_result_dir,
+            lc_data=self.step12_lc_data,
+            results=results,
+            min_period=self.step12_min_period_spin.value(),
+            max_period=self.step12_max_period_spin.value(),
+        )
+        self._step12_log_append(f"Saved: {summary_path}")
+        self._step12_log_append("Analysis complete")
+        self._refresh_runtime_status_labels()
 
     def on_step_completed(self, step_index: int):
         self._refresh_runtime_status_labels()
