@@ -127,6 +127,11 @@ from ...utils.step_paths import (
     tool_extinction_dir,
 )
 from ...utils.qc_utils import load_frame_excludes, save_frame_excludes as save_frame_excludes_file
+from ...analysis.light_curve.lightcurve_output_service import (
+    annotate_raw_lightcurve,
+    save_combined_raw_outputs,
+    save_dataset_raw_outputs,
+)
 
 
 def _safe_int_list(text: str) -> list[int]:
@@ -4160,14 +4165,7 @@ class LightCurveBuilderWindow(StepWindowBase):
             qc_rows = self._compute_comp_qc(self.datasets[0][1], target_id, active_comp_ids, verbose=False)
             self._save_comp_qc_summary(Path(self.datasets[0][1]), qc_rows)
 
-        P = self.params.P
-        color_index_by_filter = _normalize_color_index_by_filter(
-            getattr(P, "lightcurve_color_index_by_filter", {})
-        )
-
         combined_raw = []
-        base_dir = step10_dir(self.params.P.result_dir)
-        base_dir.mkdir(parents=True, exist_ok=True)
         single_dataset_mode = len(self.datasets) == 1
         for label, result_dir in self.datasets:
             result_dir = Path(result_dir)
@@ -4175,124 +4173,42 @@ class LightCurveBuilderWindow(StepWindowBase):
             if raw_df.empty:
                 self.log(f"[{label}] Raw light curve empty")
                 continue
-            raw_df = raw_df.copy()
-            raw_df["dataset"] = label
-            raw_df["diff_mag"] = raw_df["diff_mag_raw"]
-
-            # Auto-compute color indices from raw_df (already has mag, comp_avg per filter)
-            available_filters = {_normalize_filter_key(f) for f in raw_df["filter"].astype(str).unique() if f}
-            color_pair = _auto_detect_color_index(available_filters)
-
-            if color_pair and "mag" in raw_df.columns and "comp_avg" in raw_df.columns:
-                f_blue, f_red = color_pair
-                self.log(f"[{label}] Auto-detected color index: {f_blue}-{f_red}")
-
-                # Compute median mag per filter from raw_df
-                target_mags_by_filter = {}
-                comp_mags_by_filter = {}
-                for fkey, sub in raw_df.groupby(raw_df["filter"].astype(str).map(_normalize_filter_key)):
-                    t_vals = sub["mag"].dropna()
-                    c_vals = sub["comp_avg"].dropna()
-                    if len(t_vals) > 0:
-                        target_mags_by_filter[fkey] = float(np.nanmedian(t_vals))
-                    if len(c_vals) > 0:
-                        comp_mags_by_filter[fkey] = float(np.nanmedian(c_vals))
-
-                # Calculate color index
-                t_blue = target_mags_by_filter.get(f_blue, np.nan)
-                t_red = target_mags_by_filter.get(f_red, np.nan)
-                c_blue = comp_mags_by_filter.get(f_blue, np.nan)
-                c_red = comp_mags_by_filter.get(f_red, np.nan)
-
-                target_color = t_blue - t_red if np.isfinite(t_blue) and np.isfinite(t_red) else np.nan
-                comp_color = c_blue - c_red if np.isfinite(c_blue) and np.isfinite(c_red) else np.nan
-
-                if np.isfinite(target_color):
-                    self.log(f"[{label}] Target color ({f_blue}-{f_red}): {target_color:.3f}")
-                if np.isfinite(comp_color):
-                    self.log(f"[{label}] Comp color ({f_blue}-{f_red}): {comp_color:.3f}")
-                if np.isfinite(target_color) and np.isfinite(comp_color):
-                    delta_c = target_color - comp_color
-                    self.log(f"[{label}] ΔC (target - comp): {delta_c:.3f}")
-
-                raw_df["color_index"] = target_color
-                raw_df["color_index_ref"] = comp_color
-                raw_df["color_pair"] = f"{f_blue}-{f_red}"
-            else:
-                self.log(f"[{label}] No color index available (need 2+ filters: g/r, B/V, etc.)")
-                raw_df["color_index"] = np.nan
-                raw_df["color_index_ref"] = np.nan
-
-            out_dir = step10_dir(result_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"lightcurve_ID{target_id}_raw.csv"
-            raw_df.to_csv(out_path, index=False)
-            self.log(f"[{label}] Saved {out_path.name}")
+            raw_df = annotate_raw_lightcurve(raw_df, label, logger=self.log)
 
             # Export check star light curve if defined
+            check_ids_by_filter = {}
+            check_df = pd.DataFrame()
             try:
                 check_ids_by_filter, check_df = self._build_check_star_series(
                     result_dir,
                     active_comp_ids,
                     verbose=False,
                 )
-                if not check_df.empty:
-                    check_df.to_csv(out_dir / "lightcurve_check_combined_raw.csv", index=False)
-                    for filt_key, check_id in sorted(check_ids_by_filter.items()):
-                        part = check_df[
-                            check_df["filter"].astype(str).map(_normalize_filter_key) == filt_key
-                        ].copy()
-                        if part.empty:
-                            continue
-                        part_path = out_dir / f"lightcurve_check_{filt_key}_ID{int(check_id)}_raw.csv"
-                        part.to_csv(part_path, index=False)
-                        self.log(f"  Check star saved → {part_path.name}")
-                    if "check_id" in check_df.columns:
-                        for check_id in sorted({
-                            int(x) for x in pd.to_numeric(check_df["check_id"], errors="coerce").dropna().astype(int).tolist()
-                        }):
-                            part = check_df[pd.to_numeric(check_df["check_id"], errors="coerce") == int(check_id)].copy()
-                            if part.empty:
-                                continue
-                            legacy_path = out_dir / f"lightcurve_check_ID{int(check_id)}_raw.csv"
-                            part.to_csv(legacy_path, index=False)
-                elif check_ids_by_filter:
+                if check_ids_by_filter and check_df.empty:
                     self.log("  Check star configured but no usable check-star light curve was built")
             except Exception as e:
                 self.log(f"  Check star export failed: {e}")
 
+            save_dataset_raw_outputs(
+                result_dir=result_dir,
+                target_id=target_id,
+                raw_df=raw_df,
+                check_ids_by_filter=check_ids_by_filter,
+                check_df=check_df,
+                logger=self.log,
+            )
             combined_raw.append(raw_df)
 
         # combined outputs
-        if combined_raw:
-            comb = pd.concat(combined_raw, ignore_index=True)
-            comb = comb.sort_values("JD")
-            comb_path = base_dir / f"lightcurve_combined_ID{target_id}_raw.csv"
-            if single_dataset_mode:
-                if comb_path.exists():
-                    try:
-                        comb_path.unlink()
-                        self.log(f"[combined] Removed stale {comb_path.name} (single dataset)")
-                    except Exception as e:
-                        self.log(f"[combined] Failed to remove stale {comb_path.name}: {e}")
-                self.log("[combined] Skipped combined raw output (single dataset)")
-            else:
-                comb.to_csv(comb_path, index=False)
-                self.log(f"[combined] Saved {comb_path.name}")
-
-        # comp selection 저장
-        if combined_raw:
-            sel_path = step10_dir(self.params.P.result_dir) / "comp_selection.json"
-            payload = {
-                "target_id": target_id,
-                "comp_candidate_ids": [int(x) for x in self.comp_candidate_ids],
-                "comp_active_ids": [int(x) for x in active_comp_ids],
-            }
-            try:
-                sel_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                self.log(f"[combined] Saved {sel_path.name}")
-            except Exception as e:
-                self.log(f"[WARN] Failed to save comp_selection.json: {e}")
+        save_combined_raw_outputs(
+            base_result_dir=Path(self.params.P.result_dir),
+            target_id=target_id,
+            combined_raw=combined_raw,
+            single_dataset_mode=single_dataset_mode,
+            comp_candidate_ids=self.comp_candidate_ids,
+            active_comp_ids=active_comp_ids,
+            logger=self.log,
+        )
 
         self.log("=" * 60)
         self.log("[BUILD] Light Curve Build Complete (RAW)")
