@@ -1390,19 +1390,29 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             self._update_analysis_panel()
         return True
 
-    def _load_global_ensemble_df(self) -> pd.DataFrame:
+    def _load_global_ensemble_df(
+        self,
+        target_id_override: int | None = None,
+        comp_ids_override: list[int] | None = None,
+    ) -> pd.DataFrame:
         if not self.datasets:
             raise RuntimeError("No datasets available")
 
-        target_text = self.target_edit.text().strip()
-        if not target_text:
-            raise RuntimeError("Target ID is required")
-        target_id = int(target_text)
+        if target_id_override is not None:
+            target_id = int(target_id_override)
+        else:
+            target_text = self.target_edit.text().strip()
+            if not target_text:
+                raise RuntimeError("Target ID is required")
+            target_id = int(target_text)
 
-        if not self.comp_active_ids and not self.comp_candidate_ids:
-            self._load_comp_selection()
-        comp_ids = self.comp_active_ids or self.comp_candidate_ids
-        comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
+        if comp_ids_override is not None:
+            comp_ids = [int(c) for c in comp_ids_override if str(c).strip() and int(c) != target_id]
+        else:
+            if not self.comp_active_ids and not self.comp_candidate_ids:
+                self._load_comp_selection()
+            comp_ids = self.comp_active_ids or self.comp_candidate_ids
+            comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
         if not comp_ids:
             raise RuntimeError("Comparison IDs not found")
 
@@ -2067,6 +2077,46 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         if self.x_axis_mode == "phase":
             self._update_plots()
 
+    def _sync_state_from_controls(self) -> None:
+        self.mode = "offset"
+        if self.mode_color.isChecked():
+            self.mode = "color"
+        if self.mode_global.isChecked():
+            self.mode = "global"
+        self.sigma_clip = bool(self.chk_clip.isChecked())
+        self.clip_sigma = float(self.spin_clip.value())
+        self.clip_iters = int(self.spin_iters.value())
+        self.phase_period = float(self.spin_period.value())
+        self.phase_t0 = float(self.spin_t0.value())
+        if hasattr(self, "spin_cycles"):
+            self.phase_cycles = float(self.spin_cycles.value())
+        if hasattr(self, "phase_mode_combo"):
+            self.x_axis_mode = "phase" if self.phase_mode_combo.currentIndex() == 1 else "time"
+        if hasattr(self, "color_by_combo"):
+            self.color_by = str(self.color_by_combo.currentText() or self.color_by)
+        if hasattr(self, "spin_global_min_comps"):
+            self.global_min_comps = int(self.spin_global_min_comps.value())
+        if hasattr(self, "spin_global_sigma"):
+            self.global_sigma = float(self.spin_global_sigma.value())
+        if hasattr(self, "spin_global_iters"):
+            self.global_iters = int(self.spin_global_iters.value())
+        if hasattr(self, "spin_global_rms_pct"):
+            self.global_rms_pct = float(self.spin_global_rms_pct.value())
+        if hasattr(self, "spin_global_rms_thr"):
+            self.global_rms_threshold = float(self.spin_global_rms_thr.value())
+        if hasattr(self, "spin_global_frame_sigma"):
+            self.global_frame_sigma = float(self.spin_global_frame_sigma.value())
+        if hasattr(self, "combo_global_gauge"):
+            self.global_gauge = str(self.combo_global_gauge.currentText() or self.global_gauge)
+        if hasattr(self, "chk_global_robust"):
+            self.global_robust = bool(self.chk_global_robust.isChecked())
+        if hasattr(self, "chk_global_interp"):
+            self.global_interp_missing = bool(self.chk_global_interp.isChecked())
+        if hasattr(self, "chk_global_normalize"):
+            self.global_normalize = bool(self.chk_global_normalize.isChecked())
+        if hasattr(self, "chk_global_rescale_err"):
+            self.global_rescale_errors = bool(self.chk_global_rescale_err.isChecked())
+
     def _auto_set_t0(self):
         """Set T0 to min(JD) from loaded data."""
         if self.raw_df.empty:
@@ -2086,17 +2136,40 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
     def _mask_by_ranges(self, df: pd.DataFrame) -> np.ndarray:
         return np.ones(len(df), dtype=bool)
 
-    def fit_and_apply(self):
+    def fit_and_apply(
+        self,
+        update_ui: bool = True,
+        save_outputs: bool = True,
+        selected_dates: set[str] | None = None,
+        use_global_k2: bool | None = None,
+        target_id_override: int | None = None,
+        comp_ids_override: list[int] | None = None,
+        sync_controls: bool = True,
+    ):
+        if sync_controls:
+            self._sync_state_from_controls()
         if self.mode == "global":
-            self._run_global_ensemble()
+            self._run_global_ensemble(
+                update_ui=update_ui,
+                save_outputs=save_outputs,
+                target_id_override=target_id_override,
+                comp_ids_override=comp_ids_override,
+                sync_controls=False,
+            )
             return
         if self.raw_df.empty:
-            QMessageBox.information(self, "Detrend", "Raw 데이터가 없습니다.")
+            if update_ui:
+                QMessageBox.information(self, "Detrend", "Raw 데이터가 없습니다.")
+            else:
+                raise RuntimeError("Raw 데이터가 없습니다.")
             return
 
-        dates = self._selected_dates()
+        dates = set(selected_dates or self._selected_dates())
         if not dates:
-            QMessageBox.information(self, "Detrend", "날짜를 하나 이상 선택하세요.")
+            if update_ui:
+                QMessageBox.information(self, "Detrend", "날짜를 하나 이상 선택하세요.")
+            else:
+                raise RuntimeError("날짜를 하나 이상 선택하세요.")
             return
 
         # Color mode validation
@@ -2110,22 +2183,28 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                     "• Step 10에서 color_index 컬럼이 있는 데이터 생성\n\n"
                     "현재는 Offset 모드로 진행합니다."
                 )
-                QMessageBox.warning(self, "Color Mode", msg)
-                self.color_status_label.setText("⚠ ΔC 없음 - Offset 모드 사용")
+                if update_ui:
+                    QMessageBox.warning(self, "Color Mode", msg)
+                    self.color_status_label.setText("⚠ ΔC 없음 - Offset 모드 사용")
                 self.mode = "offset"
-                self.mode_offset.setChecked(True)
+                if update_ui:
+                    self.mode_offset.setChecked(True)
             else:
-                self.color_status_label.setText("")
-        self._set_busy_state(True, "Preparing fit...")
+                if update_ui:
+                    self.color_status_label.setText("")
+        if use_global_k2 is None:
+            use_global_k2 = bool(self.chk_global_k2.isChecked())
+        if update_ui:
+            self._set_busy_state(True, "Preparing fit...")
         try:
             fit_df = self.raw_df
-            use_global_k2 = self.chk_global_k2.isChecked()
 
             # Color mode with global k'' fitting
             global_k2_by_filter: dict[str, tuple[float, float]] = {}
 
             if self.mode == "color" and use_global_k2:
-                self._set_busy_message("Fitting global k''...")
+                if update_ui:
+                    self._set_busy_message("Fitting global k''...")
                 self.log("[FIT] Global k'' fitting mode enabled")
                 all_filters = [""]
                 if "filter" in fit_df.columns:
@@ -2169,7 +2248,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                         self.log(f"  → Airmass 범위 ΔX = {x_range:.3f} (좁으면 피팅 불안정)")
                         self.log(f"  → Offset 모드 권장 (k'' 피팅 불가)")
 
-            self._set_busy_message("Fitting nightly groups...")
+            if update_ui:
+                self._set_busy_message("Fitting nightly groups...")
             params_rows = []
             for date_val in sorted(dates):
                 sub_date = fit_df[fit_df["date"].astype(str) == str(date_val)]
@@ -2272,24 +2352,33 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
 
             if not params_rows:
                 self.log("[FIT] No fit groups. Check airmass/ΔC/Date selection.")
-                QMessageBox.information(self, "Detrend", "피팅할 데이터가 없습니다.")
+                if update_ui:
+                    QMessageBox.information(self, "Detrend", "피팅할 데이터가 없습니다.")
+                else:
+                    raise RuntimeError("피팅할 데이터가 없습니다.")
                 return
 
-            self._set_busy_message("Applying corrections...")
+            if update_ui:
+                self._set_busy_message("Applying corrections...")
             self.params_df = pd.DataFrame(params_rows)
             self.corrected_df = self._apply_params(self.raw_df, self.params_df)
 
-            self._set_busy_message("Refreshing plots...")
-            self._update_results_table()
-            self._update_plots()
-            self._update_analysis_panel()
+            if update_ui:
+                self._set_busy_message("Refreshing plots...")
+                self._update_results_table()
+                self._update_plots()
+                self._update_analysis_panel()
             self.log(f"[FIT] Applied corrections for {len(self.params_df)} groups")
-            self._log_fit_summary()
+            if update_ui:
+                self._log_fit_summary()
 
-            self._set_busy_message("Saving outputs...")
-            self._save_comprehensive_results()
+            if save_outputs:
+                if update_ui:
+                    self._set_busy_message("Saving outputs...")
+                self._save_comprehensive_results()
         finally:
-            self._set_busy_state(False)
+            if update_ui:
+                self._set_busy_state(False)
 
     def _apply_bjd_to_raw_df(self, target_id: int | None = None) -> None:
         """Convert raw_df["JD"] (plain JD_UTC) to BJD_TDB in-place when possible."""
@@ -2334,38 +2423,43 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             delta = np.nanmedian(bjd_arr[valid] - jd_arr[valid]) * 86400
             self.log(f"[BJD] JD → BJD_TDB applied ({valid.sum()} pts, median correction {delta:+.1f}s)")
 
-    def _run_global_ensemble(self) -> None:
-        self._set_busy_state(True, "Loading Step 5 photometry...")
+    def _run_global_ensemble(
+        self,
+        update_ui: bool = True,
+        save_outputs: bool = True,
+        target_id_override: int | None = None,
+        comp_ids_override: list[int] | None = None,
+        sync_controls: bool = True,
+    ) -> None:
+        if sync_controls:
+            self._sync_state_from_controls()
+        if update_ui:
+            self._set_busy_state(True, "Loading Step 5 photometry...")
         try:
             try:
-                df_global = self._load_global_ensemble_df()
+                df_global = self._load_global_ensemble_df(
+                    target_id_override=target_id_override,
+                    comp_ids_override=comp_ids_override,
+                )
             except Exception as e:
-                QMessageBox.warning(self, "Global Ensemble", str(e))
+                if update_ui:
+                    QMessageBox.warning(self, "Global Ensemble", str(e))
+                else:
+                    raise
                 return
 
-            target_text = self.target_edit.text().strip()
-            if not target_text:
-                QMessageBox.warning(self, "Global Ensemble", "Target ID가 필요합니다.")
-                return
-            target_id = int(target_text)
-
-            comp_ids = self.comp_active_ids or self.comp_candidate_ids
-            comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
+            target_id = int(target_id_override) if target_id_override is not None else int(self.target_edit.text().strip())
+            if comp_ids_override is not None:
+                comp_ids = [int(c) for c in comp_ids_override if str(c).strip() and int(c) != target_id]
+            else:
+                comp_ids = self.comp_active_ids or self.comp_candidate_ids
+                comp_ids = [int(c) for c in comp_ids if str(c).strip() and int(c) != target_id]
             if not comp_ids:
-                QMessageBox.warning(self, "Global Ensemble", "비교성 ID가 필요합니다.")
+                if update_ui:
+                    QMessageBox.warning(self, "Global Ensemble", "비교성 ID가 필요합니다.")
+                else:
+                    raise RuntimeError("비교성 ID가 필요합니다.")
                 return
-
-            self.global_min_comps = int(self.spin_global_min_comps.value())
-            self.global_sigma = float(self.spin_global_sigma.value())
-            self.global_iters = int(self.spin_global_iters.value())
-            self.global_rms_pct = float(self.spin_global_rms_pct.value())
-            self.global_rms_threshold = float(self.spin_global_rms_thr.value())
-            self.global_frame_sigma = float(self.spin_global_frame_sigma.value())
-            self.global_gauge = str(self.combo_global_gauge.currentText())
-            self.global_robust = bool(self.chk_global_robust.isChecked())
-            self.global_interp_missing = bool(self.chk_global_interp.isChecked())
-            self.global_normalize = bool(self.chk_global_normalize.isChecked())
-            self.global_rescale_errors = bool(self.chk_global_rescale_err.isChecked())
 
             self.log(
                 "[GLOBAL] min_comps={mc} sigma={sg} iters={it} rms_pct={rp} rms_thr={rt} frame_sigma={fs} gauge={g}".format(
@@ -2379,7 +2473,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                 )
             )
 
-            self._set_busy_message("Solving global ensemble...")
+            if update_ui:
+                self._set_busy_message("Solving global ensemble...")
             try:
                 result = solve_global_ensemble(
                     df_global,
@@ -2400,7 +2495,10 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                     log=self.log,
                 )
             except Exception as e:
-                QMessageBox.warning(self, "Global Ensemble", f"Fit failed: {e}")
+                if update_ui:
+                    QMessageBox.warning(self, "Global Ensemble", f"Fit failed: {e}")
+                else:
+                    raise
                 return
 
             self.global_input_df = df_global
@@ -2423,18 +2521,22 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             self._fill_night_id()
             self.corrected_df = self.raw_df.copy()
 
-            self._set_busy_message("Refreshing plots...")
-            self._populate_date_list()
-            self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
-            self._update_results_table()
-            self._update_plots()
-            self._update_analysis_panel()
+            if update_ui:
+                self._set_busy_message("Refreshing plots...")
+                self._populate_date_list()
+                self._refresh_filter_combo(self.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
+                self._update_results_table()
+                self._update_plots()
+                self._update_analysis_panel()
             self.log("[GLOBAL] Fit complete")
 
-            self._set_busy_message("Saving outputs...")
-            self._save_comprehensive_results()
+            if save_outputs:
+                if update_ui:
+                    self._set_busy_message("Saving outputs...")
+                self._save_comprehensive_results()
         finally:
-            self._set_busy_state(False)
+            if update_ui:
+                self._set_busy_state(False)
 
     def _log_fit_summary(self):
         """Log fit summary with astronomical interpretation."""

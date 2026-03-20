@@ -152,6 +152,87 @@ class _MergerPeriodWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
+class _MergerStep10Worker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, window, target_id: int, comp_ids: list[int]):
+        super().__init__()
+        self.window = window
+        self.target_id = int(target_id)
+        self.comp_ids = [int(c) for c in comp_ids]
+
+    def run(self):
+        original_log = getattr(self.window, "log", None)
+
+        def _worker_log(msg, *args, **kwargs):
+            self.progress.emit(str(msg))
+
+        try:
+            self.window.log = _worker_log
+            summary = self.window._build_light_curve_core(self.target_id, list(self.comp_ids))
+            self.finished.emit(summary or {})
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            if original_log is not None:
+                self.window.log = original_log
+
+
+class _MergerStep11Worker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        window,
+        selected_dates: set[str],
+        use_global_k2: bool,
+        target_id: int | None,
+        comp_ids: list[int],
+    ):
+        super().__init__()
+        self.window = window
+        self.selected_dates = set(selected_dates)
+        self.use_global_k2 = bool(use_global_k2)
+        self.target_id = int(target_id) if target_id is not None else None
+        self.comp_ids = [int(c) for c in comp_ids]
+
+    def run(self):
+        original_log = getattr(self.window, "log", None)
+
+        def _worker_log(msg, *args, **kwargs):
+            self.progress.emit(str(msg))
+
+        try:
+            self.window.log = _worker_log
+            self.window.fit_and_apply(
+                update_ui=False,
+                save_outputs=False,
+                selected_dates=self.selected_dates,
+                use_global_k2=self.use_global_k2,
+                target_id_override=self.target_id,
+                comp_ids_override=self.comp_ids,
+                sync_controls=False,
+            )
+            self.finished.emit(
+                {
+                    "mode": str(getattr(self.window, "mode", "offset")),
+                    "n_params": int(len(getattr(self.window, "params_df", []))),
+                    "n_points": int(len(getattr(self.window, "corrected_df", []))),
+                }
+            )
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            if original_log is not None:
+                self.window.log = original_log
+
+
 class MultiNightMergerWindow(QMainWindow):
     """Merger workflow for previously processed result folders."""
 
@@ -213,6 +294,8 @@ class MultiNightMergerWindow(QMainWindow):
         self.merged_runtime_file_manager = None
         self.step10_runtime_window = None
         self.step11_runtime_window = None
+        self.step10_worker: _MergerStep10Worker | None = None
+        self.step11_worker: _MergerStep11Worker | None = None
         self.step12_worker: _MergerPeriodWorker | None = None
         self.step12_lc_data: dict | None = None
 
@@ -1212,6 +1295,10 @@ class MultiNightMergerWindow(QMainWindow):
         if self.merged_result_dir is None:
             QMessageBox.warning(self, "Light Curve", "Merged workspace를 먼저 생성하세요.")
             return
+        if self.step10_worker is not None:
+            QMessageBox.information(self, "Light Curve", "이미 Step10 생성이 진행 중입니다.")
+            return
+        from .step10_light_curve_builder import _load_selection_ids, _safe_int_list
         self.btn_step10_run.setEnabled(False)
         self.step10_progress_label.setText("Building...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1219,22 +1306,40 @@ class MultiNightMergerWindow(QMainWindow):
         try:
             window = self._get_or_create_step10_runtime_window()
             self._step10_log_append(f"[MERGER] Building Step10 in {self.merged_result_dir}")
-            window.build_light_curve()
-            self.step11_runtime_window = None
-            self.step12_lc_data = None
+            target_text = window.target_edit.text().strip()
+            comp_ids = _safe_int_list(window.comp_edit.text())
+            if not target_text or not comp_ids:
+                target_id, loaded_comp_ids = _load_selection_ids(self.merged_result_dir)
+                if not target_text and target_id is not None:
+                    target_text = str(int(target_id))
+                if not comp_ids:
+                    comp_ids = list(loaded_comp_ids)
+            if not target_text:
+                raise RuntimeError("대상 ID가 필요합니다.")
+            if not comp_ids:
+                raise RuntimeError("비교성 ID가 필요합니다.")
+            window.target_edit.setText(str(target_text))
+            window.comp_edit.setText(",".join(str(int(c)) for c in comp_ids))
+            target_id = int(target_text)
+            self.step10_worker = _MergerStep10Worker(window, target_id, comp_ids)
+            self.step10_worker.progress.connect(self._on_step10_run_progress)
+            self.step10_worker.finished.connect(self._on_step10_run_finished)
+            self.step10_worker.error.connect(self._on_step10_run_error)
+            self.step10_worker.start()
             self._refresh_runtime_status_labels()
-            self.step10_progress_label.setText("Done")
         except Exception as e:
             self.step10_progress_label.setText("Error")
             self._step10_log_append(f"[ERROR] {e}")
             QMessageBox.warning(self, "Light Curve", str(e))
-        finally:
             QApplication.restoreOverrideCursor()
             self.btn_step10_run.setEnabled(True)
 
     def _run_step11_inline(self):
         if self.merged_result_dir is None:
             QMessageBox.warning(self, "Detrend", "Merged workspace를 먼저 생성하세요.")
+            return
+        if self.step11_worker is not None:
+            QMessageBox.information(self, "Detrend", "이미 Step11 보정이 진행 중입니다.")
             return
         self.btn_step11_run.setEnabled(False)
         self.step11_progress_label.setText("Running...")
@@ -1253,18 +1358,122 @@ class MultiNightMergerWindow(QMainWindow):
                 window.mode_offset.setChecked(True)
             if hasattr(window, "chk_global_k2"):
                 window.chk_global_k2.setChecked(bool(self.step11_global_k2_quick.isChecked()))
+            window._sync_state_from_controls()
+            window._load_comp_selection()
+            target_text = window.target_edit.text().strip()
+            target_id = int(target_text) if target_text else None
+            comp_ids = [int(c) for c in (window.comp_active_ids or window.comp_candidate_ids or [])]
+            selected_dates = set(window._selected_dates())
+            use_global_k2 = bool(window.chk_global_k2.isChecked()) if hasattr(window, "chk_global_k2") else False
             self._step11_log_append(f"[MERGER] Running Step11 mode={mode}")
-            window.fit_and_apply()
-            self.step12_lc_data = None
+            self.step11_worker = _MergerStep11Worker(
+                window=window,
+                selected_dates=selected_dates,
+                use_global_k2=use_global_k2,
+                target_id=target_id,
+                comp_ids=comp_ids,
+            )
+            self.step11_worker.progress.connect(self._on_step11_run_progress)
+            self.step11_worker.finished.connect(self._on_step11_run_finished)
+            self.step11_worker.error.connect(self._on_step11_run_error)
+            self.step11_worker.start()
             self._refresh_runtime_status_labels()
-            self.step11_progress_label.setText("Done")
         except Exception as e:
             self.step11_progress_label.setText("Error")
             self._step11_log_append(f"[ERROR] {e}")
             QMessageBox.warning(self, "Detrend", str(e))
-        finally:
             QApplication.restoreOverrideCursor()
             self.btn_step11_run.setEnabled(True)
+
+    def _on_step10_run_progress(self, msg: str):
+        self._step10_log_append(msg)
+
+    def _on_step10_run_finished(self, summary: dict):
+        self.step10_worker = None
+        QApplication.restoreOverrideCursor()
+        self.btn_step10_run.setEnabled(True)
+        self.step10_progress_label.setText("Done")
+        try:
+            if self.step10_runtime_window is not None:
+                self.step10_runtime_window.save_state()
+        except Exception as e:
+            self._step10_log_append(f"[WARN] save_state failed: {e}")
+        self.step11_runtime_window = None
+        self.step12_lc_data = None
+        self._refresh_runtime_status_labels()
+        if summary:
+            self._step10_log_append(
+                "[MERGER] Step10 done: datasets={ds}, outputs={out}, valid={valid}/{total}".format(
+                    ds=summary.get("n_datasets", 0),
+                    out=summary.get("n_outputs", 0),
+                    valid=summary.get("n_valid", 0),
+                    total=summary.get("n_total", 0),
+                )
+            )
+
+    def _on_step10_run_error(self, msg: str):
+        self.step10_worker = None
+        QApplication.restoreOverrideCursor()
+        self.btn_step10_run.setEnabled(True)
+        self.step10_progress_label.setText("Error")
+        self._step10_log_append(f"[ERROR] {msg}")
+        self._refresh_runtime_status_labels()
+        QMessageBox.warning(self, "Light Curve", msg)
+
+    def _on_step11_run_progress(self, msg: str):
+        self._step11_log_append(msg)
+
+    def _on_step11_run_finished(self, summary: dict):
+        self.step11_worker = None
+        QApplication.restoreOverrideCursor()
+        self.btn_step11_run.setEnabled(True)
+        window = self.step11_runtime_window
+        if window is None:
+            self.step11_progress_label.setText("Error")
+            return
+        try:
+            if window.mode == "color":
+                window.mode_color.setChecked(True)
+            elif window.mode == "global":
+                window.mode_global.setChecked(True)
+            else:
+                window.mode_offset.setChecked(True)
+            window._populate_date_list()
+            window._refresh_filter_combo(window.raw_df.get("filter", pd.Series([], dtype=str)).astype(str).tolist())
+            window._refresh_delta_c_map()
+            window._update_color_mode_enabled()
+            window._update_results_table()
+            window._update_plots()
+            window._update_analysis_panel()
+            if window.mode != "global":
+                window._log_fit_summary()
+            window._save_comprehensive_results()
+            window.save_state()
+            self.step12_lc_data = None
+            self._refresh_runtime_status_labels()
+            self.step11_progress_label.setText("Done")
+            if summary:
+                self._step11_log_append(
+                    "[MERGER] Step11 done: mode={mode}, groups={groups}, points={pts}".format(
+                        mode=summary.get("mode", window.mode),
+                        groups=summary.get("n_params", 0),
+                        pts=summary.get("n_points", 0),
+                    )
+                )
+        except Exception as e:
+            self.step11_progress_label.setText("Error")
+            self._step11_log_append(f"[ERROR] finalize failed: {e}")
+            self._refresh_runtime_status_labels()
+            QMessageBox.warning(self, "Detrend", str(e))
+
+    def _on_step11_run_error(self, msg: str):
+        self.step11_worker = None
+        QApplication.restoreOverrideCursor()
+        self.btn_step11_run.setEnabled(True)
+        self.step11_progress_label.setText("Error")
+        self._step11_log_append(f"[ERROR] {msg}")
+        self._refresh_runtime_status_labels()
+        QMessageBox.warning(self, "Detrend", msg)
 
     def _refresh_runtime_status_labels(self):
         merged_dir = self.merged_result_dir
@@ -1296,10 +1505,15 @@ class MultiNightMergerWindow(QMainWindow):
         self.step12_status_label.setText(
             f"Workspace: {merged_dir}\nStep12 outputs: {'있음' if s12_ready else '없음'}"
         )
+        step10_busy = self.step10_worker is not None
+        step11_busy = self.step11_worker is not None
+        step12_busy = self.step12_worker is not None
         if hasattr(self, "btn_step10_run"):
-            self.btn_step10_run.setEnabled(True)
+            self.btn_step10_run.setEnabled(not step10_busy and not step11_busy and not step12_busy)
         if hasattr(self, "btn_step11_run"):
-            self.btn_step11_run.setEnabled(True)
+            self.btn_step11_run.setEnabled(not step10_busy and not step11_busy and not step12_busy)
+        if hasattr(self, "btn_step12_run"):
+            self.btn_step12_run.setEnabled(not step10_busy and not step11_busy and not step12_busy)
         self._refresh_step12_filter_options()
 
     def _merged_step12_target_id(self) -> int | None:

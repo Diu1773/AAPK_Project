@@ -4159,42 +4159,20 @@ class LightCurveBuilderWindow(StepWindowBase):
                 pass
         self.check_plot_canvas.draw_idle()
 
-    def build_light_curve(self):
-        if not self.datasets:
-            QMessageBox.information(self, "Light Curve", "데이터셋이 없습니다.")
-            return
-
-        target_id = self.target_edit.text().strip()
-        if not target_id:
-            target_id, comp_ids = _load_selection_ids(self.datasets[0][1])
-            if target_id is None:
-                QMessageBox.information(self, "Light Curve", "대상 ID가 필요합니다.")
-                return
-        else:
-            target_id = int(target_id)
-            comp_ids = _safe_int_list(self.comp_edit.text())
-
-        self._update_comp_ids_from_input()
-        if not comp_ids:
-            QMessageBox.information(self, "Light Curve", "비교성 ID가 필요합니다.")
-            return
-
-        active_comp_ids = list(comp_ids)
-
+    def _build_light_curve_core(self, target_id: int, active_comp_ids: list[int]) -> dict:
         self.log("=" * 60)
         self.log("[BUILD] Starting Light Curve Build (RAW)")
         self.log(f"[BUILD] Target ID: {target_id}")
         self.log(f"[BUILD] Active Comp IDs: {active_comp_ids}")
         self.log(f"[BUILD] Datasets: {len(self.datasets)}")
 
-        # QC 요약 저장
         if active_comp_ids and not self.runtime_mode:
             qc_rows = self._compute_comp_qc(self.datasets[0][1], target_id, active_comp_ids, verbose=False)
             self._save_comp_qc_summary(Path(self.datasets[0][1]), qc_rows)
         elif active_comp_ids and self.runtime_mode:
             self.log("[BUILD] Runtime mode: skip precomputing QC summary")
 
-        combined_raw = []
+        combined_raw: list[pd.DataFrame] = []
         single_dataset_mode = len(self.datasets) == 1
         for label, result_dir in self.datasets:
             result_dir = Path(result_dir)
@@ -4204,7 +4182,6 @@ class LightCurveBuilderWindow(StepWindowBase):
                 continue
             raw_df = annotate_raw_lightcurve(raw_df, label, logger=self.log)
 
-            # Export check star light curve if defined
             check_ids_by_filter = {}
             check_df = pd.DataFrame()
             try:
@@ -4228,7 +4205,6 @@ class LightCurveBuilderWindow(StepWindowBase):
             )
             combined_raw.append(raw_df)
 
-        # combined outputs
         save_combined_raw_outputs(
             base_result_dir=Path(self.params.P.result_dir),
             target_id=target_id,
@@ -4241,11 +4217,20 @@ class LightCurveBuilderWindow(StepWindowBase):
 
         self.log("=" * 60)
         self.log("[BUILD] Light Curve Build Complete (RAW)")
+        summary = {
+            "target_id": int(target_id),
+            "n_datasets": len(self.datasets),
+            "n_outputs": len(combined_raw),
+            "n_total": 0,
+            "n_valid": 0,
+        }
         if combined_raw:
             all_data = pd.concat(combined_raw, ignore_index=True)
             valid_y = all_data["diff_mag_raw"].dropna()
             n_total = len(all_data)
             n_valid = len(valid_y)
+            summary["n_total"] = int(n_total)
+            summary["n_valid"] = int(n_valid)
             if n_valid > 0:
                 y_mean = valid_y.mean()
                 y_std = valid_y.std()
@@ -4255,7 +4240,30 @@ class LightCurveBuilderWindow(StepWindowBase):
             else:
                 self.log(f"[RESULT] RAW: 0/{n_total} valid points - CHECK DETECTION!")
         self.log("=" * 60)
+        return summary
 
+    def build_light_curve(self):
+        if not self.datasets:
+            QMessageBox.information(self, "Light Curve", "데이터셋이 없습니다.")
+            return
+
+        target_id = self.target_edit.text().strip()
+        if not target_id:
+            target_id, comp_ids = _load_selection_ids(self.datasets[0][1])
+            if target_id is None:
+                QMessageBox.information(self, "Light Curve", "대상 ID가 필요합니다.")
+                return
+        else:
+            target_id = int(target_id)
+            comp_ids = _safe_int_list(self.comp_edit.text())
+
+        self._update_comp_ids_from_input()
+        if not comp_ids:
+            QMessageBox.information(self, "Light Curve", "비교성 ID가 필요합니다.")
+            return
+
+        active_comp_ids = list(comp_ids)
+        self._build_light_curve_core(int(target_id), active_comp_ids)
         self.save_state()
         self.plot_current_comparison()
         self.show_log_window()
