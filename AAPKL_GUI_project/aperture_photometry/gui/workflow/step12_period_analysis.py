@@ -40,6 +40,11 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from .step_window_base import StepWindowBase
 from ...analysis.light_curve.period_analysis_service import run_period_analysis
+from ...analysis.light_curve.period_io_service import (
+    detect_corr_mode_from_df,
+    load_period_lightcurve_csv,
+    save_period_analysis_outputs,
+)
 from ...utils.io_utils import read_csv_int64_source_id, coerce_int64_source_id
 from ...utils.step_paths import (
     step9_selection_dir,
@@ -124,39 +129,8 @@ def _load_step9_target_id(result_dir: Path) -> int | None:
     return None
 
 
-import re as _re
-
-_CORR_MODE_RE = _re.compile(r"lightcurve_.*?_(global|color|offset|raw)\b", _re.IGNORECASE)
-
-_CORR_MODE_LABELS = {
-    "global": "Global ensemble",
-    "color": "Color-dependent",
-    "offset": "Nightly offset",
-    "raw": "Raw (no correction)",
-}
-
-
 def _detect_corr_mode(filename: str) -> tuple[str, str]:
-    """Extract correction mode from lightcurve filename.
-
-    Returns (mode_key, human_label).  e.g. ("global", "Global ensemble")
-    Falls back to ("unknown", "Unknown") if not detected.
-    """
-    m = _CORR_MODE_RE.search(filename)
-    if m:
-        key = m.group(1).lower()
-        return key, _CORR_MODE_LABELS.get(key, key)
-    return "unknown", "Unknown"
-
-
-def _detect_corr_mode_from_df(df: pd.DataFrame, filename: str) -> tuple[str, str]:
-    if "correction_mode" in df.columns:
-        vals = df["correction_mode"].dropna().astype(str).str.strip().str.lower()
-        if not vals.empty:
-            key = vals.iloc[0]
-            if key:
-                return key, _CORR_MODE_LABELS.get(key, key)
-    return _detect_corr_mode(filename)
+    return detect_corr_mode_from_df(pd.DataFrame(), filename)
 
 
 def _compute_1day_aliases(period: float) -> list[float]:
@@ -544,107 +518,26 @@ class PeriodAnalysisWindow(StepWindowBase):
         self.log(f"Loading: {lc_file}")
 
         try:
-            df = pd.read_csv(lc_file)
-            self.log(f"Loaded {len(df)} rows, columns: {list(df.columns)}")
-
-            time_col = None
-            for col in ["BJD_TDB", "BJD", "bjd", "JD", "jd", "HJD", "hjd", "time", "rel_time_hr"]:
-                if col in df.columns:
-                    time_col = col
-                    break
-
-            if time_col is None:
-                self.lc_data = None
-                self.btn_run.setEnabled(False)
-                self._clear_analysis_results()
-                self._set_data_status("No time column (JD/HJD/BJD) found.", ok=False)
-                if not silent:
-                    QMessageBox.warning(self, "Error", "No time column (JD/HJD/BJD) found.")
-                return
-
-            if "filter" in df.columns:
-                df_flt = df[df["filter"].astype(str).str.strip().str.lower() == flt.lower()].copy()
-                if df_flt.empty:
-                    self.log(f"[WARN] Filter '{flt}' not found in data, using all rows")
-                    df_flt = df
-            else:
-                df_flt = df
-
-            df_target = df_flt
-            if "ID" in df_target.columns:
-                df_id = df_target[df_target["ID"] == target_id].copy()
-                if df_id.empty:
-                    self.log(f"[WARN] ID {target_id} not found, using all data")
-                else:
-                    df_target = df_id
-
-            mag_raw_col = None
-            mag_corr_col = None
-            mag_err_col = None
-
-            for col in ["diff_mag_raw", "mag_raw", "raw_mag", "inst_mag", "mag"]:
-                if col in df_target.columns:
-                    mag_raw_col = col
-                    break
-
-            for col in ["diff_mag_corr", "diff_mag", "mag_corr", "corr_mag", "calibrated_mag"]:
-                if col in df_target.columns:
-                    mag_corr_col = col
-                    break
-
-            if mag_raw_col is None and mag_corr_col is not None:
-                mag_raw_col = mag_corr_col
-                mag_corr_col = None
-
-            for col in ["diff_err", "diff_err_corr", "mag_err", "err", "sigma", "diff_mag_err", "comp_err"]:
-                if col in df_target.columns:
-                    mag_err_col = col
-                    break
-
-            if mag_raw_col is None:
-                self.lc_data = None
-                self.btn_run.setEnabled(False)
-                self._clear_analysis_results()
-                self._set_data_status("No magnitude column found in light curve CSV.", ok=False)
-                if not silent:
-                    QMessageBox.warning(
-                        self, "Error",
-                        f"No magnitude column found.\nAvailable columns: {list(df_target.columns)}"
-                    )
-                return
-
-            self.lc_data = {
-                "time": df_target[time_col].to_numpy(float),
-                "mag_raw": df_target[mag_raw_col].to_numpy(float),
-                "mag_corr": df_target[mag_corr_col].to_numpy(float) if mag_corr_col else None,
-                "mag_err": df_target[mag_err_col].to_numpy(float) if mag_err_col else None,
-                "filter": flt,
-                "target_id": target_id,
-                "source_file": str(lc_file),
-                "col_raw": mag_raw_col,
-                "col_corr": mag_corr_col,
-                "col_err": mag_err_col,
-                "col_time": time_col,
-            }
+            self.lc_data = load_period_lightcurve_csv(lc_file, flt, target_id)
             self.current_filter = flt
             self._clear_analysis_results()
-
-            corr_mode_key, corr_mode_label = _detect_corr_mode_from_df(df_target, lc_file.name)
-            self.lc_data["corr_mode"] = corr_mode_key
-            self.lc_data["corr_mode_label"] = corr_mode_label
-
             n_valid = np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag_raw"]))
-            corr_info = f"corr={mag_corr_col}" if mag_corr_col else "corr=없음"
-            err_info = f"err={mag_err_col}" if mag_err_col else "err=없음"
+            corr_info = f"corr={self.lc_data.get('col_corr')}" if self.lc_data.get("col_corr") else "corr=없음"
+            err_info = f"err={self.lc_data.get('col_err')}" if self.lc_data.get("col_err") else "err=없음"
+            corr_mode_label = self.lc_data.get("corr_mode_label", "Unknown")
             self._set_data_status(
                 f"{n_valid}점  [{lc_file.name}]\n"
-                f"Detrend: {corr_mode_label}  |  raw={mag_raw_col}  {corr_info}\n"
-                f"{err_info}  time={time_col}",
+                f"Detrend: {corr_mode_label}  |  raw={self.lc_data.get('col_raw')}  {corr_info}\n"
+                f"{err_info}  time={self.lc_data.get('col_time')}",
                 ok=True,
             )
             self.btn_run.setEnabled(True)
 
-            self.log(f"Time: {time_col}, Raw: {mag_raw_col}, Corr: {mag_corr_col}, Err: {mag_err_col}")
+            self.log(f"Loaded {self.lc_data.get('n_rows', 0)} rows, columns: {self.lc_data.get('columns', [])}")
+            self.log(
+                f"Time: {self.lc_data.get('col_time')}, Raw: {self.lc_data.get('col_raw')}, "
+                f"Corr: {self.lc_data.get('col_corr')}, Err: {self.lc_data.get('col_err')}"
+            )
             self.log(f"Filter: {flt}, Target ID: {target_id}, Valid points: {n_valid}, Detrend: {corr_mode_label}")
 
         except Exception as e:
@@ -1078,57 +971,14 @@ class PeriodAnalysisWindow(StepWindowBase):
         flt = self.lc_data.get("filter", "unknown")
         target_id = self.lc_data.get("target_id", 0)
 
-        summary = {
-            "filter": flt,
-            "target_id": target_id,
-            "source_file": self.lc_data.get("source_file", ""),
-            "corr_mode": self.lc_data.get("corr_mode", "unknown"),
-            "corr_mode_label": self.lc_data.get("corr_mode_label", "Unknown"),
-            "min_period": self.min_period_spin.value(),
-            "max_period": self.max_period_spin.value(),
-            "results": {},
-        }
-
-        for key, data in self.results.items():
-            if "error" in data:
-                summary["results"][key] = {"error": data["error"]}
-            else:
-                entry = {
-                    "method": data.get("method", ""),
-                    "best_period": float(data["best_period"]),
-                    "best_power": float(data["best_power"]),
-                    "fap": float(data.get("fap", np.nan)) if np.isfinite(data.get("fap", np.nan)) else None,
-                    "n_points": int(data.get("n_points", 0)),
-                    "top_periods": [float(p) for p in data.get("top_periods", [])],
-                }
-                if "best_theta" in data:
-                    entry["best_theta"] = float(data["best_theta"])
-                summary["results"][key] = entry
-
-        summary_path = out_dir / f"period_analysis_{flt}_ID{target_id}.json"
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        summary_path = save_period_analysis_outputs(
+            result_dir=result_dir,
+            lc_data=self.lc_data,
+            results=self.results,
+            min_period=self.min_period_spin.value(),
+            max_period=self.max_period_spin.value(),
+        )
         self.log(f"Saved: {summary_path}")
-
-        for key, data in self.results.items():
-            if "error" in data:
-                continue
-            if "frequency" in data:
-                df = pd.DataFrame({
-                    "frequency": data["frequency"],
-                    "period": 1.0 / data["frequency"],
-                    "power": data["power"],
-                })
-            elif "trial_periods" in data:
-                df = pd.DataFrame({
-                    "period": data["trial_periods"],
-                    "power": data["power"],
-                })
-                if "theta" in data:
-                    df["theta"] = data["theta"]
-            else:
-                continue
-            csv_path = out_dir / f"periodogram_{flt}_{key}_ID{target_id}.csv"
-            df.to_csv(csv_path, index=False)
 
     def log(self, msg: str):
         if self.log_text is not None:
