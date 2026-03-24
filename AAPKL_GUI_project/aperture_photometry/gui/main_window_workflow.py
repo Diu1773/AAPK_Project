@@ -339,7 +339,7 @@ class MainWindowWorkflow(QMainWindow):
         progress_group = QGroupBox("Workflow Progress")
         progress_layout = QVBoxLayout(progress_group)
 
-        self.progress_label = QLabel(f"Progress: 0/{len(self.step_names)} steps completed")
+        self.progress_label = QLabel(f"Progress: 0/{len(self.step_names)} steps finished")
         self.progress_label.setFont(QFont("Arial", 10, QFont.Bold))
         progress_layout.addWidget(self.progress_label)
 
@@ -480,7 +480,7 @@ class MainWindowWorkflow(QMainWindow):
     def update_step_buttons(self):
         """Update step button states based on project state"""
         completed_count = len(self.project_state.state["completed_steps"])
-        self.progress_label.setText(f"Progress: {completed_count}/{len(self.step_names)} steps completed")
+        self.progress_label.setText(f"Progress: {completed_count}/{len(self.step_names)} steps finished")
 
         for i, btn in enumerate(self.step_buttons):
             completed = self.project_state.is_step_completed(i)
@@ -498,9 +498,11 @@ class MainWindowWorkflow(QMainWindow):
             step_index: Index of step to open
         """
         if not self.project_state.is_step_accessible(step_index):
+            prev_idx = step_index - 1
+            prev_name = self.step_names[prev_idx] if 0 <= prev_idx < len(self.step_names) else "previous step"
             QMessageBox.warning(
                 self, "Step Not Accessible",
-                f"Please complete Step {step_index} first."
+                f"Please finish Step {step_index}: {prev_name} first."
             )
             return
 
@@ -588,7 +590,7 @@ class MainWindowWorkflow(QMainWindow):
         """
         self.project_state.mark_step_completed(step_index)
         self.update_step_buttons()
-        self.append_log(f"✓ Step {step_index + 1} completed: {self.step_names[step_index]}")
+        self.append_log(f"✓ Step {step_index + 1} finished: {self.step_names[step_index]}")
 
     def resume_next_step(self):
         """Resume from next incomplete step"""
@@ -596,17 +598,20 @@ class MainWindowWorkflow(QMainWindow):
         if next_step is not None:
             # Check if step is accessible
             if not self.project_state.is_step_accessible(next_step):
+                prev_idx = next_step - 1
+                prev_name = self.step_names[prev_idx] if 0 <= prev_idx < len(self.step_names) else "previous step"
                 QMessageBox.warning(
                     self, "Step Not Accessible",
-                    f"Please complete previous steps first.\n"
+                    f"Please finish earlier steps first.\n"
+                    f"Required now: Step {next_step}: {prev_name}\n"
                     f"Next available step: Step {next_step + 1}"
                 )
                 return
             self.open_step(next_step)
         else:
             QMessageBox.information(
-                self, "All Steps Complete",
-                "All workflow steps have been completed!"
+                self, "Workflow Finished",
+                "All workflow steps are finished."
             )
 
     def reset_progress(self):
@@ -893,7 +898,7 @@ class MainWindowWorkflow(QMainWindow):
             QMessageBox.warning(
                 self, "No Data",
                 "Photometry data not found.\n"
-                "Please complete the Aperture Photometry step first."
+                "Run the Aperture Photometry step first."
             )
             return
 

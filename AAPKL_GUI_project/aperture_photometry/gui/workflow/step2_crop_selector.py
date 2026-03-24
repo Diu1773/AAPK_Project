@@ -187,7 +187,7 @@ class CropSelectorWindow(StepWindowBase):
                 except:
                     QMessageBox.warning(
                         self, "No Files",
-                        "Please complete Step 1 first to scan files."
+                        "Run Step 1 first to scan files."
                     )
                     return
 

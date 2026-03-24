@@ -32,11 +32,11 @@ class ProjectState:
             "crop",
             "sky_preview",
             "detection",
+            "forced_photometry",
             "wcs_plate_solve",
             "ref_build",
             "star_id_match",
             "target_selection",
-            "forced_photometry",
             "light_curve",
             "detrend_merge",
             "period_analysis",
@@ -194,7 +194,7 @@ class ProjectState:
         lines.append(f"Project: {self.state['project_name']}")
         lines.append(f"Created: {self.state['created']}")
         lines.append(f"Last Modified: {self.state['last_modified']}")
-        lines.append(f"\nProgress: {len(self.state['completed_steps'])}/{len(self.steps)} steps completed")
+        lines.append(f"\nProgress: {len(self.state['completed_steps'])}/{len(self.steps)} steps finished")
         lines.append("\nSteps:")
 
         for i, step_name in enumerate(self.steps):

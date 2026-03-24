@@ -279,7 +279,7 @@ class StepWindowBase(QMainWindow):
         if not self._finalize_valid_step(notify_main=True):
             QMessageBox.warning(
                 self, "Step Not Ready",
-                "Please complete all required tasks before proceeding."
+                "Please finish all required tasks before proceeding."
             )
             return
         self.update_navigation_buttons()
@@ -295,7 +295,7 @@ class StepWindowBase(QMainWindow):
         if not self._finalize_valid_step(notify_main=True):
             QMessageBox.warning(
                 self, "Step Not Ready",
-                "Please complete all required tasks before proceeding to the next step."
+                "Please finish all required tasks before proceeding to the next step."
             )
             return
 
