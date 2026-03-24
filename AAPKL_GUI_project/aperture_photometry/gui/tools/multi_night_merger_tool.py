@@ -83,6 +83,15 @@ class _MergedParamsProxy:
     def __getattr__(self, name):
         return getattr(self._base, name)
 
+    def get_file_path(self, filename: str) -> Path:
+        """Resolve merged-runtime FITS paths against the merged path map."""
+        path_map = getattr(self.P, "file_path_map", None)
+        if isinstance(path_map, dict):
+            mapped = path_map.get(filename)
+            if mapped:
+                return Path(mapped)
+        return Path(self.P.data_dir) / filename
+
     def save_toml(self):
         return False
 
