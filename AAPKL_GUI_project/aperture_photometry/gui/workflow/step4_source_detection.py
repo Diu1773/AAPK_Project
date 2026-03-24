@@ -40,6 +40,7 @@ from ...utils.step_paths import (
     step5_photometry_dir,
 )
 from ...utils.cache_utils import norm_path_key
+from ...utils.astro_utils import compute_airmass_from_header
 
 _DETECT_MODE_PRESETS = {
     "normal": {
@@ -1194,7 +1195,15 @@ class QCInspectionPanel(QWidget):
             try:
                 with fits.open(path) as hdul:
                     h = hdul[0].header
-                meta["airmass"] = self._safe_float(h.get("AIRMASS"), np.nan)
+                info = compute_airmass_from_header(
+                    h,
+                    float(getattr(self.params.P, "site_lat_deg", np.nan)),
+                    float(getattr(self.params.P, "site_lon_deg", np.nan)),
+                    float(getattr(self.params.P, "site_alt_m", 0.0)),
+                    float(getattr(self.params.P, "site_tz_offset_hours", 0.0)),
+                    formula=getattr(self.params.P, "airmass_formula", None),
+                )
+                meta["airmass"] = self._safe_float(info.get("airmass"), np.nan)
                 tval, tsrc = self._parse_time_value(h)
                 meta["time_val"] = tval
                 meta["time_src"] = tsrc

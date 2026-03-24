@@ -294,6 +294,8 @@ def hardie_airmass(alt_deg):
 
 
 DEFAULT_AIRMASS_FORMULA = "Kasten & Young (1989)"
+MIN_REASONABLE_AIRMASS = 0.95
+MAX_REASONABLE_AIRMASS = 6.0
 
 AIRMASS_FORMULAS = {
     "Kasten & Young (1989)": kasten_young_airmass,
@@ -308,6 +310,20 @@ def airmass_from_alt(alt_deg, formula: str | None = None):
     key = formula or DEFAULT_AIRMASS_FORMULA
     func = AIRMASS_FORMULAS.get(key, kasten_young_airmass)
     return func(alt_deg)
+
+
+def is_reasonable_airmass(
+    value,
+    *,
+    min_airmass: float = MIN_REASONABLE_AIRMASS,
+    max_airmass: float = MAX_REASONABLE_AIRMASS,
+) -> bool:
+    """Return True when a value looks like a physically plausible observation airmass."""
+    try:
+        x = float(value)
+    except Exception:
+        return False
+    return bool(np.isfinite(x) and min_airmass <= x <= max_airmass)
 
 
 def compute_airmass_from_header(
@@ -327,15 +343,15 @@ def compute_airmass_from_header(
     - datetime_utc, datetime_local, ra_deg, dec_deg
     """
     airmass_val = header.get("AIRMASS", None)
+    header_airmass = np.nan
     airmass = np.nan
+    computed_airmass = np.nan
     airmass_source = "computed"
     try:
         if airmass_val is not None:
-            airmass = float(airmass_val)
-            if np.isfinite(airmass):
-                airmass_source = "header"
+            header_airmass = float(airmass_val)
     except Exception:
-        airmass = np.nan
+        header_airmass = np.nan
 
     source_pref = str(source or "auto").strip().lower()
     t = _parse_obs_time(header) if source_pref in ("auto", "radec", "ra", "radec_only") else None
@@ -356,9 +372,7 @@ def compute_airmass_from_header(
             altaz = sc.transform_to(AltAz(obstime=t, location=loc))
             alt_deg = float(altaz.alt.deg)
             zenith_deg = 90.0 - alt_deg
-            if not np.isfinite(airmass):
-                airmass = airmass_from_alt(alt_deg, formula)
-                airmass_source = "computed"
+            computed_airmass = airmass_from_alt(alt_deg, formula)
         except Exception:
             pass
     if (source_pref in ("auto", "alt", "objalt", "altaz")) and not np.isfinite(alt_deg):
@@ -366,9 +380,31 @@ def compute_airmass_from_header(
         if alt_hdr is not None and np.isfinite(alt_hdr):
             alt_deg = float(alt_hdr)
             zenith_deg = 90.0 - alt_deg
-            if not np.isfinite(airmass):
-                airmass = airmass_from_alt(alt_deg, formula)
-                airmass_source = "computed"
+            if not np.isfinite(computed_airmass):
+                computed_airmass = airmass_from_alt(alt_deg, formula)
+
+    header_matches_alt = (
+        np.isfinite(header_airmass)
+        and np.isfinite(alt_deg)
+        and abs(header_airmass - alt_deg) <= 1.5
+    )
+    header_matches_zenith = (
+        np.isfinite(header_airmass)
+        and np.isfinite(zenith_deg)
+        and abs(header_airmass - zenith_deg) <= 1.5
+    )
+    header_ok = is_reasonable_airmass(header_airmass)
+    computed_ok = is_reasonable_airmass(computed_airmass, max_airmass=12.0)
+
+    if header_ok and not header_matches_alt and not header_matches_zenith:
+        airmass = header_airmass
+        airmass_source = "header"
+    elif computed_ok:
+        airmass = computed_airmass
+        airmass_source = "computed"
+    elif np.isfinite(header_airmass):
+        airmass = header_airmass
+        airmass_source = "header_suspicious"
 
     time_utc = t.isot if t is not None else ""
     try:

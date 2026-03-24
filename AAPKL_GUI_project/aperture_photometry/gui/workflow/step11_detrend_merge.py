@@ -11,6 +11,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from astropy.io import fits
 from astropy.time import Time
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -82,7 +83,11 @@ from ...utils.io_utils import (
 )
 from ...utils.photometry_loader import load_frame_photometry
 from ...utils.qc_utils import load_frame_excludes
-from ...utils.astro_utils import compute_bjd_tdb_array
+from ...utils.astro_utils import (
+    compute_airmass_from_header,
+    compute_bjd_tdb_array,
+    is_reasonable_airmass,
+)
 
 
 def _load_night_assignments_from_disk(result_dir: Path) -> dict[str, int]:
@@ -569,9 +574,9 @@ class DetrendNightMergeWindow(StepWindowBase):
         self.mode_group.addButton(self.mode_color)
         self.mode_group.addButton(self.mode_global)
         self.mode_offset.setChecked(True)
-        self.mode_offset.toggled.connect(lambda: self._set_mode("offset"))
-        self.mode_color.toggled.connect(lambda: self._set_mode("color"))
-        self.mode_global.toggled.connect(lambda: self._set_mode("global"))
+        self.mode_offset.toggled.connect(lambda checked: checked and self._set_mode("offset"))
+        self.mode_color.toggled.connect(lambda checked: checked and self._set_mode("color"))
+        self.mode_global.toggled.connect(lambda checked: checked and self._set_mode("global"))
 
         self.color_status_label = QLabel("")
         self.color_status_label.setStyleSheet("QLabel { color: #D32F2F; font-size: 9pt; }")
@@ -1621,20 +1626,22 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
     def _fill_airmass_from_headers(self) -> None:
         if self.raw_df.empty or "file" not in self.raw_df.columns:
             return
-        missing_mask = self.raw_df["airmass"].isna()
-        if missing_mask.sum() == 0:
+        airmass_series = pd.to_numeric(self.raw_df.get("airmass", np.nan), errors="coerce")
+        refill_mask = airmass_series.isna() | ~airmass_series.map(is_reasonable_airmass)
+        if int(refill_mask.sum()) == 0:
             return
         dataset_map = {label: Path(path) for label, path in self.datasets} if self.datasets else {}
-        filled = 0
-        total_missing = int(missing_mask.sum())
+        filled_from_headers = 0
+        filled_from_fits = 0
+        total_missing = int(refill_mask.sum())
         if not dataset_map:
             dataset_map = {"": Path(self.params.P.result_dir)}
             self.raw_df["dataset"] = self.raw_df.get("dataset", "")
         for label, result_dir in dataset_map.items():
             if "dataset" in self.raw_df.columns:
-                sel = (self.raw_df["dataset"].astype(str) == str(label)) & self.raw_df["airmass"].isna()
+                sel = (self.raw_df["dataset"].astype(str) == str(label)) & refill_mask
             else:
-                sel = self.raw_df["airmass"].isna()
+                sel = refill_mask
             if not np.any(sel):
                 continue
             headers_path = step1_dir(result_dir) / "headers.csv"
@@ -1655,16 +1662,68 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                     break
             if col_air is None:
                 continue
-            amap = dict(zip(hdf["Filename"].astype(str), pd.to_numeric(hdf[col_air], errors="coerce")))
+            amap = {}
+            for fname, aval in zip(hdf["Filename"].astype(str), pd.to_numeric(hdf[col_air], errors="coerce")):
+                if is_reasonable_airmass(aval):
+                    amap[str(fname)] = float(aval)
             files = self.raw_df.loc[sel, "file"].astype(str)
             vals = files.map(amap)
             n_fill = int(vals.notna().sum())
             if n_fill == 0:
                 continue
             self.raw_df.loc[sel, "airmass"] = vals
-            filled += n_fill
+            filled_from_headers += n_fill
+
+        airmass_series = pd.to_numeric(self.raw_df.get("airmass", np.nan), errors="coerce")
+        refill_mask = airmass_series.isna() | ~airmass_series.map(is_reasonable_airmass)
+        if np.any(refill_mask):
+            site_lat = float(getattr(self.params.P, "site_lat_deg", np.nan))
+            site_lon = float(getattr(self.params.P, "site_lon_deg", np.nan))
+            site_alt = float(getattr(self.params.P, "site_alt_m", 0.0))
+            site_tz = float(getattr(self.params.P, "site_tz_offset_hours", 0.0))
+            formula = getattr(self.params.P, "airmass_formula", None)
+            if np.isfinite(site_lat) and np.isfinite(site_lon):
+                for row_idx in self.raw_df.index[refill_mask]:
+                    fname = str(self.raw_df.at[row_idx, "file"])
+                    try:
+                        src_path = Path(self.params.get_file_path(fname))
+                    except Exception:
+                        src_path = None
+                    if src_path is None or not src_path.exists():
+                        continue
+                    try:
+                        with fits.open(src_path) as hdul:
+                            hdr = hdul[0].header
+                        info = compute_airmass_from_header(
+                            hdr,
+                            site_lat,
+                            site_lon,
+                            site_alt,
+                            site_tz,
+                            formula=formula,
+                        )
+                    except Exception:
+                        continue
+                    airmass_val = float(info.get("airmass", np.nan))
+                    airmass_source = str(info.get("airmass_source", "") or "")
+                    if not is_reasonable_airmass(airmass_val, max_airmass=12.0):
+                        continue
+                    if airmass_source == "header_suspicious":
+                        continue
+                    self.raw_df.at[row_idx, "airmass"] = airmass_val
+                    filled_from_fits += 1
+
+        filled = filled_from_headers + filled_from_fits
         if filled > 0:
-            self.log(f"[LOAD] Filled airmass from headers: {filled}/{total_missing}")
+            msg = f"[LOAD] Filled airmass: {filled}/{total_missing}"
+            details = []
+            if filled_from_headers > 0:
+                details.append(f"headers={filled_from_headers}")
+            if filled_from_fits > 0:
+                details.append(f"computed={filled_from_fits}")
+            if details:
+                msg += f" ({', '.join(details)})"
+            self.log(msg)
 
     def _update_comp_label(self) -> None:
         self._update_id_info_label()
