@@ -458,10 +458,26 @@ class FileSelectionWindow(StepWindowBase):
         self._apply_manual_input_dirs()
 
     def clear_input_directories(self):
+        if not self._manual_input_dirs:
+            return
+
         self._manual_input_dirs = []
-        self.file_manager.clear_multi_night_dirs()
-        self._sync_input_dir_widgets()
-        self._update_result_workspace()
+        self.file_manager.filenames = []
+        self.file_manager.df_headers = None
+        self.file_manager.path_map = {}
+        self.file_manager.ref_filename = None
+        self.file_manager.night_assignments = {}
+        self.file_manager.excluded_nights = set()
+        self._night_records = []
+        self._excluded_nights = set()
+
+        self.file_count_label.setText("Files: 0")
+        self.night_table.setRowCount(0)
+        self.header_table.setRowCount(0)
+        self.ref_label.setText("(not selected)")
+
+        self._apply_manual_input_dirs()
+        self.rescan_files()
 
     def rescan_files(self):
         """Rescan files then re-classify nights by JD gap."""

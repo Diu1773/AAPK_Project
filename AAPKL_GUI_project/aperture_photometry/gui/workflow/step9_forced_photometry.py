@@ -1719,11 +1719,20 @@ class ForcedPhotometryWindow(StepWindowBase):
         if self.worker and self.worker.isRunning():
             self.stop_photometry()
             self.worker.wait(5000)
-        event.accept()
+        super().closeEvent(event)
+
+    def _photometry_index_ready(self) -> bool:
+        idx_path = step5_dir(self.params.P.result_dir) / "photometry_index.csv"
+        if not idx_path.exists() or idx_path.stat().st_size <= 0:
+            return False
+        try:
+            idx = pd.read_csv(idx_path)
+        except Exception:
+            return False
+        return not idx.empty
 
     def validate_step(self) -> bool:
-        idx_path = step5_dir(self.params.P.result_dir) / "photometry_index.csv"
-        return idx_path.exists()
+        return self._photometry_index_ready()
 
     def save_state(self):
         state_data = {

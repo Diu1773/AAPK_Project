@@ -69,7 +69,7 @@ class StepWindowBase(QMainWindow):
         # NOTE: restore_state() should be called by subclass after UI setup
 
     def setup_navigation_buttons(self):
-        """Setup Previous/Next/Complete buttons at bottom"""
+        """Setup Previous/Next navigation buttons at bottom."""
         nav_layout = QHBoxLayout()
 
         # Previous button (GREEN - always enabled if not first step)
@@ -101,15 +101,16 @@ class StepWindowBase(QMainWindow):
 
         nav_layout.addStretch()
 
-        # Complete button (initially disabled)
+        # Keep a hidden placeholder for compatibility with embedded tools that
+        # still expect this attribute to exist, but remove it from the UI.
         self.btn_complete = QPushButton("Mark as Complete")
         self.btn_complete.setMinimumHeight(40)
         self.btn_complete.setFont(QFont("Arial", 10, QFont.Bold))
         self.btn_complete.setEnabled(False)
+        self.btn_complete.hide()
         self.btn_complete.clicked.connect(self.mark_complete)
-        nav_layout.addWidget(self.btn_complete)
 
-        # Next / Exit button (RED when incomplete, GREEN when complete)
+        # Next / Exit button (RED when not ready, GREEN when ready)
         self._is_last_step = (self.step_index >= len(self.main_window.step_names) - 1)
         self.btn_next = QPushButton("Exit ✕" if self._is_last_step else "Next Step →")
         self.btn_next.setMinimumHeight(40)
@@ -141,33 +142,13 @@ class StepWindowBase(QMainWindow):
         self.update_navigation_buttons()
 
     def update_navigation_buttons(self):
-        """Update navigation button states"""
-        # Complete button: enable if validation passes
-        can_complete = self.validate_step()
-        self.btn_complete.setEnabled(can_complete)
+        """Update navigation button states."""
+        can_proceed = bool(self.validate_step())
+        self.btn_complete.setEnabled(False)
+        self.btn_complete.hide()
+        self.btn_next.setEnabled(can_proceed)
 
-        # Next button: enable if step is completed
-        is_completed = self.project_state.is_step_completed(self.step_index)
-        self.btn_next.setEnabled(is_completed)
-
-        # Update complete button style
-        if is_completed:
-            # Complete button - green when done
-            self.btn_complete.setStyleSheet("""
-                QPushButton {
-                    background-color: #4CAF50;
-                    color: white;
-                    border: 2px solid #45a049;
-                    border-radius: 5px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #45a049;
-                }
-            """)
-            self.btn_complete.setText("✓ Completed")
-
-            # Next button - GREEN when complete
+        if can_proceed:
             self.btn_next.setStyleSheet("""
                 QPushButton {
                     background-color: #4CAF50;
@@ -181,26 +162,6 @@ class StepWindowBase(QMainWindow):
                 }
             """)
         else:
-            # Complete button - default style
-            self.btn_complete.setStyleSheet("""
-                QPushButton {
-                    background-color: #2196F3;
-                    color: white;
-                    border: 2px solid #1976D2;
-                    border-radius: 5px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #1976D2;
-                }
-                QPushButton:disabled {
-                    background-color: #CCCCCC;
-                    color: #666666;
-                }
-            """)
-            self.btn_complete.setText("Mark as Complete")
-
-            # Next button - RED when not complete
             self.btn_next.setStyleSheet("""
                 QPushButton {
                     background-color: #f44336;
@@ -215,6 +176,43 @@ class StepWindowBase(QMainWindow):
                     border: 2px solid #AAAAAA;
                 }
             """)
+
+    def _mark_step_complete(self, notify_main: bool = True) -> bool:
+        """Mark the current step complete if needed."""
+        if self.project_state.is_step_completed(self.step_index):
+            self.completed = True
+            return False
+
+        self.completed = True
+        if notify_main:
+            self.step_completed.emit(self.step_index)
+        else:
+            self.project_state.mark_step_completed(self.step_index)
+            if hasattr(self.main_window, "update_step_buttons"):
+                self.main_window.update_step_buttons()
+        return True
+
+    def _mark_step_incomplete(self) -> bool:
+        """Clear completion state for the current step if present."""
+        if not self.project_state.is_step_completed(self.step_index):
+            self.completed = False
+            return False
+
+        self.project_state.mark_step_incomplete(self.step_index)
+        self.completed = False
+        if hasattr(self.main_window, "update_step_buttons"):
+            self.main_window.update_step_buttons()
+        return True
+
+    def _finalize_valid_step(self, notify_main: bool = True) -> bool:
+        """Persist state/params and mark the step completed when valid."""
+        if not self.validate_step():
+            return False
+
+        self.save_state()
+        self.persist_params()
+        self._mark_step_complete(notify_main=notify_main)
+        return True
 
     def validate_step(self) -> bool:
         """
@@ -277,42 +275,14 @@ class StepWindowBase(QMainWindow):
         return all_stopped
 
     def mark_complete(self):
-        """Mark this step as complete"""
-        if not self.validate_step():
+        """Backward-compatible alias for the removed manual-complete action."""
+        if not self._finalize_valid_step(notify_main=True):
             QMessageBox.warning(
-                self, "Cannot Complete",
-                "Please complete all required tasks before marking this step as complete."
+                self, "Step Not Ready",
+                "Please complete all required tasks before proceeding."
             )
             return
-
-        # Save step data
-        self.save_state()
-
-        # Save parameters to TOML file
-        self.persist_params()
-
-        # Mark as completed
-        self.project_state.mark_step_completed(self.step_index)
-        self.completed = True
-
-        # Emit signal
-        self.step_completed.emit(self.step_index)
-
-        # Update buttons
         self.update_navigation_buttons()
-
-        if self._is_last_step:
-            QMessageBox.information(
-                self, "Step Complete",
-                f"Step {self.step_index + 1} marked as complete!\n\n"
-                f"All steps finished. Click 'Exit' to return to main menu."
-            )
-        else:
-            QMessageBox.information(
-                self, "Step Complete",
-                f"Step {self.step_index + 1} marked as complete!\n\n"
-                f"Click 'Next Step' to proceed or close this window to return to main menu."
-            )
 
     def go_previous(self):
         """Go to previous step"""
@@ -322,10 +292,10 @@ class StepWindowBase(QMainWindow):
 
     def go_next(self):
         """Go to next step, or close (exit) if this is the last step."""
-        if not self.project_state.is_step_completed(self.step_index):
+        if not self._finalize_valid_step(notify_main=True):
             QMessageBox.warning(
-                self, "Step Not Complete",
-                "Please complete this step before proceeding to the next."
+                self, "Step Not Ready",
+                "Please complete all required tasks before proceeding to the next step."
             )
             return
 
@@ -358,11 +328,11 @@ class StepWindowBase(QMainWindow):
             event.ignore()
             return
 
-        # Auto-save state when closing
+        was_completed = self.project_state.is_step_completed(self.step_index)
         if self.validate_step():
-            self.save_state()
-
-        # Always save parameters to TOML file when closing
-        self.persist_params()
+            self._finalize_valid_step(notify_main=not was_completed)
+        else:
+            self._mark_step_incomplete()
+            self.persist_params()
 
         event.accept()

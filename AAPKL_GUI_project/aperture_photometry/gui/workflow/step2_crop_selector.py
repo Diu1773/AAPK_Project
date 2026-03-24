@@ -20,7 +20,7 @@ from matplotlib.patches import Rectangle
 
 from .step_window_base import StepWindowBase
 from ...utils.constants import get_parallel_workers
-from ...utils.step_paths import step2_dir, step2_cropped_dir
+from ...utils.step_paths import crop_rect_path, step2_dir, step2_cropped_dir
 
 
 class CropSelectorWindow(StepWindowBase):
@@ -464,20 +464,31 @@ class CropSelectorWindow(StepWindowBase):
             progress.setValue(len(files))
 
             if errors:
+                self.is_cropped = False
                 first_err = errors[0][1]
                 QMessageBox.warning(
                     self, "Crop Warning",
                     f"Finished with {len(errors)} failures.\nFirst error: {first_err}"
                 )
+                self.update_navigation_buttons()
+                return
 
             # Update displayed image to show cropped result
             self.displayed_image_data = self.original_image_data[self.crop_y0:self.crop_y1, self.crop_x0:self.crop_x1]
-            self.is_cropped = True
 
             # Redisplay cropped image (without rectangle)
             self.display_image()
 
-            # Save crop info
+            self.is_cropped = self._cropped_outputs_ready(require_marker=False)
+            if not self.is_cropped:
+                QMessageBox.warning(
+                    self, "Crop Warning",
+                    "Crop outputs are incomplete. Re-apply crop or skip crop before proceeding."
+                )
+                self.update_navigation_buttons()
+                return
+
+            # Save crop info only after all cropped outputs are confirmed.
             self.save_crop_info()
 
             # Update status
@@ -492,15 +503,8 @@ class CropSelectorWindow(StepWindowBase):
             # Disable crop button
             self.btn_crop.setEnabled(False)
 
-            # Update navigation buttons to enable Mark Complete
             self.update_navigation_buttons()
-
-            QMessageBox.information(
-                self, "Crop Complete",
-                f"Successfully cropped {len(files)} images!\n\n"
-                f"Cropped files: result/step2_crop/cropped/\n"
-                f"Original files: unchanged"
-            )
+            self.go_next()
 
         except Exception as e:
             QMessageBox.critical(
@@ -643,6 +647,7 @@ class CropSelectorWindow(StepWindowBase):
         self.save_skip_info()
         self.crop_info_label.setText("Crop skipped. Original images will be used.")
         self.update_navigation_buttons()
+        self.go_next()
 
     def validate_crop_region(self) -> bool:
         """Validate if crop region is valid"""
@@ -656,8 +661,21 @@ class CropSelectorWindow(StepWindowBase):
 
     def validate_step(self) -> bool:
         """Validate if step can be completed"""
-        # Step can be completed if crop has been applied
-        return self.is_cropped or self.crop_skipped
+        return self.crop_skipped or self._cropped_outputs_ready()
+
+    def _cropped_outputs_ready(self, require_marker: bool = True) -> bool:
+        """Return True only when the saved crop outputs are actually usable."""
+        marker = crop_rect_path(self.params.P.result_dir)
+        cropped_dir = step2_cropped_dir(self.params.P.result_dir)
+        if require_marker and not marker.exists():
+            return False
+        if not cropped_dir.exists():
+            return False
+
+        files = list(self.file_manager.filenames) if self.file_manager else []
+        if files:
+            return all((cropped_dir / fname).exists() for fname in files)
+        return any(cropped_dir.glob("*.fit*"))
 
     def save_crop_info(self):
         """Save crop info to JSON"""
@@ -699,7 +717,9 @@ class CropSelectorWindow(StepWindowBase):
 
     def save_state(self):
         """Save step state to project"""
-        if self.is_cropped:
+        if self._cropped_outputs_ready():
+            self.is_cropped = True
+            self.crop_skipped = False
             self.save_crop_info()
         elif self.crop_skipped:
             self.save_skip_info()
@@ -739,14 +759,15 @@ class CropSelectorWindow(StepWindowBase):
             if state_data.get("ref_file"):
                 self.ref_filename = state_data.get("ref_file")
 
-            self.is_cropped = True  # Assume cropped if we have saved state
+            self.crop_skipped = False
+            self.is_cropped = self._cropped_outputs_ready()
 
             # Try to load image
             try:
                 self.load_reference_image()
 
                 # Update info label
-                if self.crop_x0 is not None:
+                if self.is_cropped and self.crop_x0 is not None:
                     width = self.crop_x1 - self.crop_x0
                     height = self.crop_y1 - self.crop_y0
                     self.crop_info_label.setText(
@@ -754,5 +775,12 @@ class CropSelectorWindow(StepWindowBase):
                         f"Cropped files in: result/step2_crop/cropped/\n"
                         f"Size: {width} × {height} pixels"
                     )
+                elif self.crop_x0 is not None:
+                    self.crop_info_label.setText(
+                        "Saved crop region found, but cropped outputs are missing.\n"
+                        "Re-apply crop or skip crop to continue."
+                    )
             except:
                 pass
+
+            self.update_navigation_buttons()

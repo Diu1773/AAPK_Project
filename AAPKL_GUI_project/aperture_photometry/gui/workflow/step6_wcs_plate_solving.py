@@ -88,6 +88,52 @@ def _is_explicit_stopped_message(value: str | None) -> bool:
     return s == "stopped" or s.startswith("stopped |")
 
 
+def _coord_sep_deg(a: SkyCoord | None, b: SkyCoord | None) -> float:
+    if a is None or b is None:
+        return float("nan")
+    try:
+        return float(a.separation(b).deg)
+    except Exception:
+        return float("nan")
+
+
+def _format_coord_hint(coord: SkyCoord | None) -> str:
+    if coord is None:
+        return "blind"
+    try:
+        return f"{coord.ra.deg:.6f},{coord.dec.deg:.6f}"
+    except Exception:
+        return "invalid"
+
+
+def _astnet_center_candidates(
+    header_coord: SkyCoord | None,
+    target_coord: SkyCoord | None,
+) -> list[tuple[str, SkyCoord | None]]:
+    attempts: list[tuple[str, SkyCoord | None]] = []
+
+    def _add(label: str, coord: SkyCoord | None) -> None:
+        for _, existing in attempts:
+            if coord is None and existing is None:
+                return
+            sep_deg = _coord_sep_deg(coord, existing)
+            if coord is not None and existing is not None and np.isfinite(sep_deg) and sep_deg < 1e-6:
+                return
+        attempts.append((label, coord))
+
+    if header_coord is not None:
+        _add("header", header_coord)
+
+    sep_deg = _coord_sep_deg(header_coord, target_coord)
+    if target_coord is not None and (
+        header_coord is None or (not np.isfinite(sep_deg)) or sep_deg > 0.25
+    ):
+        _add("target", target_coord)
+
+    _add("blind", None)
+    return attempts
+
+
 def _wsl_path_exists_probe(wsl_path: str) -> bool:
     try:
         cp = subprocess.run(
@@ -1329,6 +1375,8 @@ WHERE 1=CONTAINS(
             astnet_use_cache = bool(getattr(self.params.P, "astnet_local_use_cache", True))
             astnet_max_objs = int(getattr(self.params.P, "astnet_local_max_objs", 2000))
             astnet_cpulimit_s = float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0))
+            astnet_blind_retry = bool(getattr(self.params.P, "astnet_blind_retry_on_fail", True))
+            astnet_blind_cpulimit_s = float(getattr(self.params.P, "astnet_blind_cpulimit_s", 120.0))
             meta_dir = self.cache_dir / "wcs_solve"
             meta_dir.mkdir(parents=True, exist_ok=True)
             log_path = self.cache_dir / "wcs_solve.log"
@@ -1359,7 +1407,8 @@ WHERE 1=CONTAINS(
             L(
                 f"[WCS] astnet_local_enable={astnet_local_enable} use_wsl={astnet_use_wsl} "
                 f"timeout_s={astnet_timeout_s} downsample={astnet_downsample} "
-                f"scale=[{astnet_scale_low:.5f},{astnet_scale_high:.5f}] radius_deg={astnet_radius_deg}"
+                f"scale=[{astnet_scale_low:.5f},{astnet_scale_high:.5f}] radius_deg={astnet_radius_deg} "
+                f"blind_retry={astnet_blind_retry} blind_cpulimit_s={astnet_blind_cpulimit_s}"
             )
 
             # Determine Gaia center - PRIORITY: FITS header > project_state
@@ -1538,6 +1587,9 @@ WHERE 1=CONTAINS(
                 astnet_cmd = []
                 astnet_cmd_str = ""
                 astnet_new_path = None
+                astnet_hint_source = ""
+                astnet_center_hint = ""
+                astnet_attempts = ""
                 solver = "astap"
                 used_elapsed = float(dt_astap)
 
@@ -1565,25 +1617,63 @@ WHERE 1=CONTAINS(
                             scale_high = float(pix_arc) * 1.15
 
                         outdir = meta_dir / "astnet_local"
-                        astnet_ok, astnet_dt, astnet_stdout, astnet_stderr, astnet_cmd, astnet_new_path = (
-                            self._run_solve_field(
-                                fits_path,
-                                center_coord=center_coord,
-                                scale_low=scale_low,
-                                scale_high=scale_high,
-                                radius_deg=astnet_radius_deg,
-                                downsample=astnet_downsample,
-                                timeout_s=astnet_timeout_s,
-                                outdir=outdir,
-                                use_wsl=astnet_use_wsl,
-                                use_cache=astnet_use_cache,
-                                max_objs=astnet_max_objs,
-                                cpulimit_s=astnet_cpulimit_s,
-                            )
+                        frame_header_coord = None
+                        try:
+                            ra0 = hdr.get("OBJCTRA", None)
+                            dec0 = hdr.get("OBJCTDEC", None)
+                            if ra0 is not None and dec0 is not None:
+                                frame_header_coord = SkyCoord(str(ra0), str(dec0), unit=(u.hourangle, u.deg))
+                        except Exception:
+                            frame_header_coord = None
+
+                        target_attempt_coord = self.target_coord if self.target_coord is not None else center_coord
+                        attempt_specs = _astnet_center_candidates(
+                            header_coord=frame_header_coord,
+                            target_coord=target_attempt_coord,
                         )
+                        has_hint_attempt = any(coord is not None for _, coord in attempt_specs)
+                        if not astnet_blind_retry and has_hint_attempt:
+                            attempt_specs = [(label, coord) for label, coord in attempt_specs if coord is not None]
+                        if not attempt_specs:
+                            attempt_specs = [("blind", None)]
+                        attempt_notes: list[str] = []
+                        for attempt_idx, (astnet_hint_source, attempt_coord) in enumerate(attempt_specs, start=1):
+                            astnet_center_hint = _format_coord_hint(attempt_coord)
+                            is_blind_retry = attempt_coord is None and has_hint_attempt
+                            attempt_cpulimit_s = astnet_blind_cpulimit_s if is_blind_retry else astnet_cpulimit_s
+                            L(
+                                f"[ASTNET_WSL] {filename} attempt={attempt_idx}/{len(attempt_specs)} "
+                                f"hint={astnet_hint_source} center={astnet_center_hint} "
+                                f"cpulimit={attempt_cpulimit_s:.0f}s"
+                            )
+                            astnet_ok, astnet_dt, astnet_stdout, astnet_stderr, astnet_cmd, astnet_new_path = (
+                                self._run_solve_field(
+                                    fits_path,
+                                    center_coord=attempt_coord,
+                                    scale_low=scale_low,
+                                    scale_high=scale_high,
+                                    radius_deg=astnet_radius_deg,
+                                    downsample=astnet_downsample,
+                                    timeout_s=astnet_timeout_s,
+                                    outdir=outdir,
+                                    use_wsl=astnet_use_wsl,
+                                    use_cache=astnet_use_cache,
+                                    max_objs=astnet_max_objs,
+                                    cpulimit_s=attempt_cpulimit_s,
+                                )
+                            )
+                            attempt_notes.append(
+                                f"{astnet_hint_source}@{astnet_center_hint}:{'ok' if astnet_ok else 'fail'}:{float(astnet_dt):.1f}s:cpu={attempt_cpulimit_s:.0f}"
+                            )
+                            if astnet_ok:
+                                break
+                        astnet_attempts = " | ".join(attempt_notes)
                         astnet_cmd_str = " ".join(str(c) for c in astnet_cmd)
                         if astnet_ok:
-                            L(f"[ASTNET_WSL] {filename} success dt={astnet_dt:.1f}s")
+                            L(
+                                f"[ASTNET_WSL] {filename} success dt={astnet_dt:.1f}s "
+                                f"hint={astnet_hint_source} center={astnet_center_hint}"
+                            )
                             if astnet_stderr:
                                 L(f"{filename}: ASTNET_WSL stderr_tail={_tail_text(astnet_stderr, limit=600, max_lines=6)}")
                         else:
@@ -1610,13 +1700,15 @@ WHERE 1=CONTAINS(
                             if not fail_reason:
                                 fail_reason = astnet_reason
                             log_cmd_failure(
-                                "ASTNET_WSL",
+                                f"ASTNET_WSL[{astnet_hint_source or 'unknown'}]",
                                 filename,
                                 f"{astnet_reason}, dt={astnet_dt:.1f}s",
                                 cmd=astnet_cmd,
                                 stdout=astnet_stdout,
                                 stderr=astnet_stderr,
                             )
+                            if astnet_attempts:
+                                L(f"{filename}: ASTNET_WSL attempts={astnet_attempts}")
 
                         if astnet_ok and astnet_new_path is not None and astnet_new_path.exists():
                             try:
@@ -1763,6 +1855,9 @@ WHERE 1=CONTAINS(
                     "astnet_wsl_ok": bool(astnet_ok),
                     "astnet_wsl_elapsed": float(astnet_dt) if np.isfinite(astnet_dt) else None,
                     "astnet_wsl_fail_reason": astnet_reason,
+                    "astnet_wsl_hint_source": astnet_hint_source,
+                    "astnet_wsl_center_hint": astnet_center_hint,
+                    "astnet_wsl_attempts": astnet_attempts,
                     "astnet_wsl_cmd": astnet_cmd_str,
                     "astnet_wsl_stdout": _tail_text(astnet_stdout, limit=2000, max_lines=12),
                     "astnet_wsl_stderr": _tail_text(astnet_stderr, limit=2000, max_lines=12),
@@ -2690,7 +2785,9 @@ WHERE 1=CONTAINS(
 
             dt = time.time() - start
             rc = int(proc.returncode if proc.returncode is not None else -998)
-            ok = (rc == 0 and run_new_path.exists() and run_solved_path.exists())
+            # Some solve-field builds return non-zero or omit the .solved marker
+            # even when usable WCS artifacts were produced.
+            ok = bool(run_new_path.exists() and (run_solved_path.exists() or run_wcs_path_out.exists()))
             if ok and run_outdir != outdir:
                 try:
                     for src, dst in (
@@ -2776,6 +2873,8 @@ WHERE 1=CONTAINS(
         keep_outputs = bool(getattr(self.params.P, "astnet_local_keep_outputs", True))
         use_cache = bool(getattr(self.params.P, "astnet_local_use_cache", True))
         cpulimit_s = float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0))
+        blind_retry = bool(getattr(self.params.P, "astnet_blind_retry_on_fail", True))
+        blind_cpulimit_s = float(getattr(self.params.P, "astnet_blind_cpulimit_s", 120.0))
         max_workers = get_parallel_workers(self.params)
 
         if scale_low <= 0 or scale_high <= 0:
@@ -2804,12 +2903,18 @@ WHERE 1=CONTAINS(
         LOG(
             f"[ASTNET] scale=[{scale_low:.5f},{scale_high:.5f}] downsample={downsample} "
             f"max_objs={max_objs} radius_deg={radius_deg} timeout_s={timeout_s} "
-            f"cpulimit_s={cpulimit_s} use_wsl={use_wsl} use_cache={use_cache}"
+            f"cpulimit_s={cpulimit_s} use_wsl={use_wsl} use_cache={use_cache} "
+            f"blind_retry={blind_retry} blind_cpulimit_s={blind_cpulimit_s}"
         )
 
         self.log_message.emit(f"Starting parallel plate solving with {max_workers} workers...")
         self.log_message.emit(f"  Scale: {scale_low:.4f} - {scale_high:.4f} arcsec/px")
+        self.log_message.emit(f"  Radius: {radius_deg:.1f} deg")
         self.log_message.emit(f"  Downsample: {downsample}, Max objs: {max_objs}")
+        self.log_message.emit(
+            f"  Blind retry: {'on' if blind_retry else 'off'}"
+            + (f", blind CPU limit: {blind_cpulimit_s:.0f}s" if blind_retry else "")
+        )
         self.log_message.emit(f"  Debug log: {log_path}")
 
         # 내부 함수: 단일 파일 처리 로직 (스레드에서 실행됨)
@@ -2840,17 +2945,44 @@ WHERE 1=CONTAINS(
             except Exception:
                 center_coord = None
             
-            if center_coord is None and self.target_coord is not None:
-                center_coord = self.target_coord
+            attempt_specs = _astnet_center_candidates(header_coord=center_coord, target_coord=self.target_coord)
+            has_hint_attempt = any(coord is not None for _, coord in attempt_specs)
+            if not blind_retry and has_hint_attempt:
+                attempt_specs = [(label, coord) for label, coord in attempt_specs if coord is not None]
+            if not attempt_specs:
+                attempt_specs = [("blind", None)]
+            attempt_notes: list[str] = []
+            ok = False
+            dt = 0.0
+            out_s = ""
+            err_s = ""
+            cmd = []
+            new_path = None
+            attempt_label = ""
+            attempt_coord_hint = ""
+            for idx, (attempt_label, attempt_coord) in enumerate(attempt_specs, start=1):
+                attempt_coord_hint = _format_coord_hint(attempt_coord)
+                is_blind_retry = attempt_coord is None and has_hint_attempt
+                attempt_cpulimit_s = blind_cpulimit_s if is_blind_retry else cpulimit_s
+                LOG(
+                    f"{filename}: attempt {idx}/{len(attempt_specs)} "
+                    f"hint={attempt_label} center={attempt_coord_hint} "
+                    f"cpulimit={attempt_cpulimit_s:.0f}s"
+                )
+                ok, dt, out_s, err_s, cmd, new_path = self._run_solve_field(
+                    fits_path, attempt_coord, scale_low, scale_high, radius_deg,
+                    downsample, timeout_s, outdir, use_wsl, True, use_cache, max_objs, attempt_cpulimit_s
+                )
+                attempt_notes.append(
+                    f"{attempt_label}@{attempt_coord_hint}:{'ok' if ok else 'fail'}:{float(dt):.1f}s:cpu={attempt_cpulimit_s:.0f}"
+                )
+                if ok:
+                    break
 
-            # solve-field 실행
-            ok, dt, out_s, err_s, cmd, new_path = self._run_solve_field(
-                fits_path, center_coord, scale_low, scale_high, radius_deg,
-                downsample, timeout_s, outdir, use_wsl, True, use_cache, max_objs, cpulimit_s
-            )
             cmd_str = " ".join(str(c) for c in cmd) if cmd else ""
             stdout_tail = _tail_text(out_s, limit=2000, max_lines=12)
             stderr_tail = _tail_text(err_s, limit=2000, max_lines=12)
+            attempt_summary = " | ".join(attempt_notes)
             fail_reason = ""
             if not ok:
                 err_l = str(err_s).lower()
@@ -2894,6 +3026,9 @@ WHERE 1=CONTAINS(
                 "ra": 0.0, "dec": 0.0, "pixscale": 0.0,
                 "elapsed_s": float(dt),
                 "solver": "astnet_wsl",
+                "astnet_wsl_hint_source": attempt_label,
+                "astnet_wsl_center_hint": attempt_coord_hint,
+                "astnet_wsl_attempts": attempt_summary,
                 "astnet_wsl_cmd": cmd_str,
                 "astnet_wsl_stdout": stdout_tail,
                 "astnet_wsl_stderr": stderr_tail,
@@ -2926,6 +3061,9 @@ WHERE 1=CONTAINS(
                                 "elapsed_s": float(dt),
                                 "solver": "astnet_wsl",
                                 "fail_reason": "",
+                                "astnet_wsl_hint_source": attempt_label,
+                                "astnet_wsl_center_hint": attempt_coord_hint,
+                                "astnet_wsl_attempts": attempt_summary,
                                 "astnet_wsl_cmd": cmd_str,
                                 "astnet_wsl_stdout": stdout_tail,
                                 "astnet_wsl_stderr": stderr_tail,
@@ -2934,7 +3072,8 @@ WHERE 1=CONTAINS(
                             }
                             LOG(
                                 f"{filename}: solved dt={dt:.1f}s RA={result['ra']:.6f} "
-                                f"Dec={result['dec']:.6f} pix={pix_fit:.5f}"
+                                f"Dec={result['dec']:.6f} pix={pix_fit:.5f} "
+                                f"hint={attempt_label} center={attempt_coord_hint}"
                             )
                             if stderr_tail:
                                 LOG(f"{filename}: solver_stderr_tail={stderr_tail}")
@@ -2960,6 +3099,9 @@ WHERE 1=CONTAINS(
                         "fail_reason": fail_reason,
                         "elapsed_s": float(dt),
                         "solver": "astnet_wsl",
+                        "astnet_wsl_hint_source": attempt_label,
+                        "astnet_wsl_center_hint": attempt_coord_hint,
+                        "astnet_wsl_attempts": attempt_summary,
                         "astnet_wsl_cmd": cmd_str,
                         "astnet_wsl_stdout": stdout_tail,
                         "astnet_wsl_stderr": stderr_tail,
@@ -2982,6 +3124,8 @@ WHERE 1=CONTAINS(
                     LOG(f"{filename}: stdout_tail={stdout_tail}")
                 if stderr_tail:
                     LOG(f"{filename}: stderr_tail={stderr_tail}")
+                if attempt_summary:
+                    LOG(f"{filename}: attempts={attempt_summary}")
 
             # 임시 파일 정리
             if not keep_outputs:
@@ -3846,7 +3990,7 @@ class WcsPlateSolvingWindow(StepWindowBase):
     def open_astrometrynet_parameters_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Astrometry.net Parameters")
-        dialog.resize(520, 520)
+        dialog.resize(520, 600)
 
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
@@ -3907,6 +4051,18 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.param_astnet_cpulimit.setValue(float(getattr(self.params.P, "astnet_local_cpulimit_s", 30.0)))
         form.addRow("CPU Limit (s):", self.param_astnet_cpulimit)
 
+        form.addRow(QLabel("── Blind retry ─────────────────────────"))
+
+        self.param_astnet_blind_retry = QCheckBox("Retry blind when hint-based solve fails")
+        self.param_astnet_blind_retry.setChecked(bool(getattr(self.params.P, "astnet_blind_retry_on_fail", True)))
+        form.addRow("Blind Retry:", self.param_astnet_blind_retry)
+
+        self.param_astnet_blind_cpulimit = QDoubleSpinBox()
+        self.param_astnet_blind_cpulimit.setRange(10, 600)
+        self.param_astnet_blind_cpulimit.setValue(float(getattr(self.params.P, "astnet_blind_cpulimit_s", 120.0)))
+        self.param_astnet_blind_cpulimit.setSuffix(" s")
+        form.addRow("Blind CPU Limit:", self.param_astnet_blind_cpulimit)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -3955,6 +4111,8 @@ class WcsPlateSolvingWindow(StepWindowBase):
         self.params.P.astnet_local_use_cache = self.param_astnet_use_cache.isChecked()
         self.params.P.astnet_local_max_objs = self.param_astnet_max_objs.value()
         self.params.P.astnet_local_cpulimit_s = self.param_astnet_cpulimit.value()
+        self.params.P.astnet_blind_retry_on_fail = self.param_astnet_blind_retry.isChecked()
+        self.params.P.astnet_blind_cpulimit_s = self.param_astnet_blind_cpulimit.value()
         self.persist_params()
         self.save_state()
         QMessageBox.information(dialog, "Success", "Astrometry.net parameters saved!")
@@ -4025,8 +4183,57 @@ class WcsPlateSolvingWindow(StepWindowBase):
                 eta_str = f" | ETA {int(remaining // 60)}m{int(remaining % 60):02d}s"
         self.progress_label.setText(f"{current}/{total}{eta_str} | {filename}")
 
+    @staticmethod
+    def _boolish(value) -> bool:
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if value is None:
+            return False
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return bool(value) and np.isfinite(value)
+        return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "ok", "solved"}
+
+    @classmethod
+    def _is_successful_wcs_result(cls, result: dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if cls._boolish(result.get("ok")):
+            return True
+        status = str(result.get("status", "")).strip().lower()
+        return status in {"ok", "ok_astnet_wsl", "solved"}
+
+    def _restore_success_results_from_summary(self):
+        summary_path = step6_dir(self.params.P.result_dir) / "wcs_solve_summary.csv"
+        if not summary_path.exists():
+            return
+        try:
+            df = pd.read_csv(summary_path)
+        except Exception:
+            return
+        if df.empty:
+            return
+
+        file_col = "file" if "file" in df.columns else "fname" if "fname" in df.columns else None
+        if not file_col:
+            return
+
+        restored = {}
+        for row in df.to_dict("records"):
+            if not self._is_successful_wcs_result(row):
+                continue
+            filename = row.get(file_col)
+            if filename is None or pd.isna(filename):
+                continue
+            restored[str(filename)] = row
+
+        if restored:
+            self.results = restored
+
     def on_file_done(self, filename, result):
-        self.results[filename] = result
+        if self._is_successful_wcs_result(result):
+            self.results[filename] = result
+        else:
+            self.results.pop(filename, None)
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         self.results_table.setItem(row, 0, QTableWidgetItem(filename))
@@ -4100,3 +4307,5 @@ class WcsPlateSolvingWindow(StepWindowBase):
             for key, val in state_data.items():
                 if hasattr(self.params.P, key):
                     setattr(self.params.P, key, val)
+        self._restore_success_results_from_summary()
+        self.update_navigation_buttons()

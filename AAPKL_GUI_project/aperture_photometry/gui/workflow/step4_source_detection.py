@@ -3471,7 +3471,7 @@ class SourceDetectionWindow(StepWindowBase):
         if self.detection_worker and self.detection_worker.isRunning():
             self.stop_detection()
             self.detection_worker.wait(5000)
-        event.accept()
+        super().closeEvent(event)
 
     def populate_results_table(self):
         """Populate results table from detection_results"""

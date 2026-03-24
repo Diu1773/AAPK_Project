@@ -815,6 +815,15 @@ class WCSConfig(BaseModel):
         ge=1.0, le=600.0,
         description="solve-field --cpulimit (seconds)"
     )
+    astnet_blind_retry_on_fail: bool = Field(
+        default=True,
+        description="Retry solve-field without RA/Dec hint when hint-based solve fails"
+    )
+    astnet_blind_cpulimit_s: float = Field(
+        default=120.0,
+        ge=10.0, le=600.0,
+        description="solve-field --cpulimit for blind retry (seconds)"
+    )
     wcs_propagate_max_shift_px: float = Field(
         default=50.0,
         ge=1.0, le=500.0,
