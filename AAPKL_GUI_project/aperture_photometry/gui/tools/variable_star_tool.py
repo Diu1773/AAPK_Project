@@ -1,16 +1,14 @@
 """
 Variable Star Analysis Tool
 
-Detailed period analysis + refinement + O-C diagram for variable stars
-(Mira, RR Lyr, Cepheid, Delta Sct, etc.).
+Interactive variable-star workflow for Step 10/11 or merged-workspace light curves.
 
-Pipeline:
-  1. Load light curve (from Step 10/11 output)
-  2. Quick LS/PDM scan  →  coarse best period
-  3. Fine-grid refinement + bootstrap σ_P
-  4. Phase-fold viewer with harmonic selector
-  5. O-C diagram with linear / parabola / parabola+sine fits
-  6. Basic Fourier decomposition (R21, φ21)
+Workflow:
+  1. Load a light curve workspace
+  2. Run a quick LS/PDM/BLS scan
+  3. Route to Single or Multi analysis
+  4. Single path: refine/bootstrap -> phase/Fourier -> O-C
+  5. Multi path: candidate periods -> multi-mode fit -> isolated mode views
 """
 
 from __future__ import annotations
@@ -129,6 +127,15 @@ def _describe_series(corr_tag: str, mag_col: str) -> str:
         return "Corrected"
     return "Raw"
 
+
+def _target_plot_title(params, target_id: int | None = None) -> str:
+    target_name = str(getattr(params.P, "target_name", "") or "").strip()
+    if target_name:
+        return target_name
+    if target_id is not None:
+        return f"Target ID {int(target_id)}"
+    return "Target"
+
 from astropy.timeseries import LombScargle
 
 from matplotlib.backends.backend_qt5agg import (
@@ -208,6 +215,344 @@ def _pick_check_overlay_cols(df: pd.DataFrame, preferred_mag_col: str | None = N
             mag_col = col
             break
     return time_col, mag_col
+
+
+def _parse_period_list(text: str) -> list[float]:
+    periods: list[float] = []
+    seen: set[float] = set()
+    for token in re.split(r"[\s,;/]+", str(text or "").strip()):
+        if not token:
+            continue
+        try:
+            value = float(token)
+        except Exception:
+            continue
+        if not np.isfinite(value) or value <= 0:
+            continue
+        key = round(value, 12)
+        if key in seen:
+            continue
+        seen.add(key)
+        periods.append(float(value))
+    return periods
+
+
+def _format_period_list(periods: list[float]) -> str:
+    return ", ".join(f"{float(p):.8f}" for p in periods if np.isfinite(p) and float(p) > 0)
+
+
+def _scan_top_periods(results: dict | None, max_count: int = 3) -> list[float]:
+    if not results:
+        return []
+    for key in ("raw_ls", "raw_pdm", "raw_bls"):
+        data = results.get(key)
+        if not data or "error" in data:
+            continue
+        raw_periods = data.get("top_periods") or []
+        periods: list[float] = []
+        for value in raw_periods:
+            try:
+                p = float(value)
+            except Exception:
+                continue
+            if not np.isfinite(p) or p <= 0:
+                continue
+            if any(abs(p - prev) / max(abs(prev), 1e-12) < 1e-5 for prev in periods):
+                continue
+            periods.append(p)
+            if len(periods) >= int(max_count):
+                break
+        return periods
+    return []
+
+
+def _period_to_frequency(period: float) -> float:
+    try:
+        value = float(period)
+    except Exception:
+        return np.nan
+    if not np.isfinite(value) or value <= 0:
+        return np.nan
+    return 1.0 / value
+
+
+def _is_1day_alias_period(p1: float, p2: float, tol: float = 0.01) -> bool:
+    f1 = _period_to_frequency(p1)
+    f2 = _period_to_frequency(p2)
+    if not (np.isfinite(f1) and np.isfinite(f2)):
+        return False
+    for order in (1, 2):
+        for sign in (-1.0, 1.0):
+            alias = f1 + sign * float(order)
+            if alias <= 0:
+                continue
+            if abs(alias - f2) / max(abs(f2), 1e-12) < tol:
+                return True
+    return False
+
+
+def _is_near_harmonic_period(p1: float, p2: float, max_order: int = 6, tol: float = 0.02) -> bool:
+    f1 = _period_to_frequency(p1)
+    f2 = _period_to_frequency(p2)
+    if not (np.isfinite(f1) and np.isfinite(f2)):
+        return False
+    hi = max(f1, f2)
+    lo = min(f1, f2)
+    if lo <= 0:
+        return False
+    ratio = hi / lo
+    for order in range(2, int(max_order) + 1):
+        if abs(ratio - float(order)) / float(order) < tol:
+            return True
+    return False
+
+
+def _recommend_analysis_mode_from_scan(results: dict | None) -> tuple[str, str]:
+    if not results:
+        return "unknown", "Run a scan first."
+
+    available = []
+    for key in ("raw_ls", "raw_pdm", "raw_bls"):
+        data = results.get(key)
+        if not data or "error" in data:
+            continue
+        best = float(data.get("best_period", np.nan))
+        if np.isfinite(best) and best > 0:
+            available.append((key, data))
+    if not available:
+        return "unknown", "No usable scan result."
+
+    primary_key, primary = available[0]
+    primary_label = primary_key.split("_", 1)[1].upper()
+    top_periods = [float(p) for p in primary.get("top_periods", []) if np.isfinite(p) and float(p) > 0]
+    top_powers = [float(v) for v in primary.get("top_powers", []) if np.isfinite(v)]
+    if not top_periods:
+        return "unknown", "No period peaks found."
+    best_period = top_periods[0]
+    best_power = top_powers[0] if top_powers else float(primary.get("best_power", np.nan))
+
+    for idx, cand_period in enumerate(top_periods[1:], start=1):
+        cand_power = top_powers[idx] if idx < len(top_powers) else np.nan
+        if _is_1day_alias_period(best_period, cand_period):
+            continue
+        if _is_near_harmonic_period(best_period, cand_period):
+            continue
+        if np.isfinite(cand_power) and np.isfinite(best_power) and best_power > 0:
+            rel_power = cand_power / best_power
+            if rel_power >= 0.45:
+                return "multi", (
+                    f"{primary_label} scan shows a comparable secondary non-alias peak "
+                    f"({cand_period:.6f} d, {rel_power:.0%} of primary power)."
+                )
+        else:
+            return "multi", f"{primary_label} scan shows a secondary non-alias peak at {cand_period:.6f} d."
+
+    best_periods = [float(data["best_period"]) for _, data in available]
+    unique_periods: list[float] = []
+    for value in best_periods:
+        if any(abs(value - prev) / max(abs(prev), 1e-12) < 0.01 for prev in unique_periods):
+            continue
+        unique_periods.append(value)
+    if len(unique_periods) >= 2:
+        for idx in range(len(unique_periods)):
+            for jdx in range(idx + 1, len(unique_periods)):
+                p1 = unique_periods[idx]
+                p2 = unique_periods[jdx]
+                if _is_1day_alias_period(p1, p2) or _is_near_harmonic_period(p1, p2):
+                    continue
+                return "multi", (
+                    f"Different methods prefer distinct non-alias periods ({p1:.6f} d vs {p2:.6f} d)."
+                )
+
+    return "single", f"Current scan is dominated by one primary period near {best_period:.6f} d."
+
+
+def _build_multimode_design_matrix(time_rel: np.ndarray, periods: list[float], harmonics: int) -> tuple[np.ndarray, list[dict]]:
+    cols = [np.ones(len(time_rel), dtype=float)]
+    terms: list[dict] = []
+    for mode_index, period in enumerate(periods):
+        base_freq = 1.0 / float(period)
+        for harmonic in range(1, int(harmonics) + 1):
+            omega = 2.0 * np.pi * base_freq * harmonic
+            cols.append(np.cos(omega * time_rel))
+            terms.append({
+                "mode_index": int(mode_index),
+                "harmonic": int(harmonic),
+                "kind": "cos",
+                "omega": float(omega),
+            })
+            cols.append(np.sin(omega * time_rel))
+            terms.append({
+                "mode_index": int(mode_index),
+                "harmonic": int(harmonic),
+                "kind": "sin",
+                "omega": float(omega),
+            })
+    return np.column_stack(cols), terms
+
+
+def _evaluate_multimode_result(result: dict, times: np.ndarray) -> dict:
+    arr_t = np.asarray(times, dtype=float)
+    tau = arr_t - float(result["time_ref"])
+    coeff = np.asarray(result["coeff"], dtype=float)
+    periods = [float(p) for p in result["periods"]]
+    components = np.zeros((len(periods), len(arr_t)), dtype=float)
+    derivs = np.zeros_like(components)
+    total = np.full(len(arr_t), float(coeff[0]), dtype=float)
+
+    for coeff_idx, term in enumerate(result["terms"], start=1):
+        omega = float(term["omega"])
+        if term["kind"] == "cos":
+            basis = np.cos(omega * tau)
+            deriv_basis = -omega * np.sin(omega * tau)
+        else:
+            basis = np.sin(omega * tau)
+            deriv_basis = omega * np.cos(omega * tau)
+        contrib = float(coeff[coeff_idx]) * basis
+        components[int(term["mode_index"])] += contrib
+        derivs[int(term["mode_index"])] += float(coeff[coeff_idx]) * deriv_basis
+        total += contrib
+
+    return {
+        "times": arr_t,
+        "intercept": float(coeff[0]),
+        "total": total,
+        "components": components,
+        "component_derivatives": derivs,
+        "total_derivative": np.sum(derivs, axis=0),
+    }
+
+
+def _fit_multimode_model(
+    time: np.ndarray,
+    mag: np.ndarray,
+    mag_err: np.ndarray | None,
+    periods: list[float],
+    harmonics: int = 1,
+) -> dict:
+    mask = np.isfinite(time) & np.isfinite(mag)
+    if mag_err is not None:
+        mask &= np.isfinite(mag_err)
+    t = np.asarray(time[mask], dtype=float)
+    y = np.asarray(mag[mask], dtype=float)
+    dy = np.asarray(mag_err[mask], dtype=float) if mag_err is not None else None
+    if len(t) < 10:
+        raise ValueError("Not enough valid data points for multi-mode fit (< 10).")
+
+    order = np.argsort(t)
+    t = t[order]
+    y = y[order]
+    dy = dy[order] if dy is not None else None
+    time_ref = float(np.min(t))
+    time_rel = t - time_ref
+    design, terms = _build_multimode_design_matrix(time_rel, periods, harmonics)
+
+    if dy is not None and np.any(dy > 0):
+        sigma = np.clip(np.asarray(dy, dtype=float), 1e-6, None)
+        coeff, _, rank, singular_values = np.linalg.lstsq(design / sigma[:, None], y / sigma, rcond=None)
+    else:
+        sigma = None
+        coeff, _, rank, singular_values = np.linalg.lstsq(design, y, rcond=None)
+
+    coeff = np.asarray(coeff, dtype=float)
+    eval_obs = _evaluate_multimode_result(
+        {"time_ref": time_ref, "coeff": coeff, "periods": periods, "terms": terms},
+        t,
+    )
+    model = eval_obs["total"]
+    residual = y - model
+    baseline = float(np.max(t) - np.min(t)) if len(t) else 0.0
+    rmse = float(np.sqrt(np.nanmean(residual ** 2))) if len(residual) else np.nan
+    if sigma is not None and len(sigma) == len(residual):
+        wrms = float(np.sqrt(np.nanmean((residual / sigma) ** 2)))
+    else:
+        wrms = np.nan
+    singular_values = np.asarray(singular_values, dtype=float)
+    if singular_values.size >= 2 and np.all(np.isfinite(singular_values)) and singular_values[-1] > 0:
+        design_condition = float(singular_values[0] / singular_values[-1])
+    else:
+        design_condition = np.inf
+
+    return {
+        "time": t,
+        "mag": y,
+        "mag_err": sigma,
+        "periods": [float(p) for p in periods],
+        "harmonics": int(harmonics),
+        "coeff": coeff,
+        "terms": terms,
+        "time_ref": time_ref,
+        "intercept": float(coeff[0]),
+        "model": model,
+        "components": eval_obs["components"],
+        "component_derivatives": eval_obs["component_derivatives"],
+        "residual": residual,
+        "baseline": baseline,
+        "n_points": int(len(t)),
+        "n_params": int(design.shape[1]),
+        "rank": int(rank),
+        "rmse": rmse,
+        "wrms": wrms,
+        "design_condition": design_condition,
+    }
+
+
+def _trend_label(dm_dt: float) -> str:
+    if not np.isfinite(dm_dt):
+        return "unknown"
+    if abs(dm_dt) < 1e-6:
+        return "turning"
+    return "brightening" if dm_dt < 0 else "fading"
+
+
+def _fit_fixed_period_fourier(
+    time: np.ndarray,
+    mag: np.ndarray,
+    period: float,
+    harmonics: int,
+) -> dict:
+    t = np.asarray(time, dtype=float)
+    y = np.asarray(mag, dtype=float)
+    mask = np.isfinite(t) & np.isfinite(y)
+    t = t[mask]
+    y = y[mask]
+    if len(t) < max(8, 2 * int(harmonics) + 3):
+        raise ValueError("Not enough points for phase fit")
+    time_ref = float(np.nanmin(t))
+    tau = t - time_ref
+    omega = 2.0 * np.pi / float(period)
+    design = np.column_stack(
+        [np.ones(len(t))] +
+        [f(k * omega * tau) for k in range(1, int(harmonics) + 1) for f in (np.cos, np.sin)]
+    )
+    coeff, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+    return {
+        "coeff": np.asarray(coeff, dtype=float),
+        "time_ref": time_ref,
+        "period": float(period),
+    }
+
+
+def _evaluate_fixed_period_fourier(
+    time: np.ndarray,
+    period: float,
+    fit_result: dict,
+) -> np.ndarray:
+    t = np.asarray(time, dtype=float)
+    coeff = np.asarray(fit_result["coeff"], dtype=float)
+    time_ref = float(fit_result.get("time_ref", 0.0))
+    tau = t - time_ref
+    harmonics = max(0, (len(coeff) - 1) // 2)
+    model = np.full(len(t), float(coeff[0]), dtype=float)
+    if harmonics <= 0:
+        return model
+    omega = 2.0 * np.pi / float(period)
+    idx = 1
+    for k in range(1, harmonics + 1):
+        model += float(coeff[idx]) * np.cos(k * omega * tau)
+        model += float(coeff[idx + 1]) * np.sin(k * omega * tau)
+        idx += 2
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +742,16 @@ class VariableStarToolWindow(QWidget):
         self.scan_result: Optional[dict] = None
         self.refined_period: Optional[float] = None
         self.sigma_period: Optional[float] = None
+        self.multimode_result: Optional[dict] = None
         self._scan_worker: Optional[PeriodAnalysisWorker] = None
         self._refine_worker: Optional[RefineBootstrapWorker] = None
         self.filter_colors: dict = {}      # user-customized per-filter colors
         self.filter_visibility: dict = {}  # True=visible, False=hidden
         self.workspace_dir = Path(self.params.P.result_dir)
+        self.analysis_mode = "auto"
+        self.recommended_mode = "unknown"
+        self.recommendation_text = "Load a light curve and run a scan."
+        self.workflow_step = "load"
 
         self.setWindowTitle("Variable Star Analysis")
         self.resize(1200, 800)
@@ -416,8 +766,8 @@ class VariableStarToolWindow(QWidget):
         root = QVBoxLayout(self)
 
         header = QLabel(
-            "<b>Variable Star Analysis</b> — Lomb-Scargle scan → fine-grid refinement → "
-            "bootstrap σ_P → phase plot → O-C diagram → Fourier decomposition"
+            "<b>Variable Star Analysis</b> — load workspace → quick scan → "
+            "route to Single/Multi → refine or multi-mode fit → phase/O-C/Fourier"
         )
         header.setStyleSheet("QLabel { background: #E8EAF6; padding: 8px; border-radius: 4px; }")
         header.setWordWrap(True)
@@ -428,14 +778,14 @@ class VariableStarToolWindow(QWidget):
 
         # ---- Left panel (controls) ----
         left = QWidget()
-        left.setMaximumWidth(310)
+        left.setMaximumWidth(340)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
         splitter.addWidget(left)
 
         # Light curve
-        lc_group = QGroupBox("Light Curve")
-        lc_form = QFormLayout(lc_group)
+        self.lc_group = QGroupBox("Light Curve")
+        lc_form = QFormLayout(self.lc_group)
         self.lc_status = QLabel("Not loaded")
         self.lc_status.setWordWrap(True)
         lc_form.addRow("Status:", self.lc_status)
@@ -459,19 +809,60 @@ class VariableStarToolWindow(QWidget):
         self.analysis_filter_combo.setEnabled(False)
         self.analysis_filter_combo.currentIndexChanged.connect(self._on_analysis_filter_changed)
         lc_form.addRow("Filter:", self.analysis_filter_combo)
-        left_layout.addWidget(lc_group)
+        left_layout.addWidget(self.lc_group)
 
         # Filter display controls
-        filt_group = QGroupBox("Filter Display")
-        filt_form = QFormLayout(filt_group)
+        self.filt_group = QGroupBox("Filter Display")
+        filt_form = QFormLayout(self.filt_group)
         btn_filt_browser = QPushButton("Browse Colors / Visibility…")
         btn_filt_browser.clicked.connect(self.show_filter_color_browser)
         filt_form.addRow(btn_filt_browser)
-        left_layout.addWidget(filt_group)
+        left_layout.addWidget(self.filt_group)
+
+        # Workflow / routing
+        self.workflow_group = QGroupBox("Analysis Workflow")
+        workflow_layout = QVBoxLayout(self.workflow_group)
+        workflow_layout.setContentsMargins(8, 8, 8, 8)
+        workflow_layout.setSpacing(6)
+
+        self.workflow_status_label = QLabel("Load a light curve to begin.")
+        self.workflow_status_label.setWordWrap(True)
+        self.workflow_status_label.setStyleSheet(
+            "QLabel { background: #ECEFF1; padding: 8px; border-radius: 4px; font-size: 8pt; }"
+        )
+        workflow_layout.addWidget(self.workflow_status_label)
+
+        workflow_btn_layout = QGridLayout()
+        workflow_btn_layout.setHorizontalSpacing(6)
+        workflow_btn_layout.setVerticalSpacing(6)
+        self.workflow_buttons = {}
+        for idx, (step_key, label) in enumerate((
+            ("load", "1. Load"),
+            ("scan", "2. Scan"),
+            ("single", "3. Single"),
+            ("multi", "4. Multi"),
+        )):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _checked=False, step=step_key: self._set_workflow_step(step))
+            workflow_btn_layout.addWidget(btn, idx // 2, idx % 2)
+            self.workflow_buttons[step_key] = btn
+        workflow_layout.addLayout(workflow_btn_layout)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Path:"))
+        self.analysis_mode_combo = QComboBox()
+        self.analysis_mode_combo.addItem("Auto", "auto")
+        self.analysis_mode_combo.addItem("Single", "single")
+        self.analysis_mode_combo.addItem("Multi", "multi")
+        self.analysis_mode_combo.currentIndexChanged.connect(self._on_analysis_mode_changed)
+        mode_row.addWidget(self.analysis_mode_combo, 1)
+        workflow_layout.addLayout(mode_row)
+        left_layout.addWidget(self.workflow_group)
 
         # Period scan
-        scan_group = QGroupBox("Period Scan")
-        scan_form = QFormLayout(scan_group)
+        self.scan_group = QGroupBox("Period Scan")
+        scan_form = QFormLayout(self.scan_group)
         self.min_p = QDoubleSpinBox()
         self.min_p.setRange(0.001, 500); self.min_p.setDecimals(4)
         self.min_p.setValue(0.05); self.min_p.setSuffix(" d")
@@ -503,11 +894,29 @@ class VariableStarToolWindow(QWidget):
         self.scan_status = QLabel("")
         self.scan_status.setStyleSheet("font-size: 8pt; color: #555;")
         scan_form.addRow(self.scan_status)
-        left_layout.addWidget(scan_group)
+        left_layout.addWidget(self.scan_group)
+
+        self.route_group = QGroupBox("Route")
+        route_form = QFormLayout(self.route_group)
+        self.route_recommend_label = QLabel("Run a scan to get a single/multi recommendation.")
+        self.route_recommend_label.setWordWrap(True)
+        self.route_recommend_label.setStyleSheet(
+            "QLabel { background: #FFF8E1; padding: 8px; border-radius: 4px; font-size: 8pt; }"
+        )
+        route_form.addRow("Recommendation:", self.route_recommend_label)
+        route_btn_row = QHBoxLayout()
+        self.btn_route_single = QPushButton("Go Single")
+        self.btn_route_single.clicked.connect(lambda: self._route_to_analysis_path("single"))
+        route_btn_row.addWidget(self.btn_route_single)
+        self.btn_route_multi = QPushButton("Go Multi")
+        self.btn_route_multi.clicked.connect(lambda: self._route_to_analysis_path("multi"))
+        route_btn_row.addWidget(self.btn_route_multi)
+        route_form.addRow("Open:", route_btn_row)
+        left_layout.addWidget(self.route_group)
 
         # Refine
-        refine_group = QGroupBox("Refine & Bootstrap")
-        refine_form = QFormLayout(refine_group)
+        self.refine_group = QGroupBox("Refine & Bootstrap")
+        refine_form = QFormLayout(self.refine_group)
         rp_row = QHBoxLayout()
         self.center_p = QDoubleSpinBox()
         self.center_p.setRange(0.00001, 10000); self.center_p.setDecimals(8)
@@ -536,25 +945,109 @@ class VariableStarToolWindow(QWidget):
         self.refine_status = QLabel("")
         self.refine_status.setStyleSheet("font-size: 8pt; color: #555;")
         refine_form.addRow(self.refine_status)
-        left_layout.addWidget(refine_group)
+        left_layout.addWidget(self.refine_group)
+
+        # Multi-mode fit
+        self.mm_group = QGroupBox("Multi-Mode Fit")
+        mm_form = QFormLayout(self.mm_group)
+        self.mm_periods_edit = QLineEdit()
+        self.mm_periods_edit.setPlaceholderText("0.086017, 0.066529")
+        mm_form.addRow("Periods (d):", self.mm_periods_edit)
+        self.mm_n_modes = QSpinBox()
+        self.mm_n_modes.setRange(1, 6); self.mm_n_modes.setValue(2)
+        mm_form.addRow("Top peaks:", self.mm_n_modes)
+        btn_mm_row = QHBoxLayout()
+        btn_mm_best = QPushButton("+ Best")
+        btn_mm_best.clicked.connect(self._append_current_period_to_multimode)
+        btn_mm_row.addWidget(btn_mm_best)
+        btn_mm_peaks = QPushButton("Top Peaks")
+        btn_mm_peaks.clicked.connect(self._set_multimode_periods_from_scan)
+        btn_mm_row.addWidget(btn_mm_peaks)
+        mm_form.addRow(btn_mm_row)
+        self.mm_harm = QSpinBox()
+        self.mm_harm.setRange(1, 4); self.mm_harm.setValue(1)
+        mm_form.addRow("Harmonics/mode:", self.mm_harm)
+        focus_row = QHBoxLayout()
+        self.mm_focus_combo = QComboBox()
+        self.mm_focus_combo.setEnabled(False)
+        self.mm_focus_combo.currentIndexChanged.connect(self._on_multimode_focus_changed)
+        focus_row.addWidget(self.mm_focus_combo, 1)
+        btn_mm_phase = QPushButton("→ Phase")
+        btn_mm_phase.clicked.connect(self._apply_multimode_focus_to_phase)
+        focus_row.addWidget(btn_mm_phase)
+        mm_form.addRow("Send mode:", focus_row)
+        state_row = QHBoxLayout()
+        self.mm_state_epoch = QDoubleSpinBox()
+        self.mm_state_epoch.setRange(2400000, 2600000); self.mm_state_epoch.setDecimals(6)
+        self.mm_state_epoch.setValue(2458000.0)
+        self.mm_state_epoch.valueChanged.connect(self._draw_multimode)
+        state_row.addWidget(self.mm_state_epoch, 1)
+        btn_state_t0 = QPushButton("← T₀")
+        btn_state_t0.clicked.connect(lambda: self.mm_state_epoch.setValue(self.t0_edit.value()))
+        state_row.addWidget(btn_state_t0)
+        mm_form.addRow("State epoch:", state_row)
+        self.mm_project_chk = QCheckBox("Show projected beat window")
+        self.mm_project_chk.setChecked(True)
+        self.mm_project_chk.toggled.connect(self._draw_multimode)
+        mm_form.addRow(self.mm_project_chk)
+        self.mm_overlay_chk = QCheckBox("Overlay isolated mode on Phase Plot")
+        self.mm_overlay_chk.setChecked(False)
+        self.mm_overlay_chk.toggled.connect(self._update_phase_plot)
+        mm_form.addRow(self.mm_overlay_chk)
+        self.mm_overlay_chk.hide()
+        self.btn_multimode_fit = QPushButton("Fit Multi-Mode")
+        self.btn_multimode_fit.setStyleSheet(
+            "QPushButton { background: #455A64; color: white; font-weight: bold; padding: 6px; }"
+        )
+        self.btn_multimode_fit.clicked.connect(self._run_multimode_fit)
+        mm_form.addRow(self.btn_multimode_fit)
+        self.mm_status = QLabel("")
+        self.mm_status.setStyleSheet("font-size: 8pt; color: #555;")
+        self.mm_status.setWordWrap(True)
+        mm_form.addRow(self.mm_status)
+        left_layout.addWidget(self.mm_group)
 
         # Phase plot controls
-        phase_group = QGroupBox("Phase Plot")
-        phase_form = QFormLayout(phase_group)
+        self.phase_group = QGroupBox("Phase Plot")
+        phase_form = QFormLayout(self.phase_group)
         self.phase_p = QDoubleSpinBox()
         self.phase_p.setRange(0.00001, 10000); self.phase_p.setDecimals(8)
         self.phase_p.setValue(1.0); self.phase_p.setSuffix(" d")
-        self.phase_p.valueChanged.connect(self._update_phase_plot)
+        self.phase_p.valueChanged.connect(self._on_phase_period_changed)
         phase_form.addRow("Period:", self.phase_p)
+        self.phase_mode_combo = QComboBox()
+        self.phase_mode_combo.addItem("Manual / custom period", "manual")
+        self.phase_mode_combo.setEnabled(False)
+        self.phase_mode_combo.currentIndexChanged.connect(self._on_phase_mode_changed)
+        phase_form.addRow("Mode from fit:", self.phase_mode_combo)
         self.t0_edit = QDoubleSpinBox()
         self.t0_edit.setRange(2400000, 2600000); self.t0_edit.setDecimals(6)
         self.t0_edit.setValue(2458000.0)
         self.t0_edit.valueChanged.connect(self._update_phase_plot)
+        self.t0_edit.valueChanged.connect(self._draw_multimode)
         phase_form.addRow("T₀ (BJD):", self.t0_edit)
+        self.phase_data_mode = QComboBox()
+        self.phase_data_mode.addItem("Raw composite (diagnostic)", "raw")
+        self.phase_data_mode.addItem("Focused mode isolation", "focused")
+        self.phase_data_mode.currentIndexChanged.connect(self._update_phase_plot)
+        phase_form.addRow("Data view:", self.phase_data_mode)
+        self.phase_check_overlay_chk = QCheckBox("Show check star")
+        self.phase_check_overlay_chk.setChecked(False)
+        self.phase_check_overlay_chk.toggled.connect(self._update_phase_plot)
+        phase_form.addRow(self.phase_check_overlay_chk)
+        self.phase_fit_chk = QCheckBox("Overlay phase fit")
+        self.phase_fit_chk.setChecked(True)
+        self.phase_fit_chk.toggled.connect(self._update_phase_plot)
+        phase_form.addRow(self.phase_fit_chk)
+        self.phase_fit_harm = QSpinBox()
+        self.phase_fit_harm.setRange(1, 8)
+        self.phase_fit_harm.setValue(4)
+        self.phase_fit_harm.valueChanged.connect(self._update_phase_plot)
+        phase_form.addRow("Fit harmonics:", self.phase_fit_harm)
         btn_detect_t0 = QPushButton("Detect T₀ (min)")
         btn_detect_t0.clicked.connect(self._detect_t0)
         phase_form.addRow(btn_detect_t0)
-        left_layout.addWidget(phase_group)
+        left_layout.addWidget(self.phase_group)
 
         left_layout.addStretch()
 
@@ -616,6 +1109,10 @@ class VariableStarToolWindow(QWidget):
         ref_layout.addWidget(ref_splitter, 1)
         self.tabs.addTab(ref_tab, "Refine")
 
+        # Multi-mode tab
+        mm_tab = self._build_multimode_tab()
+        self.tabs.addTab(mm_tab, "Multi-Mode")
+
         # Phase plot tab
         ph_tab = QWidget()
         ph_layout = QVBoxLayout(ph_tab)
@@ -631,6 +1128,123 @@ class VariableStarToolWindow(QWidget):
         # Fourier tab
         fo_tab = self._build_fourier_tab()
         self.tabs.addTab(fo_tab, "Fourier")
+        self.tabs.currentChanged.connect(self._sync_left_panel_visibility)
+        self._refresh_tool_workflow_ui()
+
+    def _effective_analysis_mode(self) -> str:
+        if self.analysis_mode in ("single", "multi"):
+            return self.analysis_mode
+        if self.recommended_mode in ("single", "multi"):
+            return self.recommended_mode
+        return "single"
+
+    def _set_tool_tab(self, title: str) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        for idx in range(self.tabs.count()):
+            if self.tabs.tabText(idx) == title:
+                self.tabs.setCurrentIndex(idx)
+                return
+
+    def _set_workflow_step(self, step: str) -> None:
+        if step not in {"load", "scan", "single", "multi"}:
+            return
+        if step != "load" and self.lc_data is None:
+            step = "load"
+        if step in {"single", "multi"} and self.scan_result is None:
+            step = "scan"
+        self.workflow_step = step
+        if step == "scan":
+            self._set_tool_tab("Periodogram")
+        elif step == "single":
+            self._set_tool_tab("Refine")
+        elif step == "multi":
+            self._set_tool_tab("Multi-Mode")
+        self._refresh_tool_workflow_ui()
+
+    def _on_analysis_mode_changed(self) -> None:
+        mode = self.analysis_mode_combo.currentData() if hasattr(self, "analysis_mode_combo") else "auto"
+        self.analysis_mode = str(mode or "auto")
+        if self.workflow_step in {"single", "multi"}:
+            self.workflow_step = self._effective_analysis_mode()
+        self._refresh_tool_workflow_ui()
+
+    def _route_to_analysis_path(self, mode: str) -> None:
+        if mode not in {"single", "multi"}:
+            return
+        if hasattr(self, "analysis_mode_combo"):
+            idx = self.analysis_mode_combo.findData(mode)
+            if idx >= 0:
+                self.analysis_mode_combo.setCurrentIndex(idx)
+        self.analysis_mode = mode
+        self._set_workflow_step(mode)
+
+    def _refresh_tool_workflow_ui(self) -> None:
+        has_data = self.lc_data is not None
+        has_scan = self.scan_result is not None
+        effective_mode = self._effective_analysis_mode()
+        mode_text = {
+            "auto": f"Auto → {effective_mode.title()}" if effective_mode else "Auto",
+            "single": "Single",
+            "multi": "Multi",
+        }.get(self.analysis_mode, str(self.analysis_mode))
+        step_text = {
+            "load": "Load",
+            "scan": "Scan",
+            "single": "Single",
+            "multi": "Multi",
+        }.get(self.workflow_step, self.workflow_step)
+        if hasattr(self, "workflow_status_label"):
+            self.workflow_status_label.setText(
+                f"Current step: {step_text}\nAnalysis path: {mode_text}\n{self.recommendation_text}"
+            )
+
+        enabled_map = {
+            "load": True,
+            "scan": has_data,
+            "single": has_scan,
+            "multi": has_scan,
+        }
+        for key, btn in getattr(self, "workflow_buttons", {}).items():
+            btn.blockSignals(True)
+            btn.setEnabled(enabled_map.get(key, False))
+            btn.setChecked(key == self.workflow_step)
+            if key == self.workflow_step:
+                btn.setStyleSheet(
+                    "QPushButton { background: #1565C0; color: white; font-weight: bold; }"
+                )
+            elif key in {"single", "multi"} and key == effective_mode and has_scan:
+                btn.setStyleSheet(
+                    "QPushButton { background: #E3F2FD; color: #0D47A1; font-weight: bold; }"
+                )
+            else:
+                btn.setStyleSheet("")
+            btn.blockSignals(False)
+
+        if hasattr(self, "route_recommend_label"):
+            route_style = "#FFF8E1"
+            if self.recommended_mode == "single":
+                route_style = "#E8F5E9"
+            elif self.recommended_mode == "multi":
+                route_style = "#FFF3E0"
+            self.route_recommend_label.setStyleSheet(
+                f"QLabel {{ background: {route_style}; padding: 8px; border-radius: 4px; font-size: 8pt; }}"
+            )
+            self.route_recommend_label.setText(self.recommendation_text)
+
+        if hasattr(self, "btn_route_single"):
+            self.btn_route_single.setEnabled(has_scan)
+        if hasattr(self, "btn_route_multi"):
+            self.btn_route_multi.setEnabled(has_scan)
+
+        self.scan_group.setVisible(self.workflow_step == "scan")
+        self.route_group.setVisible(self.workflow_step == "scan")
+        self.refine_group.setVisible(self.workflow_step == "single")
+        self.mm_group.setVisible(self.workflow_step == "multi")
+        self.phase_group.setVisible(self.workflow_step in {"single", "multi"})
+
+    def _sync_left_panel_visibility(self, *_):
+        self._refresh_tool_workflow_ui()
 
     def _build_oc_tab(self) -> QWidget:
         tab = QWidget()
@@ -767,6 +1381,475 @@ class VariableStarToolWindow(QWidget):
 
         return tab
 
+    def _build_multimode_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        help_label = QLabel(
+            "<b>Multi-Mode Fit</b> — 여러 주기를 동시에 넣는 선형 다중주파수 Fourier fit입니다. "
+            "문헌 period를 직접 넣거나 스캔 peak를 가져온 뒤, JD time-series 총합 fit과 "
+            "각 모드별 분리 phase curve를 확인합니다."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet(
+            "QLabel { background: #FFF3E0; padding: 8px; border-radius: 4px; "
+            "font-size: 8pt; border: 1px solid #FFCC80; }"
+        )
+        layout.addWidget(help_label)
+
+        self.mm_summary_label = QLabel("Set periods and run Fit Multi-Mode.")
+        self.mm_summary_label.setWordWrap(True)
+        self.mm_summary_label.setStyleSheet(
+            "QLabel { background: #ECEFF1; padding: 8px; border-radius: 4px; "
+            "font-family: monospace; font-size: 9pt; }"
+        )
+        layout.addWidget(self.mm_summary_label)
+
+        self.mm_canvas = FigureCanvas(Figure(figsize=(8, 6)))
+        layout.addWidget(NavigationToolbar(self.mm_canvas, tab))
+        layout.addWidget(self.mm_canvas, 1)
+
+        return tab
+
+    # ------------------------------------------------------------------
+    # Multi-mode
+    # ------------------------------------------------------------------
+
+    def _clear_multimode_result(self, clear_inputs: bool = False):
+        self.multimode_result = None
+        if clear_inputs and hasattr(self, "mm_periods_edit"):
+            self.mm_periods_edit.clear()
+        if hasattr(self, "mm_status"):
+            self.mm_status.setText("")
+        if hasattr(self, "mm_focus_combo"):
+            self.mm_focus_combo.blockSignals(True)
+            self.mm_focus_combo.clear()
+            self.mm_focus_combo.setEnabled(False)
+            self.mm_focus_combo.blockSignals(False)
+        if hasattr(self, "mm_summary_label"):
+            self.mm_summary_label.setText("Set periods and run Fit Multi-Mode.")
+        if hasattr(self, "phase_mode_combo"):
+            self.phase_mode_combo.blockSignals(True)
+            self.phase_mode_combo.clear()
+            self.phase_mode_combo.addItem("Manual / custom period", "manual")
+            self.phase_mode_combo.setEnabled(False)
+            self.phase_mode_combo.blockSignals(False)
+        if hasattr(self, "mm_canvas"):
+            fig = self.mm_canvas.figure
+            fig.clear()
+            self.mm_canvas.draw_idle()
+
+    def _sync_phase_mode_combo(self):
+        if not hasattr(self, "phase_mode_combo"):
+            return
+        current_data = self.phase_mode_combo.currentData()
+        self.phase_mode_combo.blockSignals(True)
+        self.phase_mode_combo.clear()
+        self.phase_mode_combo.addItem("Manual / custom period", "manual")
+        periods = []
+        if self.multimode_result:
+            periods = [float(p) for p in self.multimode_result.get("periods", [])]
+        for idx, period in enumerate(periods):
+            self.phase_mode_combo.addItem(f"M{idx + 1} | P={period:.8f} d", idx)
+        self.phase_mode_combo.setEnabled(bool(periods))
+        restore_idx = self.phase_mode_combo.findData(current_data)
+        if restore_idx < 0:
+            restore_idx = 0
+        self.phase_mode_combo.setCurrentIndex(restore_idx)
+        self.phase_mode_combo.blockSignals(False)
+
+    def _selected_phase_mode_index(self) -> int | None:
+        if not hasattr(self, "phase_mode_combo"):
+            return None
+        data = self.phase_mode_combo.currentData()
+        try:
+            idx = int(data)
+        except Exception:
+            return None
+        if not self.multimode_result:
+            return None
+        periods = [float(p) for p in self.multimode_result.get("periods", [])]
+        if 0 <= idx < len(periods):
+            return idx
+        return None
+
+    def _on_phase_mode_changed(self):
+        idx = self._selected_phase_mode_index()
+        if idx is None or not self.multimode_result:
+            self._update_phase_plot()
+            return
+        period = float(self.multimode_result["periods"][idx])
+        self.phase_p.blockSignals(True)
+        self.phase_p.setValue(period)
+        self.phase_p.blockSignals(False)
+        mode_idx = self.phase_data_mode.findData("focused")
+        if mode_idx >= 0:
+            self.phase_data_mode.blockSignals(True)
+            self.phase_data_mode.setCurrentIndex(mode_idx)
+            self.phase_data_mode.blockSignals(False)
+        if hasattr(self, "mm_focus_combo"):
+            combo_idx = self.mm_focus_combo.findData(idx)
+            if combo_idx >= 0:
+                self.mm_focus_combo.blockSignals(True)
+                self.mm_focus_combo.setCurrentIndex(combo_idx)
+                self.mm_focus_combo.blockSignals(False)
+        self._draw_multimode()
+        self._update_phase_plot()
+
+    def _on_phase_period_changed(self):
+        idx = self._selected_phase_mode_index()
+        if idx is not None and self.multimode_result:
+            try:
+                mode_period = float(self.multimode_result["periods"][idx])
+            except Exception:
+                mode_period = np.nan
+            current_period = float(self.phase_p.value())
+            if np.isfinite(mode_period) and np.isfinite(current_period):
+                rel = abs(current_period - mode_period) / max(abs(mode_period), 1e-12)
+                if rel > 1e-5 and hasattr(self, "phase_mode_combo"):
+                    manual_idx = self.phase_mode_combo.findData("manual")
+                    if manual_idx >= 0:
+                        self.phase_mode_combo.blockSignals(True)
+                        self.phase_mode_combo.setCurrentIndex(manual_idx)
+                        self.phase_mode_combo.blockSignals(False)
+        self._update_phase_plot()
+
+    def _phase_multimode_payload(
+        self,
+        t_v: np.ndarray,
+        m_v: np.ndarray,
+        current_period: float,
+    ) -> dict | None:
+        if not self.multimode_result or not np.isfinite(current_period) or current_period <= 0:
+            return None
+        periods = [float(p) for p in self.multimode_result.get("periods", [])]
+        if not periods:
+            return None
+        idx = self._selected_phase_mode_index()
+        if idx is None:
+            rel = np.asarray([abs(current_period - p) / max(abs(p), 1e-12) for p in periods], dtype=float)
+            idx = int(np.argmin(rel))
+            if not np.isfinite(rel[idx]) or rel[idx] > 0.03:
+                return None
+        eval_obs = _evaluate_multimode_result(self.multimode_result, t_v)
+        focus_component = np.asarray(eval_obs["components"][idx], dtype=float)
+        iso_mag = m_v - (eval_obs["total"] - (float(eval_obs["intercept"]) + focus_component))
+        return {
+            "index": idx,
+            "period": periods[idx],
+            "iso_mag": iso_mag,
+        }
+
+    def _append_current_period_to_multimode(self):
+        current = np.nan
+        if self.refined_period is not None and np.isfinite(self.refined_period):
+            current = float(self.refined_period)
+        elif self.scan_result:
+            current, _, _ = self._best_from_results(self.scan_result)
+        elif np.isfinite(self.phase_p.value()):
+            current = float(self.phase_p.value())
+        if not np.isfinite(current) or current <= 0:
+            QMessageBox.information(self, "Multi-Mode", "추가할 주기가 없습니다.")
+            return
+        periods = _parse_period_list(self.mm_periods_edit.text())
+        if not any(abs(current - p) / max(abs(p), 1e-12) < 1e-5 for p in periods):
+            periods.append(current)
+        self.mm_periods_edit.setText(_format_period_list(periods))
+
+    def _set_multimode_periods_from_scan(self):
+        periods = _scan_top_periods(self.scan_result, max_count=self.mm_n_modes.value())
+        if not periods:
+            QMessageBox.information(self, "Multi-Mode", "먼저 period scan을 실행하세요.")
+            return
+        self.mm_periods_edit.setText(_format_period_list(periods))
+        self.mm_status.setText(f"Loaded {len(periods)} peak period(s) from scan.")
+
+    def _selected_multimode_focus_index(self) -> int | None:
+        if not self.multimode_result:
+            return None
+        periods = [float(p) for p in self.multimode_result.get("periods", [])]
+        if not periods:
+            return None
+        data = self.mm_focus_combo.currentData() if hasattr(self, "mm_focus_combo") else None
+        try:
+            idx = int(data)
+            if 0 <= idx < len(periods):
+                return idx
+        except Exception:
+            pass
+        phase_idx = self._selected_phase_mode_index()
+        if phase_idx is not None:
+            return phase_idx
+        phase_period = float(self.phase_p.value())
+        if np.isfinite(phase_period) and phase_period > 0:
+            rel = [abs(phase_period - p) / max(abs(p), 1e-12) for p in periods]
+            return int(np.argmin(rel))
+        return 0
+
+    def _on_multimode_focus_changed(self):
+        if self.mm_overlay_chk.isChecked():
+            self._update_phase_plot()
+
+    def _apply_multimode_focus_to_phase(self):
+        idx = self._selected_multimode_focus_index()
+        if idx is None or not self.multimode_result:
+            return
+        if hasattr(self, "phase_mode_combo"):
+            combo_idx = self.phase_mode_combo.findData(idx)
+            if combo_idx >= 0:
+                self.phase_mode_combo.setCurrentIndex(combo_idx)
+                return
+        self.phase_p.setValue(float(self.multimode_result["periods"][idx]))
+
+    def _run_multimode_fit(self):
+        if self.lc_data is None:
+            QMessageBox.warning(self, "No Data", "Load a light curve first.")
+            return
+
+        periods = _parse_period_list(self.mm_periods_edit.text())
+        if not periods:
+            QMessageBox.warning(self, "Multi-Mode", "한 개 이상 period를 입력하세요.")
+            return
+        if len(periods) > 6:
+            QMessageBox.warning(self, "Multi-Mode", "Mode 수는 6개 이하로 제한하세요.")
+            return
+
+        try:
+            self.workflow_step = "multi"
+            self._refresh_tool_workflow_ui()
+            self.mm_status.setText("Fitting…")
+            result = _fit_multimode_model(
+                self.lc_data["time"],
+                self.lc_data["mag"],
+                self.lc_data.get("mag_err"),
+                periods=periods,
+                harmonics=int(self.mm_harm.value()),
+            )
+        except Exception as e:
+            self.mm_status.setText("Fit failed")
+            QMessageBox.warning(self, "Multi-Mode Fit", str(e))
+            return
+
+        self.multimode_result = result
+        self.mm_focus_combo.blockSignals(True)
+        self.mm_focus_combo.clear()
+        for idx, period in enumerate(result["periods"]):
+            self.mm_focus_combo.addItem(f"M{idx + 1} | P={float(period):.8f} d", idx)
+        focus_idx = self._selected_multimode_focus_index()
+        if focus_idx is None:
+            focus_idx = 0
+        self.mm_focus_combo.setCurrentIndex(max(0, min(focus_idx, self.mm_focus_combo.count() - 1)))
+        self.mm_focus_combo.setEnabled(self.mm_focus_combo.count() > 0)
+        self.mm_focus_combo.blockSignals(False)
+        self._sync_phase_mode_combo()
+        self.mm_status.setText(
+            f"Fitted {len(result['periods'])} mode(s), {int(result['harmonics'])} harmonic(s)/mode."
+        )
+        cond = float(result.get("design_condition", np.nan))
+        n_points = int(result.get("n_points", 0))
+        n_params = int(result.get("n_params", 0))
+        if (np.isfinite(cond) and cond > 1e8) or (n_params > 0 and n_points < n_params * 4):
+            self.mm_status.setText(
+                self.mm_status.text() + " Warning: fit may be underconstrained/overfit for this baseline."
+            )
+        self._draw_multimode()
+        if self.mm_overlay_chk.isChecked():
+            self._update_phase_plot()
+        self.log(
+            f"Multi-mode fit: {len(result['periods'])} modes, "
+            f"periods={_format_period_list(result['periods'])}"
+        )
+
+    def _draw_multimode(self):
+        if not hasattr(self, "mm_canvas"):
+            return
+        fig = self.mm_canvas.figure
+        fig.clear()
+
+        if not self.multimode_result:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No multi-mode fit yet", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=12, color="gray")
+            ax.set_axis_off()
+            fig.tight_layout()
+            self.mm_canvas.draw_idle()
+            return
+
+        result = self.multimode_result
+        periods = [float(p) for p in result["periods"]]
+        t = np.asarray(result["time"], dtype=float)
+        y = np.asarray(result["mag"], dtype=float)
+        model = np.asarray(result["model"], dtype=float)
+        residual = np.asarray(result["residual"], dtype=float)
+
+        obs_start = float(np.min(t))
+        obs_end = float(np.max(t))
+        obs_span = max(obs_end - obs_start, 1e-9)
+        baseline = float(result.get("baseline", obs_span))
+        longest_period = max(periods)
+        proj_span = max(baseline, longest_period * 3.0)
+        beat_lines: list[str] = []
+        freqs = [1.0 / p for p in periods]
+        for i in range(len(freqs)):
+            for j in range(i + 1, len(freqs)):
+                dfreq = abs(freqs[i] - freqs[j])
+                if dfreq <= 1e-9:
+                    continue
+                beat = 1.0 / dfreq
+                if np.isfinite(beat):
+                    proj_span = max(proj_span, min(beat, longest_period * 12.0))
+                    beat_lines.append(f"M{i + 1}-M{j + 1} beat≈{beat:.5f} d ({beat*24:.2f} h)")
+
+        n_grid_obs = max(600, min(4000, int(obs_span * 4000)))
+        t_dense_obs = np.linspace(obs_start, obs_end, n_grid_obs)
+        obs_eval = _evaluate_multimode_result(result, t_dense_obs)
+        total_dense_obs = obs_eval["total"]
+
+        n_grid_proj = max(1200, min(5000, int(proj_span * 4000)))
+        t_dense_proj = np.linspace(obs_start, obs_start + proj_span, n_grid_proj)
+        proj_eval = _evaluate_multimode_result(result, t_dense_proj)
+        total_dense_proj = proj_eval["total"]
+
+        obs_bright = float(np.nanmin(total_dense_obs))
+        obs_faint = float(np.nanmax(total_dense_obs))
+        obs_ptp = float(obs_faint - obs_bright)
+        proj_bright = float(np.nanmin(total_dense_proj))
+        proj_faint = float(np.nanmax(total_dense_proj))
+        proj_ptp = float(proj_faint - proj_bright)
+
+        t0 = float(self.t0_edit.value())
+        state_epoch = float(self.mm_state_epoch.value())
+        state_eval = _evaluate_multimode_result(result, np.array([state_epoch], dtype=float))
+        total_state = float(state_eval["total"][0])
+        total_state_trend = _trend_label(float(state_eval["total_derivative"][0]))
+
+        component_lines: list[str] = []
+        phase_panels: list[dict] = []
+        for idx, period in enumerate(periods):
+            phase_grid = np.linspace(0.0, 1.0, 500)
+            phase_times = t0 + phase_grid * period
+            phase_eval = _evaluate_multimode_result(result, phase_times)
+            comp_curve = phase_eval["intercept"] + phase_eval["components"][idx]
+            comp_ptp = float(np.nanmax(comp_curve) - np.nanmin(comp_curve))
+            comp_phase = ((state_epoch - t0) / period) % 1.0 if period > 0 else np.nan
+            comp_state = float(state_eval["components"][idx][0])
+            comp_trend = _trend_label(float(state_eval["component_derivatives"][idx][0]))
+            component_lines.append(
+                f"M{idx + 1}: P={period:.8f} d  f={1.0/period:.5f} d^-1  "
+                f"Δm≈{comp_ptp:.4f}  φ={comp_phase:.3f}  contrib={comp_state:+.4f}  {comp_trend}"
+            )
+
+            component_obs = np.asarray(result["components"][idx], dtype=float)
+            other_model = model - (float(result["intercept"]) + component_obs)
+            iso_mag = y - other_model
+            obs_phase = ((t - t0) / period) % 1.0
+            phase_model = np.linspace(0.0, 2.0, 800)
+            phase_model_times = t0 + (phase_model % 1.0) * period
+            phase_model_eval = _evaluate_multimode_result(result, phase_model_times)
+            model_curve = phase_model_eval["intercept"] + phase_model_eval["components"][idx]
+            phase_panels.append({
+                "index": idx,
+                "period": period,
+                "phase_ext": np.concatenate([obs_phase, obs_phase + 1.0]),
+                "iso_ext": np.concatenate([iso_mag, iso_mag]),
+                "phase_model": phase_model,
+                "model_curve": model_curve,
+            })
+
+        summary_lines = [
+            f"[{len(periods)} mode(s) | {int(result['harmonics'])} harmonic(s)/mode | "
+            f"n={int(result.get('n_points', len(t)))} pts | p={int(result.get('n_params', 0))} params]",
+            f"Observed-window fit range: {obs_bright:.4f} .. {obs_faint:.4f} mag  (Δm={obs_ptp:.4f})",
+            f"Projected beat range: {proj_bright:.4f} .. {proj_faint:.4f} mag  (Δm={proj_ptp:.4f})",
+            f"Fit RMS={float(result.get('rmse', np.nan)):.5f} mag  "
+            f"WRMS={float(result.get('wrms', np.nan)):.3f}  cond≈{float(result.get('design_condition', np.nan)):.2e}",
+            f"State @ {state_epoch:.6f} BJD: model={total_state:.4f} mag  ({total_state_trend})",
+        ]
+        summary_lines.extend(component_lines)
+        summary_lines.extend(beat_lines[:4])
+        self.mm_summary_label.setText("\n".join(summary_lines))
+
+        show_phase_panels = min(len(phase_panels), 4)
+        phase_cols = 2 if show_phase_panels > 1 else 1
+        phase_rows = max(1, (show_phase_panels + phase_cols - 1) // phase_cols)
+        gs = fig.add_gridspec(2 + phase_rows, phase_cols, height_ratios=[1.25, 0.9] + [1.0] * phase_rows)
+        ax_time = fig.add_subplot(gs[0, :])
+        ax_resid = fig.add_subplot(gs[1, :])
+        phase_axes = [
+            fig.add_subplot(gs[2 + (panel_idx // phase_cols), panel_idx % phase_cols])
+            for panel_idx in range(show_phase_panels)
+        ]
+
+        show_projection = bool(self.mm_project_chk.isChecked()) if hasattr(self, "mm_project_chk") else False
+
+        ax_time.scatter(t, y, s=12, color="#607D8B", alpha=0.7, label="Data")
+        ax_time.plot(t_dense_obs, total_dense_obs, color="#D32F2F", lw=1.6, label="Observed-window fit")
+        if show_projection and len(t_dense_proj) > len(t_dense_obs):
+            proj_mask = t_dense_proj > obs_end
+            if np.any(proj_mask):
+                ax_time.plot(
+                    t_dense_proj[proj_mask],
+                    total_dense_proj[proj_mask],
+                    color="#D32F2F",
+                    lw=1.3,
+                    ls="--",
+                    alpha=0.85,
+                    label="Projected beat window",
+                )
+                ax_time.axvspan(obs_start, obs_end, color="#ECEFF1", alpha=0.35, zorder=0)
+                ax_time.axvline(obs_end, color="#9E9E9E", ls=":", lw=1.0, alpha=0.7)
+                ax_time.set_xlim(obs_start, float(t_dense_proj[-1]))
+            else:
+                ax_time.set_xlim(obs_start, obs_end)
+        else:
+            ax_time.set_xlim(obs_start, obs_end)
+        ax_time.invert_yaxis()
+        ax_time.set_xlabel("Time (BJD)")
+        ax_time.set_ylabel("Magnitude")
+        if show_projection:
+            ax_time.set_title("Observed JD + Projected Beat Window")
+        else:
+            ax_time.set_title("Observed JD Window + Total Multi-Mode Fit")
+        ax_time.grid(True, alpha=0.3)
+        ax_time.legend(fontsize=8)
+
+        ax_resid.scatter(t, residual, s=12, color="#3949AB", alpha=0.7)
+        ax_resid.axhline(0, color="gray", ls="--", lw=1.0, alpha=0.6)
+        ax_resid.set_xlabel("Time (BJD)")
+        ax_resid.set_ylabel("Residual (mag)")
+        ax_resid.set_title("Residual After Total Fit")
+        ax_resid.grid(True, alpha=0.3)
+
+        for ax_phase, panel in zip(phase_axes, phase_panels[:show_phase_panels]):
+            idx = int(panel["index"])
+            ax_phase.scatter(
+                panel["phase_ext"],
+                panel["iso_ext"],
+                s=10,
+                color="#1E88E5",
+                alpha=0.72,
+                label=f"M{idx + 1} isolated",
+            )
+            ax_phase.plot(
+                panel["phase_model"],
+                panel["model_curve"],
+                color="#C62828",
+                lw=1.5,
+                label="Fit",
+            )
+            ax_phase.invert_yaxis()
+            ax_phase.set_xlim(0, 2)
+            ax_phase.set_xlabel("Phase")
+            ax_phase.set_ylabel("Magnitude")
+            ax_phase.set_title(f"M{idx + 1} Isolated Phase (P={float(panel['period']):.8f} d)")
+            ax_phase.axvline(0, color="gray", ls=":", alpha=0.4)
+            ax_phase.axvline(1, color="gray", ls=":", alpha=0.4)
+            ax_phase.grid(True, alpha=0.3)
+            ax_phase.legend(fontsize=8)
+
+        fig.tight_layout()
+        self.mm_canvas.draw_idle()
+
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
@@ -804,6 +1887,10 @@ class VariableStarToolWindow(QWidget):
         self.scan_result = None
         self.refined_period = None
         self.sigma_period = None
+        self.multimode_result = None
+        self.recommended_mode = "unknown"
+        self.recommendation_text = str(status)
+        self.workflow_step = "load"
         self.mag_col_combo.blockSignals(True)
         self.mag_col_combo.clear()
         self.mag_col_combo.setEnabled(False)
@@ -815,7 +1902,16 @@ class VariableStarToolWindow(QWidget):
         self.analysis_filter_combo.blockSignals(False)
         self.lc_status.setText(status)
         self.lc_status.setStyleSheet("color: #C62828;")
-        for canvas_name in ("pg_canvas", "ref_canvas", "boot_canvas", "ph_canvas", "oc_canvas", "fourier_canvas"):
+        if hasattr(self, "mm_status"):
+            self.mm_status.setText("")
+        if hasattr(self, "mm_summary_label"):
+            self.mm_summary_label.setText("Set periods and run Fit Multi-Mode.")
+        if hasattr(self, "mm_focus_combo"):
+            self.mm_focus_combo.blockSignals(True)
+            self.mm_focus_combo.clear()
+            self.mm_focus_combo.setEnabled(False)
+            self.mm_focus_combo.blockSignals(False)
+        for canvas_name in ("pg_canvas", "ref_canvas", "boot_canvas", "mm_canvas", "ph_canvas", "oc_canvas", "fourier_canvas"):
             canvas = getattr(self, canvas_name, None)
             if canvas is None:
                 continue
@@ -824,6 +1920,7 @@ class VariableStarToolWindow(QWidget):
                 continue
             fig.clear()
             canvas.draw_idle()
+        self._refresh_tool_workflow_ui()
 
     def _load_paths(self, paths: list[Path]):
         try:
@@ -959,6 +2056,7 @@ class VariableStarToolWindow(QWidget):
             "corr_tag": item.get("corr_tag", ""),
             "analysis_filter": selected_filter,
             "series_label": item.get("series_label", item["mag_col"]),
+            "target_id": item.get("target_id"),
         }
         n = int(np.sum(np.isfinite(self.lc_data["time"]) & np.isfinite(self.lc_data["mag"])))
         corr_line = f"  [{self.lc_data['corr_tag']}]" if self.lc_data.get("corr_tag") else ""
@@ -986,7 +2084,17 @@ class VariableStarToolWindow(QWidget):
         t0_guess = float(np.nanmin(self.lc_data["time"]))
         self.t0_edit.setValue(t0_guess)
         self.oc_t0.setValue(t0_guess)
+        if hasattr(self, "mm_state_epoch"):
+            self.mm_state_epoch.setValue(t0_guess)
         self._update_fourier_filter_combo()
+        self._clear_multimode_result(clear_inputs=False)
+        self.scan_result = None
+        self.refined_period = None
+        self.sigma_period = None
+        self.recommended_mode = "unknown"
+        self.recommendation_text = "Run a period scan, then choose the Single or Multi path."
+        self.workflow_step = "scan"
+        self._refresh_tool_workflow_ui()
 
     def _refresh_analysis_filter_combo(self, filters) -> str:
         current = self.analysis_filter_combo.currentData()
@@ -1052,6 +2160,8 @@ class VariableStarToolWindow(QWidget):
             return
 
         self.scan_status.setText("Running…")
+        self.workflow_step = "scan"
+        self._refresh_tool_workflow_ui()
         mag = self.lc_data["mag"]
         self._scan_worker = PeriodAnalysisWorker(
             time=self.lc_data["time"],
@@ -1073,6 +2183,7 @@ class VariableStarToolWindow(QWidget):
         # results keyed as "raw_ls", "raw_pdm", "raw_bls"
         self.scan_result = results
         best_period, best_power, fap = self._best_from_results(results)
+        self.recommended_mode, self.recommendation_text = _recommend_analysis_mode_from_scan(results)
         fap_str = f"{fap:.2e}" if np.isfinite(fap) else "—"
         methods_run = [k.split("_", 1)[1].upper() for k in results]
         self.scan_status.setText(
@@ -1085,6 +2196,8 @@ class VariableStarToolWindow(QWidget):
         self._draw_periodogram(results)
         self._update_phase_plot()
         self.log(f"Scan done: P={best_period:.6f} d, power={best_power:.4f}, FAP={fap_str}")
+        self.log(f"[ROUTE] Recommended path: {self.recommended_mode} — {self.recommendation_text}")
+        self._refresh_tool_workflow_ui()
 
     def _best_from_results(self, results: dict):
         """Pick best period across all methods (prefer ls > pdm > bls)."""
@@ -1151,6 +2264,8 @@ class VariableStarToolWindow(QWidget):
             return
         if self._refine_worker and self._refine_worker.isRunning():
             return
+        self.workflow_step = "single"
+        self._refresh_tool_workflow_ui()
         self.btn_refine.setEnabled(False)
         self.refine_status.setText("Running…")
         self.tabs.setCurrentIndex(1)  # Refine tab
@@ -1272,6 +2387,67 @@ class VariableStarToolWindow(QWidget):
         self.oc_t0.setValue(t0_epoch)
         self.log(f"T₀ detected: {t0_epoch:.6f} BJD  (φ_min={phi_min:.4f})")
 
+    def _overlay_phase_fourier_fit(self, ax, t_v: np.ndarray, m_v: np.ndarray, filt_v):
+        if not self.phase_fit_chk.isChecked():
+            return
+        period = float(self.phase_p.value())
+        t0 = float(self.t0_edit.value())
+        if not np.isfinite(period) or period <= 0:
+            return
+        harmonics = int(self.phase_fit_harm.value())
+        phase_model = np.linspace(0.0, 2.0, 1000)
+        time_model = t0 + (phase_model % 1.0) * period
+
+        if filt_v is not None:
+            unique_filters = sorted(set(filt_v))
+        else:
+            unique_filters = [""]
+
+        for fi, filt in enumerate(unique_filters):
+            if filt and not self.filter_visibility.get(filt, True):
+                continue
+            sel = (filt_v == filt) if filt_v is not None else np.ones(len(t_v), dtype=bool)
+            if np.sum(sel) < max(8, 2 * harmonics + 3):
+                continue
+            try:
+                fit_result = _fit_fixed_period_fourier(t_v[sel], m_v[sel], period, harmonics)
+            except Exception:
+                continue
+            model_mag = _evaluate_fixed_period_fourier(time_model, period, fit_result)
+            color = self.filter_colors.get(filt) or _filt_color(filt, fi)
+            label = f"{filt} fit" if filt else f"Fit (N={harmonics})"
+            ax.plot(phase_model, model_mag, color=color, lw=1.6, alpha=0.95, zorder=4, label=label)
+
+    def _overlay_multimode_phase_plot(self, ax, t_v: np.ndarray, m_v: np.ndarray, phase: np.ndarray):
+        if not self.multimode_result or not self.mm_overlay_chk.isChecked():
+            return
+        focus_idx = self._selected_multimode_focus_index()
+        if focus_idx is None:
+            return
+        focus_period = float(self.multimode_result["periods"][focus_idx])
+        current_period = float(self.phase_p.value())
+        if not np.isfinite(current_period) or current_period <= 0:
+            return
+        if abs(current_period - focus_period) / max(abs(focus_period), 1e-12) > 0.02:
+            return
+
+        eval_obs = _evaluate_multimode_result(self.multimode_result, t_v)
+        focus_component = np.asarray(eval_obs["components"][focus_idx], dtype=float)
+        iso_mag = m_v - (eval_obs["total"] - (float(eval_obs["intercept"]) + focus_component))
+        phase_ext = np.concatenate([phase, phase + 1.0])
+        iso_ext = np.concatenate([iso_mag, iso_mag])
+        ax.scatter(
+            phase_ext, iso_ext, s=14, facecolors="none", edgecolors="#263238",
+            linewidths=0.8, alpha=0.55, zorder=4, label=f"M{focus_idx + 1} isolated"
+        )
+
+        t0 = float(self.t0_edit.value())
+        phase_model = np.linspace(0.0, 2.0, 800)
+        phase_times = t0 + (phase_model % 1.0) * focus_period
+        eval_model = _evaluate_multimode_result(self.multimode_result, phase_times)
+        focus_model = eval_model["intercept"] + eval_model["components"][focus_idx]
+        ax.plot(phase_model, focus_model, color="#212121", lw=1.4, zorder=5, label=f"M{focus_idx + 1} fit")
+
     def _update_phase_plot(self):
         if self.lc_data is None:
             return
@@ -1287,6 +2463,19 @@ class VariableStarToolWindow(QWidget):
         filt_v = filters[mask] if filters is not None else None
 
         phase = ((t_v - t0) / period) % 1.0
+        plot_mag = m_v
+        title_suffix = ""
+        phase_view_mode = self.phase_data_mode.currentData() if hasattr(self, "phase_data_mode") else "raw"
+        focus_payload = None
+        if phase_view_mode == "focused":
+            focus_payload = self._phase_multimode_payload(t_v, m_v, float(period))
+            if focus_payload is not None:
+                plot_mag = np.asarray(focus_payload["iso_mag"], dtype=float)
+                title_suffix = f"  [M{int(focus_payload['index']) + 1} isolated]"
+            else:
+                title_suffix = "  [select fitted mode]"
+        elif self.multimode_result:
+            title_suffix = "  [raw composite]"
 
         fig = self.ph_canvas.figure
         fig.clear()
@@ -1298,7 +2487,7 @@ class VariableStarToolWindow(QWidget):
                 continue
             sel = (filt_v == filt) if filt_v is not None else np.ones(len(phase), bool)
             ph_sel = np.concatenate([phase[sel], phase[sel] + 1.0])
-            m_sel = np.concatenate([m_v[sel], m_v[sel]])
+            m_sel = np.concatenate([plot_mag[sel], plot_mag[sel]])
             color = self.filter_colors.get(filt) or _filt_color(filt, fi)
             label = filt if filt else "data"
             if dy_v is not None:
@@ -1309,41 +2498,68 @@ class VariableStarToolWindow(QWidget):
             else:
                 ax.scatter(ph_sel, m_sel, color=color, s=12, alpha=0.7, label=label)
 
+        target_title = _target_plot_title(self.params, self.lc_data.get("target_id"))
         ax.invert_yaxis()
         ax.set_xlabel("Phase")
         ax.set_ylabel("Magnitude")
-        ax.set_title(f"Phase Plot  P={period:.6f} d   T₀={t0:.4f}  [{self.lc_data['source']}]")
+        ax.set_title(f"{target_title}  |  P={period:.6f} d   T₀={t0:.4f}{title_suffix}")
         ax.set_xlim(0, 2)
         ax.axvline(0, color="gray", ls=":", alpha=0.4)
         ax.axvline(1, color="gray", ls=":", alpha=0.4)
         ax.grid(True, alpha=0.3)
-        if len(unique_filters) > 1 or (unique_filters and unique_filters[0] != ""):
-            ax.legend(fontsize=8, title="Filter")
+        legend_title = "Filter" if (len(unique_filters) > 1 or (unique_filters and unique_filters[0] != "")) else None
 
         # Check star phase-folded overlay
-        try:
-            _rd = self._current_workspace_dir()
-            _check_filter = _resolve_check_filter(
-                self.lc_data.get("filters"),
-                self.lc_data.get("analysis_filter"),
+        if self.phase_check_overlay_chk.isChecked():
+            try:
+                _rd = self._current_workspace_dir()
+                _check_filter = _resolve_check_filter(
+                    self.lc_data.get("filters"),
+                    self.lc_data.get("analysis_filter"),
+                )
+                _ck_id, _ck_df = _load_check_star_for_plot(_rd, filt=_check_filter)
+                if _ck_df is not None and not _ck_df.empty:
+                    _t_col, _y_col = _pick_check_overlay_cols(_ck_df, self.lc_data.get("mag_col"))
+                    if _t_col and _y_col:
+                        _ct = pd.to_numeric(_ck_df[_t_col], errors="coerce").to_numpy(float)
+                        _cm = pd.to_numeric(_ck_df[_y_col], errors="coerce").to_numpy(float)
+                        _mask = np.isfinite(_ct) & np.isfinite(_cm)
+                        if _mask.any():
+                            _ck_label = f"Check ID {_ck_id}" if _ck_id is not None else "Check"
+                            _phase = ((_ct[_mask] - t0) / period) % 1.0
+                            _phase_ext = np.concatenate([_phase, _phase + 1.0])
+                            _mag_ext = np.concatenate([_cm[_mask], _cm[_mask]])
+                            ax.scatter(
+                                _phase_ext,
+                                _mag_ext,
+                                s=8,
+                                color="#FFD700",
+                                alpha=0.4,
+                                zorder=2,
+                                label=_ck_label,
+                                marker="^",
+                            )
+            except Exception:
+                pass
+
+        self._overlay_phase_fourier_fit(ax, t_v, plot_mag, filt_v)
+        if phase_view_mode != "focused":
+            self._overlay_multimode_phase_plot(ax, t_v, m_v, phase)
+        elif focus_payload is None and self.multimode_result:
+            ax.text(
+                0.5,
+                0.03,
+                "Select M1/M2 from 'Mode from fit' for a meaningful single-mode phase curve.",
+                transform=ax.transAxes,
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color="#6D4C41",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#FFF3E0", edgecolor="#FFCC80", alpha=0.9),
             )
-            _ck_id, _ck_df = _load_check_star_for_plot(_rd, filt=_check_filter)
-            if _ck_df is not None and not _ck_df.empty:
-                _t_col, _y_col = _pick_check_overlay_cols(_ck_df, self.lc_data.get("mag_col"))
-                if _t_col and _y_col:
-                    _ct = pd.to_numeric(_ck_df[_t_col], errors="coerce").to_numpy(float)
-                    _cm = pd.to_numeric(_ck_df[_y_col], errors="coerce").to_numpy(float)
-                    _mask = np.isfinite(_ct) & np.isfinite(_cm)
-                    if _mask.any():
-                        _ck_label = f"Check ID {_ck_id}" if _ck_id is not None else "Check"
-                        _phase = ((_ct[_mask] - t0) / period) % 1.0
-                        _phase_ext = np.concatenate([_phase, _phase + 1.0])
-                        _mag_ext = np.concatenate([_cm[_mask], _cm[_mask]])
-                        ax.scatter(_phase_ext, _mag_ext, s=8, color="#FFD700", alpha=0.4,
-                                   zorder=2, label=_ck_label, marker="^")
-                        ax.legend(fontsize=8)
-        except Exception:
-            pass
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=8, title=legend_title)
 
         fig.tight_layout()
         self.ph_canvas.draw_idle()
