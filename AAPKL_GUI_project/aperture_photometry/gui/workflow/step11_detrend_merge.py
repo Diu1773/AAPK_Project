@@ -47,7 +47,7 @@ from PyQt5.QtWidgets import (
     QTextBrowser,
     QProgressBar,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSignalBlocker
 from PyQt5.QtGui import QColor, QFont
 
 from .step_window_base import StepWindowBase
@@ -73,6 +73,7 @@ from ...utils.step_paths import (
     step11_current_global_diag_path,
     step11_history_dir,
     legacy_step11_zeropoint_dir,
+    load_detrend_preference,
 )
 from ...utils.common_helpers import safe_float as _safe_float, normalize_filter_key as _normalize_filter_key, parse_jd as _parse_jd
 from ...utils.io_utils import (
@@ -1390,9 +1391,209 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         self._refresh_delta_c_map()
         self._log_color_index_info()
         self._update_color_mode_enabled()
+        self.corrected_df = pd.DataFrame()
+        self.params_df = pd.DataFrame()
+        self.global_mean_df = pd.DataFrame()
+        self.global_diagnostics = {}
+        self._load_saved_current_result(silent=True)
         if not self.runtime_mode:
+            self._update_results_table()
             self._update_plots()
             self._update_analysis_panel()
+        return True
+
+    def _sync_mode_controls_from_state(self) -> None:
+        is_global = self.mode == "global"
+        self.color_map_group.setEnabled(not is_global)
+        self.chk_global_k2.setEnabled(not is_global)
+        blockers = [
+            QSignalBlocker(self.mode_offset),
+            QSignalBlocker(self.mode_color),
+            QSignalBlocker(self.mode_global),
+        ]
+        try:
+            if self.mode == "color":
+                self.mode_color.setChecked(True)
+            elif self.mode == "global":
+                self.mode_global.setChecked(True)
+            else:
+                self.mode = "offset"
+                self.mode_offset.setChecked(True)
+        finally:
+            del blockers
+
+    def _load_saved_current_result(self, silent: bool = True) -> bool:
+        target_text = self.target_edit.text().strip()
+        if not target_text:
+            return False
+        try:
+            target_id = int(target_text)
+        except Exception:
+            return False
+
+        result_root = self._find_saved_current_result_root(target_id)
+        if result_root is None:
+            return False
+        lc_path = step11_current_lc_path(result_root, target_id)
+
+        try:
+            corrected_df = pd.read_csv(lc_path)
+        except Exception as e:
+            self.log(f"[LOAD] Failed to read current Step11 result: {e}")
+            if not silent:
+                QMessageBox.warning(self, "Detrend", f"Current 결과 로드 실패:\n{e}")
+            return False
+
+        if corrected_df.empty:
+            self.log(f"[LOAD] Current Step11 result is empty: {lc_path.name}")
+            return False
+
+        mode = ""
+        if "correction_mode" in corrected_df.columns:
+            vals = corrected_df["correction_mode"].dropna().astype(str).str.strip().str.lower()
+            if not vals.empty:
+                mode = vals.iloc[0]
+        if mode not in ("global", "color", "offset"):
+            try:
+                mode = str(load_detrend_preference(result_root, target_id=target_id) or "").strip().lower()
+            except Exception:
+                mode = ""
+        if mode not in ("global", "color", "offset"):
+            mode = self.mode if self.mode in ("global", "color", "offset") else "offset"
+
+        for col in ("JD", "jd", "BJD_TDB", "airmass", "diff_mag_raw", "diff_mag_corr", "diff_err", "diff_err_corr", "residual", "fit_value"):
+            if col in corrected_df.columns:
+                corrected_df[col] = pd.to_numeric(corrected_df[col], errors="coerce")
+        if "JD" not in corrected_df.columns and "jd" in corrected_df.columns:
+            corrected_df["JD"] = corrected_df["jd"]
+        if "date" not in corrected_df.columns and not self.raw_df.empty and "file" in corrected_df.columns and "file" in self.raw_df.columns:
+            date_map = self.raw_df.groupby(self.raw_df["file"].astype(str))["date"].first()
+            corrected_df["date"] = corrected_df["file"].astype(str).map(date_map).fillna("unknown")
+        if "night_id" not in corrected_df.columns and not self.raw_df.empty and "file" in corrected_df.columns and "file" in self.raw_df.columns:
+            night_map = self.raw_df.groupby(self.raw_df["file"].astype(str))["night_id"].first() if "night_id" in self.raw_df.columns else None
+            if night_map is not None:
+                corrected_df["night_id"] = corrected_df["file"].astype(str).map(night_map)
+
+        params_df = pd.DataFrame()
+        global_mean_df = pd.DataFrame()
+        global_diagnostics: dict = {}
+        params_path = step11_current_params_path(result_root, target_id)
+
+        if mode == "global":
+            zp_path = step11_current_global_zp_path(result_root, target_id)
+            params_candidate = zp_path if zp_path.exists() else params_path
+            if params_candidate.exists():
+                try:
+                    params_df = pd.read_csv(params_candidate)
+                except Exception as e:
+                    self.log(f"[LOAD] Failed to read global ZP/current params: {e}")
+            mean_path = step11_current_global_mean_path(result_root, target_id)
+            if mean_path.exists():
+                try:
+                    global_mean_df = pd.read_csv(mean_path)
+                except Exception as e:
+                    self.log(f"[LOAD] Failed to read global mean: {e}")
+            diag_path = step11_current_global_diag_path(result_root, target_id)
+            if diag_path.exists():
+                try:
+                    global_diagnostics = json.loads(diag_path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    self.log(f"[LOAD] Failed to read global diagnostics: {e}")
+        elif params_path.exists():
+            try:
+                params_df = pd.read_csv(params_path)
+            except Exception as e:
+                self.log(f"[LOAD] Failed to read current params: {e}")
+
+        self.corrected_df = corrected_df
+        self.params_df = params_df
+        self.global_mean_df = global_mean_df
+        self.global_diagnostics = global_diagnostics
+        self.mode = mode
+        self._sync_mode_controls_from_state()
+        self.log(
+            f"[LOAD] Restored Step11 current result: {lc_path.name} "
+            f"(mode={mode}, params={len(self.params_df)})"
+        )
+        return True
+
+    def _saved_current_result_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for root in [Path(self.params.P.result_dir), *[Path(path) for _, path in self.datasets]]:
+            try:
+                key = str(root.resolve())
+            except Exception:
+                key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(root)
+        return roots
+
+    def _find_saved_current_result_root(self, target_id: int) -> Path | None:
+        for root in self._saved_current_result_roots():
+            if step11_current_lc_path(root, target_id).exists():
+                return root
+        return None
+
+    def _global_zp_is_loaded(self) -> bool:
+        if self.params_df.empty:
+            return False
+        cols = {str(c) for c in self.params_df.columns}
+        return "time_id" in cols and "Z" in cols
+
+    def _restore_saved_global_payload(self, silent: bool = True) -> bool:
+        if self.mode != "global":
+            return False
+        if self._global_zp_is_loaded():
+            return True
+
+        target_text = self.target_edit.text().strip()
+        if not target_text:
+            return False
+        try:
+            target_id = int(target_text)
+        except Exception:
+            return False
+
+        root = self._find_saved_current_result_root(target_id)
+        if root is None:
+            root = Path(self.params.P.result_dir)
+
+        zp_path = step11_current_global_zp_path(root, target_id)
+        if not zp_path.exists():
+            return False
+
+        try:
+            params_df = pd.read_csv(zp_path)
+        except Exception as e:
+            self.log(f"[LOAD] Failed to recover global ZP: {e}")
+            if not silent:
+                QMessageBox.warning(self, "Detrend", f"Global ZP 로드 실패:\n{e}")
+            return False
+
+        if params_df.empty:
+            self.log(f"[LOAD] Saved global ZP is empty: {zp_path.name}")
+            return False
+
+        self.params_df = params_df
+
+        mean_path = step11_current_global_mean_path(root, target_id)
+        if mean_path.exists():
+            try:
+                self.global_mean_df = pd.read_csv(mean_path)
+            except Exception as e:
+                self.log(f"[LOAD] Failed to recover global mean: {e}")
+
+        diag_path = step11_current_global_diag_path(root, target_id)
+        if diag_path.exists():
+            try:
+                self.global_diagnostics = json.loads(diag_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                self.log(f"[LOAD] Failed to recover global diagnostics: {e}")
+
+        self.log(f"[LOAD] Recovered global ZP from saved current result: {zp_path.name} ({len(self.params_df)} rows)")
         return True
 
     def _load_global_ensemble_df(
@@ -2084,7 +2285,9 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         jd = pd.to_numeric(df["JD"], errors="coerce").to_numpy(float)
         if not np.any(np.isfinite(jd)):
             return jd, y
-        t0 = self.phase_t0 if self.phase_t0 > 0 else np.nanmin(jd)
+        t0 = self._phase_reference_t0()
+        if not np.isfinite(t0):
+            return jd, y
         phase = ((jd - t0) / self.phase_period) % 1.0
         cycles = float(self.phase_cycles) if self.phase_cycles > 1 else 1.0
         full = int(cycles)
@@ -2101,6 +2304,27 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             xs.append(phase[mask] + full)
             ys.append(y[mask])
         return (np.concatenate(xs), np.concatenate(ys)) if xs else (phase, y)
+
+    def _phase_reference_t0(self, *extra_frames: pd.DataFrame) -> float:
+        if self.phase_t0 > 0:
+            return float(self.phase_t0)
+        frames: list[pd.DataFrame] = []
+        for frame in (self.raw_df, self.corrected_df, *extra_frames):
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return np.nan
+        finite_chunks: list[np.ndarray] = []
+        for frame in frames:
+            if "JD" not in frame.columns:
+                continue
+            jd = pd.to_numeric(frame["JD"], errors="coerce").to_numpy(float)
+            finite = jd[np.isfinite(jd)]
+            if finite.size:
+                finite_chunks.append(finite)
+        if not finite_chunks:
+            return np.nan
+        return float(np.nanmin(np.concatenate(finite_chunks)))
 
     def _set_mode(self, mode: str):
         if self.mode == mode:
@@ -2560,12 +2784,36 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
                     raise
                 return
 
+            zp_df = result.get("zp_df", pd.DataFrame()).copy()
+            mean_df = result.get("mean_df", pd.DataFrame()).copy()
+            lc_df = result.get("lc_df", pd.DataFrame()).copy()
+            diagnostics = result.get("diagnostics", {}) or {}
+            self.log(
+                "[GLOBAL] Solver output: input_rows={rows} frames={frames} zp_rows={zp} mean_rows={mean} lc_rows={lc}".format(
+                    rows=len(df_global),
+                    frames=df_global["time_id"].astype(str).nunique() if "time_id" in df_global.columns else 0,
+                    zp=len(zp_df),
+                    mean=len(mean_df),
+                    lc=len(lc_df),
+                )
+            )
+            if zp_df.empty:
+                msg = (
+                    "Global ensemble produced no zeropoint rows.\n"
+                    "Check Step 5 photometry / comparison-star availability / filter mapping."
+                )
+                if update_ui:
+                    QMessageBox.warning(self, "Global Ensemble", msg)
+                else:
+                    raise RuntimeError(msg)
+                return
+
             self.global_input_df = df_global
-            self.params_df = result.get("zp_df", pd.DataFrame())
-            self.global_mean_df = result.get("mean_df", pd.DataFrame())
-            self.corrected_df = result.get("lc_df", pd.DataFrame())
+            self.params_df = zp_df
+            self.global_mean_df = mean_df
+            self.corrected_df = lc_df
             self.raw_df = self.corrected_df.copy()
-            self.global_diagnostics = result.get("diagnostics", {}) or {}
+            self.global_diagnostics = diagnostics
 
             if "JD" not in self.corrected_df.columns and "jd" in self.corrected_df.columns:
                 self.corrected_df["JD"] = self.corrected_df["jd"]
@@ -2820,6 +3068,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
         return out
 
     def _update_results_table(self):
+        if self.mode == "global" and not self._global_zp_is_loaded():
+            self._restore_saved_global_payload()
         self.result_table.blockSignals(True)
         self.result_table.setUpdatesEnabled(False)
         self.result_table.clearContents()
@@ -3127,6 +3377,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
 
     def _plot_global_diagnostics(self, dates, filter_key, date_colors) -> None:
         self.ax_diag.clear()
+        if not self._global_zp_is_loaded():
+            self._restore_saved_global_payload()
         if self.params_df.empty:
             self.ax_diag.text(0.5, 0.5, "No global ZP available", ha="center", va="center")
             return
@@ -3225,8 +3477,9 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             # Add phase if period is set
             if self.phase_period > 0 and "JD" in out_df.columns:
                 jd = pd.to_numeric(out_df["JD"], errors="coerce").to_numpy(float)
-                t0 = self.phase_t0 if self.phase_t0 > 0 else np.nanmin(jd)
-                out_df["phase"] = ((jd - t0) / self.phase_period) % 1.0
+                t0 = self._phase_reference_t0(out_df)
+                if np.isfinite(t0):
+                    out_df["phase"] = ((jd - t0) / self.phase_period) % 1.0
 
             # Add fit value (what was subtracted)
             out_df["fit_value"] = out_df["diff_mag_raw"] - out_df["diff_mag_corr"]
@@ -3439,6 +3692,8 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
     def revert_raw(self):
         self.corrected_df = pd.DataFrame()
         self.params_df = pd.DataFrame()
+        self.global_mean_df = pd.DataFrame()
+        self.global_diagnostics = {}
         self._update_results_table()
         self._update_plots()
 
@@ -3505,13 +3760,7 @@ Step 11은 여러 밤의 관측을 합칠 때 기준선을 맞추는 단계입�
             )
 
         # Sync UI
-        if self.mode == "color":
-            self.mode_color.setChecked(True)
-        elif self.mode == "global":
-            self.mode_global.setChecked(True)
-        else:
-            self.mode = "offset"
-            self.mode_offset.setChecked(True)
+        self._sync_mode_controls_from_state()
 
         self.chk_clip.setChecked(self.sigma_clip)
         self.spin_clip.setValue(self.clip_sigma)
