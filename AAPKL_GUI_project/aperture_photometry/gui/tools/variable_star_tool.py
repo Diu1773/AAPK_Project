@@ -378,6 +378,92 @@ def _classify_candidate_period(period: float, adopted_periods: list[float]) -> s
     return "new"
 
 
+def _find_harmonic_order(target_freq: float, base_freq: float, max_order: int = 6, tol: float = 0.02) -> int | None:
+    if not (np.isfinite(target_freq) and np.isfinite(base_freq)):
+        return None
+    if target_freq <= 0 or base_freq <= 0:
+        return None
+    for order in range(2, int(max_order) + 1):
+        if abs(target_freq - float(order) * base_freq) / max(abs(target_freq), 1e-12) < tol:
+            return int(order)
+    return None
+
+
+def _find_combination_relation(
+    target_freq: float,
+    prev_freqs: list[float],
+    max_coeff: int = 2,
+    tol: float = 0.01,
+) -> str | None:
+    if not np.isfinite(target_freq) or target_freq <= 0:
+        return None
+    best_match: tuple[float, str] | None = None
+    for jdx in range(len(prev_freqs)):
+        f_j = float(prev_freqs[jdx])
+        if not np.isfinite(f_j) or f_j <= 0:
+            continue
+        for kdx in range(jdx + 1, len(prev_freqs)):
+            f_k = float(prev_freqs[kdx])
+            if not np.isfinite(f_k) or f_k <= 0:
+                continue
+            for coeff_j in range(1, int(max_coeff) + 1):
+                for coeff_k in range(1, int(max_coeff) + 1):
+                    for sign in (-1, 1):
+                        combo = coeff_j * f_j + sign * coeff_k * f_k
+                        if combo <= 0:
+                            continue
+                        rel = abs(target_freq - combo) / max(abs(target_freq), 1e-12)
+                        if rel >= tol:
+                            continue
+                        expr = (
+                            f"{coeff_j}f(M{jdx + 1}) {'+' if sign > 0 else '-'} "
+                            f"{coeff_k}f(M{kdx + 1})"
+                        )
+                        if best_match is None or rel < best_match[0]:
+                            best_match = (rel, expr)
+    return None if best_match is None else f"near {best_match[1]}"
+
+
+def _classify_fitted_periods(periods: list[float]) -> list[dict]:
+    labels: list[dict] = []
+    freqs = [_period_to_frequency(period) for period in periods]
+    for idx, period in enumerate(periods):
+        freq = freqs[idx]
+        relation = "independent"
+        if idx == 0:
+            note = "primary fitted mode"
+            labels.append({"relation": relation, "note": note})
+            continue
+
+        note = "not matched to earlier fitted modes"
+        for prev_idx in range(idx):
+            prev_period = periods[prev_idx]
+            if _is_1day_alias_period(period, prev_period):
+                relation = "alias"
+                note = f"near 1-day alias of M{prev_idx + 1}"
+                break
+        if relation == "independent":
+            for prev_idx in range(idx):
+                order = _find_harmonic_order(freq, freqs[prev_idx])
+                if order is not None:
+                    relation = "harmonic"
+                    note = f"near {order}f(M{prev_idx + 1})"
+                    break
+        if relation == "independent" and idx >= 2:
+            combo_note = _find_combination_relation(freq, freqs[:idx])
+            if combo_note:
+                relation = "combination"
+                note = combo_note
+        labels.append({"relation": relation, "note": note})
+    return labels
+
+
+def _sanitize_filename_token(text: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
+    token = token.strip("._")
+    return token or "series"
+
+
 def _build_multimode_design_matrix(time_rel: np.ndarray, periods: list[float], harmonics: int) -> tuple[np.ndarray, list[dict]]:
     cols = [np.ones(len(time_rel), dtype=float)]
     terms: list[dict] = []
@@ -755,6 +841,8 @@ class VariableStarToolWindow(QWidget):
         self.sigma_period: Optional[float] = None
         self.multimode_result: Optional[dict] = None
         self.mm_candidate_scan: Optional[dict] = None
+        self.mm_mode_rows: list[dict] = []
+        self.mm_history: list[dict] = []
         self._scan_worker: Optional[PeriodAnalysisWorker] = None
         self._refine_worker: Optional[RefineBootstrapWorker] = None
         self.filter_colors: dict = {}      # user-customized per-filter colors
@@ -1450,6 +1538,47 @@ class VariableStarToolWindow(QWidget):
         self.mm_candidate_table.itemDoubleClicked.connect(lambda *_args: self._append_selected_candidate_to_multimode())
         layout.addWidget(self.mm_candidate_table)
 
+        self.mm_mode_status = QLabel("No joint-fit mode classification yet.")
+        self.mm_mode_status.setWordWrap(True)
+        self.mm_mode_status.setStyleSheet(
+            "QLabel { background: #F1F8E9; padding: 6px; border-radius: 4px; font-size: 8pt; }"
+        )
+        layout.addWidget(self.mm_mode_status)
+
+        self.mm_mode_table = QTableWidget()
+        self.mm_mode_table.setColumnCount(8)
+        self.mm_mode_table.setHorizontalHeaderLabels(
+            ["Mode", "Period (d)", "Freq (d^-1)", "A1", "A2", "Δm", "Class", "Note"]
+        )
+        self.mm_mode_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.mm_mode_table.horizontalHeader().setStretchLastSection(True)
+        self.mm_mode_table.setMaximumHeight(170)
+        layout.addWidget(self.mm_mode_table)
+
+        history_ctrl = QHBoxLayout()
+        self.btn_mm_export_report = QPushButton("Export Report")
+        self.btn_mm_export_report.clicked.connect(self._export_multimode_report)
+        history_ctrl.addWidget(self.btn_mm_export_report)
+        history_ctrl.addStretch()
+        layout.addLayout(history_ctrl)
+
+        self.mm_history_status = QLabel("Prewhitening history is empty.")
+        self.mm_history_status.setWordWrap(True)
+        self.mm_history_status.setStyleSheet(
+            "QLabel { background: #ECEFF1; padding: 6px; border-radius: 4px; font-size: 8pt; }"
+        )
+        layout.addWidget(self.mm_history_status)
+
+        self.mm_history_table = QTableWidget()
+        self.mm_history_table.setColumnCount(6)
+        self.mm_history_table.setHorizontalHeaderLabels(
+            ["#", "Action", "Stage", "Modes", "Best / Added", "Note"]
+        )
+        self.mm_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.mm_history_table.horizontalHeader().setStretchLastSection(True)
+        self.mm_history_table.setMaximumHeight(180)
+        layout.addWidget(self.mm_history_table)
+
         self.mm_pw_canvas = FigureCanvas(Figure(figsize=(8, 3.2)))
         layout.addWidget(NavigationToolbar(self.mm_pw_canvas, tab))
         layout.addWidget(self.mm_pw_canvas)
@@ -1467,6 +1596,8 @@ class VariableStarToolWindow(QWidget):
     def _clear_multimode_result(self, clear_inputs: bool = False):
         self.multimode_result = None
         self.mm_candidate_scan = None
+        self.mm_mode_rows = []
+        self.mm_history = []
         if clear_inputs and hasattr(self, "mm_periods_edit"):
             self.mm_periods_edit.clear()
         if hasattr(self, "mm_status"):
@@ -1488,6 +1619,14 @@ class VariableStarToolWindow(QWidget):
             self.mm_candidate_status.setText("Candidate detection not run yet.")
         if hasattr(self, "mm_candidate_table"):
             self.mm_candidate_table.setRowCount(0)
+        if hasattr(self, "mm_mode_status"):
+            self.mm_mode_status.setText("No joint-fit mode classification yet.")
+        if hasattr(self, "mm_mode_table"):
+            self.mm_mode_table.setRowCount(0)
+        if hasattr(self, "mm_history_status"):
+            self.mm_history_status.setText("Prewhitening history is empty.")
+        if hasattr(self, "mm_history_table"):
+            self.mm_history_table.setRowCount(0)
         if hasattr(self, "mm_pw_canvas"):
             fig = self.mm_pw_canvas.figure
             fig.clear()
@@ -1496,6 +1635,236 @@ class VariableStarToolWindow(QWidget):
             fig = self.mm_canvas.figure
             fig.clear()
             self.mm_canvas.draw_idle()
+
+    def _record_multimode_history(
+        self,
+        action: str,
+        *,
+        stage: str = "",
+        periods: list[float] | None = None,
+        best_period: float = np.nan,
+        best_power: float = np.nan,
+        note: str = "",
+        fit_result: dict | None = None,
+    ) -> None:
+        period_list = [float(p) for p in (periods or []) if np.isfinite(p) and float(p) > 0]
+        entry = {
+            "step": int(len(self.mm_history) + 1),
+            "action": str(action),
+            "stage": str(stage),
+            "n_modes": int(len(period_list)),
+            "periods": _format_period_list(period_list),
+            "best_or_added": (
+                f"{float(best_period):.8f}" if np.isfinite(best_period) and float(best_period) > 0
+                else ""
+            ),
+            "best_power": (
+                float(best_power) if np.isfinite(best_power) else np.nan
+            ),
+            "fit_rmse_mag": np.nan,
+            "fit_wrms": np.nan,
+            "note": str(note or ""),
+        }
+        if fit_result:
+            entry["fit_rmse_mag"] = float(fit_result.get("rmse", np.nan))
+            entry["fit_wrms"] = float(fit_result.get("wrms", np.nan))
+            if not entry["note"]:
+                entry["note"] = (
+                    f"harm={int(fit_result.get('harmonics', 0))}, "
+                    f"cond≈{float(fit_result.get('design_condition', np.nan)):.2e}"
+                )
+        self.mm_history.append(entry)
+        self._update_multimode_history_views()
+
+    def _update_multimode_history_views(self) -> None:
+        if not hasattr(self, "mm_history_table"):
+            return
+        self.mm_history_table.setRowCount(0)
+        for row_idx, entry in enumerate(self.mm_history):
+            self.mm_history_table.insertRow(row_idx)
+            values = [
+                str(entry.get("step", row_idx + 1)),
+                str(entry.get("action", "")),
+                str(entry.get("stage", "")),
+                str(entry.get("n_modes", "")),
+                str(entry.get("best_or_added", "")),
+                str(entry.get("note", "")),
+            ]
+            for col_idx, value in enumerate(values):
+                self.mm_history_table.setItem(row_idx, col_idx, QTableWidgetItem(value))
+        if hasattr(self, "mm_history_status"):
+            if not self.mm_history:
+                self.mm_history_status.setText("Prewhitening history is empty.")
+            else:
+                latest = self.mm_history[-1]
+                self.mm_history_status.setText(
+                    f"{len(self.mm_history)} action(s) recorded. Latest: "
+                    f"{latest.get('action', '')} | modes={latest.get('n_modes', 0)} | "
+                    f"{latest.get('note', '')}"
+                )
+
+    def _summarize_multimode_modes(self, result: dict) -> list[dict]:
+        periods = [float(p) for p in result.get("periods", [])]
+        coeff = np.asarray(result.get("coeff", []), dtype=float)
+        terms = result.get("terms", [])
+        mode_labels = _classify_fitted_periods(periods)
+        harmonic_map: dict[tuple[int, int], dict[str, float]] = {}
+
+        for coeff_idx, term in enumerate(terms, start=1):
+            key = (int(term["mode_index"]), int(term["harmonic"]))
+            entry = harmonic_map.setdefault(key, {})
+            entry[str(term["kind"])] = float(coeff[coeff_idx])
+
+        rows: list[dict] = []
+        harmonics = max(1, int(result.get("harmonics", 1)))
+        time_ref = float(result.get("time_ref", 0.0))
+        for idx, period in enumerate(periods):
+            freq = _period_to_frequency(period)
+            amp_h1 = np.nan
+            amp_h2 = np.nan
+            for harmonic in range(1, harmonics + 1):
+                pair = harmonic_map.get((idx, harmonic), {})
+                amp = float(np.hypot(float(pair.get("cos", 0.0)), float(pair.get("sin", 0.0))))
+                if harmonic == 1:
+                    amp_h1 = amp
+                elif harmonic == 2:
+                    amp_h2 = amp
+            phase_grid = np.linspace(0.0, 1.0, 600)
+            phase_times = time_ref + phase_grid * period
+            eval_phase = _evaluate_multimode_result(result, phase_times)
+            component_curve = np.asarray(eval_phase["components"][idx], dtype=float)
+            ptp = float(np.nanmax(component_curve) - np.nanmin(component_curve)) if component_curve.size else np.nan
+            label = mode_labels[idx] if idx < len(mode_labels) else {"relation": "independent", "note": ""}
+            rows.append({
+                "mode": f"M{idx + 1}",
+                "period_d": float(period),
+                "frequency_d^-1": float(freq),
+                "a1_mag": float(amp_h1) if np.isfinite(amp_h1) else np.nan,
+                "a2_mag": float(amp_h2) if np.isfinite(amp_h2) else np.nan,
+                "ptp_mag": float(ptp) if np.isfinite(ptp) else np.nan,
+                "relation": str(label.get("relation", "independent")),
+                "note": str(label.get("note", "")),
+            })
+        return rows
+
+    def _update_multimode_mode_views(self) -> None:
+        if not hasattr(self, "mm_mode_table"):
+            return
+        self.mm_mode_table.setRowCount(0)
+        self.mm_mode_rows = []
+        if not self.multimode_result:
+            if hasattr(self, "mm_mode_status"):
+                self.mm_mode_status.setText("No joint-fit mode classification yet.")
+            return
+
+        rows = self._summarize_multimode_modes(self.multimode_result)
+        self.mm_mode_rows = rows
+        for row_idx, row in enumerate(rows):
+            self.mm_mode_table.insertRow(row_idx)
+            values = [
+                str(row.get("mode", "")),
+                f"{float(row.get('period_d', np.nan)):.8f}",
+                f"{float(row.get('frequency_d^-1', np.nan)):.5f}",
+                f"{float(row.get('a1_mag', np.nan)):.4f}" if np.isfinite(row.get("a1_mag", np.nan)) else "—",
+                f"{float(row.get('a2_mag', np.nan)):.4f}" if np.isfinite(row.get("a2_mag", np.nan)) else "—",
+                f"{float(row.get('ptp_mag', np.nan)):.4f}" if np.isfinite(row.get("ptp_mag", np.nan)) else "—",
+                str(row.get("relation", "")),
+                str(row.get("note", "")),
+            ]
+            relation = str(row.get("relation", ""))
+            for col_idx, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if relation == "independent":
+                    cell.setBackground(QColor("#E8F5E9"))
+                elif relation == "combination":
+                    cell.setBackground(QColor("#FFF3E0"))
+                elif relation == "harmonic":
+                    cell.setBackground(QColor("#FFF8E1"))
+                elif relation == "alias":
+                    cell.setBackground(QColor("#FBE9E7"))
+                self.mm_mode_table.setItem(row_idx, col_idx, cell)
+
+        if hasattr(self, "mm_mode_status"):
+            counts: dict[str, int] = {}
+            for row in rows:
+                relation = str(row.get("relation", "independent"))
+                counts[relation] = counts.get(relation, 0) + 1
+            status = (
+                f"Mode classification: independent={counts.get('independent', 0)}, "
+                f"combination={counts.get('combination', 0)}, "
+                f"harmonic={counts.get('harmonic', 0)}, "
+                f"alias={counts.get('alias', 0)}"
+            )
+            independent = [float(row["period_d"]) for row in rows if row.get("relation") == "independent"]
+            if len(independent) >= 2:
+                p_short = min(independent[0], independent[1])
+                p_long = max(independent[0], independent[1])
+                if p_long > 0:
+                    status += f"  |  P_short/P_long={p_short / p_long:.4f}"
+            self.mm_mode_status.setText(status)
+
+    def _current_multimode_export_stem(self) -> str:
+        parts = []
+        if self.lc_data is not None:
+            target_id = self.lc_data.get("target_id")
+            if target_id is not None:
+                parts.append(f"ID{int(target_id)}")
+            analysis_filter = str(self.lc_data.get("analysis_filter") or "").strip()
+            if analysis_filter and analysis_filter != "__all__":
+                parts.append(analysis_filter)
+            corr_tag = str(self.lc_data.get("corr_tag") or "").strip()
+            if corr_tag:
+                parts.append(corr_tag)
+            source = Path(str(self.lc_data.get("source") or "series")).stem
+            parts.append(source)
+        if not parts:
+            parts.append("series")
+        return _sanitize_filename_token("_".join(parts))
+
+    def _export_multimode_report(self) -> None:
+        if not self.mm_history and not self.mm_mode_rows and not self.multimode_result:
+            QMessageBox.information(self, "Multi-Mode", "Export할 multi-mode 결과가 없습니다.")
+            return
+
+        try:
+            out_dir = self._current_workspace_dir() / "variable_star_tool"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stem = self._current_multimode_export_stem()
+            written: list[Path] = []
+
+            if self.mm_history:
+                history_path = out_dir / f"{stem}_multimode_history.csv"
+                pd.DataFrame(self.mm_history).to_csv(history_path, index=False)
+                written.append(history_path)
+            if self.mm_mode_rows:
+                mode_path = out_dir / f"{stem}_multimode_modes.csv"
+                pd.DataFrame(self.mm_mode_rows).to_csv(mode_path, index=False)
+                written.append(mode_path)
+            if self.mm_candidate_scan and self.mm_candidate_scan.get("candidates"):
+                cand_path = out_dir / f"{stem}_multimode_candidates.csv"
+                pd.DataFrame(self.mm_candidate_scan.get("candidates", [])).to_csv(cand_path, index=False)
+                written.append(cand_path)
+
+            summary_path = out_dir / f"{stem}_multimode_summary.txt"
+            summary_lines = [
+                self.mm_summary_label.text().strip() if hasattr(self, "mm_summary_label") else "",
+                "",
+                self.mm_mode_status.text().strip() if hasattr(self, "mm_mode_status") else "",
+                self.mm_candidate_status.text().strip() if hasattr(self, "mm_candidate_status") else "",
+                self.mm_history_status.text().strip() if hasattr(self, "mm_history_status") else "",
+            ]
+            summary_path.write_text("\n".join(line for line in summary_lines if line), encoding="utf-8")
+            written.append(summary_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Multi-Mode Export", str(e))
+            return
+
+        self.log(f"[MULTI] Exported report to {out_dir}")
+        QMessageBox.information(
+            self,
+            "Multi-Mode Export",
+            "Saved:\n" + "\n".join(str(path.name) for path in written),
+        )
 
     def _sync_phase_mode_combo(self):
         if not hasattr(self, "phase_mode_combo"):
@@ -1598,9 +1967,9 @@ class VariableStarToolWindow(QWidget):
             "iso_mag": iso_mag,
         }
 
-    def _append_periods_to_multimode(self, periods_to_add: list[float]) -> None:
+    def _append_periods_to_multimode(self, periods_to_add: list[float]) -> list[float]:
         current = _parse_period_list(self.mm_periods_edit.text())
-        changed = False
+        added: list[float] = []
         for period in periods_to_add:
             try:
                 value = float(period)
@@ -1611,9 +1980,10 @@ class VariableStarToolWindow(QWidget):
             if any(abs(value - prev) / max(abs(prev), 1e-12) < 1e-5 for prev in current):
                 continue
             current.append(value)
-            changed = True
-        if changed:
+            added.append(value)
+        if added:
             self.mm_periods_edit.setText(_format_period_list(current))
+        return added
 
     def _build_multimode_scan_payload(self, periods: list[float] | None = None) -> dict | None:
         if self.lc_data is None:
@@ -1716,6 +2086,23 @@ class VariableStarToolWindow(QWidget):
             return
         self.mm_candidate_scan = payload
         self._update_multimode_candidate_views()
+        ls_result = payload.get("ls_result") if payload else None
+        candidates = payload.get("candidates", []) if payload else []
+        best_period = float(ls_result.get("best_period", np.nan)) if ls_result else np.nan
+        best_power = float(ls_result.get("best_power", np.nan)) if ls_result else np.nan
+        self._record_multimode_history(
+            "detect_candidates",
+            stage=str(payload.get("stage", "")) if payload else "",
+            periods=[float(p) for p in payload.get("periods", [])] if payload else [],
+            best_period=best_period,
+            best_power=best_power,
+            note=f"new={sum(1 for item in candidates if item.get('relation') == 'new')}, total={len(candidates)}",
+        )
+        if np.isfinite(best_period):
+            self.log(
+                f"[MULTI] Candidate scan ({payload.get('stage', 'raw')}): "
+                f"best={best_period:.8f} d, new={sum(1 for item in candidates if item.get('relation') == 'new')}"
+            )
 
     def _selected_candidate_periods(self) -> list[float]:
         if not self.mm_candidate_scan:
@@ -1738,8 +2125,19 @@ class VariableStarToolWindow(QWidget):
         if not periods:
             QMessageBox.information(self, "Multi-Mode", "Adopt할 candidate가 없습니다.")
             return
-        self._append_periods_to_multimode(periods)
-        self.mm_status.setText(f"Added {len(periods)} candidate period(s). Re-run Detect/Fit.")
+        added = self._append_periods_to_multimode(periods)
+        if not added:
+            QMessageBox.information(self, "Multi-Mode", "선택한 candidate는 이미 period list에 있습니다.")
+            return
+        self.mm_status.setText(f"Added {len(added)} candidate period(s). Re-run Detect/Fit.")
+        merged_periods = _parse_period_list(self.mm_periods_edit.text())
+        self._record_multimode_history(
+            "adopt_selected",
+            stage="candidate",
+            periods=merged_periods,
+            best_period=added[0] if added else np.nan,
+            note=f"added {len(added)} selected candidate(s)",
+        )
 
     def _adopt_all_new_candidates(self):
         if not self.mm_candidate_scan:
@@ -1749,8 +2147,19 @@ class VariableStarToolWindow(QWidget):
         if not periods:
             QMessageBox.information(self, "Multi-Mode", "추가할 new candidate가 없습니다.")
             return
-        self._append_periods_to_multimode(periods)
-        self.mm_status.setText(f"Added {len(periods)} new candidate period(s). Re-run Fit Multi-Mode.")
+        added = self._append_periods_to_multimode(periods)
+        if not added:
+            QMessageBox.information(self, "Multi-Mode", "추가할 new candidate가 이미 모두 들어 있습니다.")
+            return
+        self.mm_status.setText(f"Added {len(added)} new candidate period(s). Re-run Fit Multi-Mode.")
+        merged_periods = _parse_period_list(self.mm_periods_edit.text())
+        self._record_multimode_history(
+            "adopt_all_new",
+            stage="candidate",
+            periods=merged_periods,
+            best_period=added[0] if added else np.nan,
+            note=f"added {len(added)} new candidate(s)",
+        )
 
     def _update_multimode_candidate_views(self):
         if not hasattr(self, "mm_candidate_table") or not hasattr(self, "mm_pw_canvas"):
@@ -1846,9 +2255,21 @@ class VariableStarToolWindow(QWidget):
             QMessageBox.information(self, "Multi-Mode", "추가할 주기가 없습니다.")
             return
         periods = _parse_period_list(self.mm_periods_edit.text())
+        added = False
         if not any(abs(current - p) / max(abs(p), 1e-12) < 1e-5 for p in periods):
             periods.append(current)
+            added = True
         self.mm_periods_edit.setText(_format_period_list(periods))
+        if not added:
+            self.mm_status.setText("Current dominant period is already in the multi-mode list.")
+            return
+        self._record_multimode_history(
+            "add_best",
+            stage="manual",
+            periods=periods,
+            best_period=current,
+            note="added current dominant period to multi-mode list",
+        )
 
     def _set_multimode_periods_from_scan(self):
         periods = _scan_top_periods(self.scan_result, max_count=self.mm_n_modes.value())
@@ -1857,6 +2278,13 @@ class VariableStarToolWindow(QWidget):
             return
         self.mm_periods_edit.setText(_format_period_list(periods))
         self.mm_status.setText(f"Loaded {len(periods)} peak period(s) from scan.")
+        self._record_multimode_history(
+            "seed_from_scan",
+            stage="scan",
+            periods=periods,
+            best_period=periods[0] if periods else np.nan,
+            note="loaded top scan peaks into multi-mode list",
+        )
 
     def _selected_multimode_focus_index(self) -> int | None:
         if not self.multimode_result:
@@ -1936,6 +2364,7 @@ class VariableStarToolWindow(QWidget):
         self.mm_focus_combo.setEnabled(self.mm_focus_combo.count() > 0)
         self.mm_focus_combo.blockSignals(False)
         self._sync_phase_mode_combo()
+        self._update_multimode_mode_views()
         self.mm_status.setText(
             f"Fitted {len(result['periods'])} mode(s), {int(result['harmonics'])} harmonic(s)/mode."
         )
@@ -1952,6 +2381,17 @@ class VariableStarToolWindow(QWidget):
         except Exception:
             self.mm_candidate_scan = None
         self._update_multimode_candidate_views()
+        self._record_multimode_history(
+            "fit",
+            stage="joint_fit",
+            periods=[float(p) for p in result["periods"]],
+            best_period=float(result["periods"][0]) if result.get("periods") else np.nan,
+            note=(
+                f"rmse={float(result.get('rmse', np.nan)):.5f}, "
+                f"independent={sum(1 for row in self.mm_mode_rows if row.get('relation') == 'independent')}"
+            ),
+            fit_result=result,
+        )
         if self.mm_overlay_chk.isChecked():
             self._update_phase_plot()
         self.log(
@@ -2187,6 +2627,9 @@ class VariableStarToolWindow(QWidget):
         self.refined_period = None
         self.sigma_period = None
         self.multimode_result = None
+        self.mm_candidate_scan = None
+        self.mm_mode_rows = []
+        self.mm_history = []
         self.recommended_mode = "unknown"
         self.recommendation_text = str(status)
         self.workflow_step = "load"
@@ -2201,16 +2644,8 @@ class VariableStarToolWindow(QWidget):
         self.analysis_filter_combo.blockSignals(False)
         self.lc_status.setText(status)
         self.lc_status.setStyleSheet("color: #C62828;")
-        if hasattr(self, "mm_status"):
-            self.mm_status.setText("")
-        if hasattr(self, "mm_summary_label"):
-            self.mm_summary_label.setText("Set periods and run Fit Multi-Mode.")
-        if hasattr(self, "mm_focus_combo"):
-            self.mm_focus_combo.blockSignals(True)
-            self.mm_focus_combo.clear()
-            self.mm_focus_combo.setEnabled(False)
-            self.mm_focus_combo.blockSignals(False)
-        for canvas_name in ("pg_canvas", "ref_canvas", "boot_canvas", "mm_canvas", "ph_canvas", "oc_canvas", "fourier_canvas"):
+        self._clear_multimode_result(clear_inputs=False)
+        for canvas_name in ("pg_canvas", "ref_canvas", "boot_canvas", "mm_pw_canvas", "mm_canvas", "ph_canvas", "oc_canvas", "fourier_canvas"):
             canvas = getattr(self, canvas_name, None)
             if canvas is None:
                 continue
