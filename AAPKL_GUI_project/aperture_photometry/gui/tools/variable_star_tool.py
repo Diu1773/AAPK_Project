@@ -181,6 +181,7 @@ def _resolve_check_filter(filters, selected_filter: str | None = None) -> str | 
     return unique_filters[0] if len(unique_filters) == 1 else None
 
 from ..workflow.step12_period_analysis import PeriodAnalysisWorker
+from ...analysis.light_curve.period_analysis_service import run_period_analysis
 
 
 def _load_check_star_for_plot(result_dir: Path, filt: str | None = None):
@@ -365,6 +366,16 @@ def _recommend_analysis_mode_from_scan(results: dict | None) -> tuple[str, str]:
                 )
 
     return "single", f"Current scan is dominated by one primary period near {best_period:.6f} d."
+
+
+def _classify_candidate_period(period: float, adopted_periods: list[float]) -> str:
+    if any(abs(float(period) - float(prev)) / max(abs(float(prev)), 1e-12) < 1e-5 for prev in adopted_periods):
+        return "duplicate"
+    if any(_is_1day_alias_period(float(period), float(prev)) for prev in adopted_periods):
+        return "alias"
+    if any(_is_near_harmonic_period(float(period), float(prev)) for prev in adopted_periods):
+        return "harmonic"
+    return "new"
 
 
 def _build_multimode_design_matrix(time_rel: np.ndarray, periods: list[float], harmonics: int) -> tuple[np.ndarray, list[dict]]:
@@ -743,6 +754,7 @@ class VariableStarToolWindow(QWidget):
         self.refined_period: Optional[float] = None
         self.sigma_period: Optional[float] = None
         self.multimode_result: Optional[dict] = None
+        self.mm_candidate_scan: Optional[dict] = None
         self._scan_worker: Optional[PeriodAnalysisWorker] = None
         self._refine_worker: Optional[RefineBootstrapWorker] = None
         self.filter_colors: dict = {}      # user-customized per-filter colors
@@ -1177,7 +1189,11 @@ class VariableStarToolWindow(QWidget):
             if idx >= 0:
                 self.analysis_mode_combo.setCurrentIndex(idx)
         self.analysis_mode = mode
+        if mode == "multi" and not _parse_period_list(self.mm_periods_edit.text()) and self.scan_result:
+            self._set_multimode_periods_from_scan()
         self._set_workflow_step(mode)
+        if mode == "multi" and self.lc_data is not None:
+            self._detect_multimode_candidates()
 
     def _refresh_tool_workflow_ui(self) -> None:
         has_data = self.lc_data is not None
@@ -1405,6 +1421,39 @@ class VariableStarToolWindow(QWidget):
         )
         layout.addWidget(self.mm_summary_label)
 
+        candidate_ctrl = QHBoxLayout()
+        self.btn_mm_detect_candidates = QPushButton("Detect Residual Peaks")
+        self.btn_mm_detect_candidates.clicked.connect(self._detect_multimode_candidates)
+        candidate_ctrl.addWidget(self.btn_mm_detect_candidates)
+        self.btn_mm_adopt_candidate = QPushButton("+ Selected Candidate")
+        self.btn_mm_adopt_candidate.clicked.connect(self._append_selected_candidate_to_multimode)
+        candidate_ctrl.addWidget(self.btn_mm_adopt_candidate)
+        self.btn_mm_adopt_all = QPushButton("Adopt New Peaks")
+        self.btn_mm_adopt_all.clicked.connect(self._adopt_all_new_candidates)
+        candidate_ctrl.addWidget(self.btn_mm_adopt_all)
+        candidate_ctrl.addStretch()
+        layout.addLayout(candidate_ctrl)
+
+        self.mm_candidate_status = QLabel("Candidate detection not run yet.")
+        self.mm_candidate_status.setWordWrap(True)
+        self.mm_candidate_status.setStyleSheet(
+            "QLabel { background: #F5F5F5; padding: 6px; border-radius: 4px; font-size: 8pt; }"
+        )
+        layout.addWidget(self.mm_candidate_status)
+
+        self.mm_candidate_table = QTableWidget()
+        self.mm_candidate_table.setColumnCount(5)
+        self.mm_candidate_table.setHorizontalHeaderLabels(["#", "Period (d)", "Power", "Relation", "Note"])
+        self.mm_candidate_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.mm_candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.mm_candidate_table.setMaximumHeight(160)
+        self.mm_candidate_table.itemDoubleClicked.connect(lambda *_args: self._append_selected_candidate_to_multimode())
+        layout.addWidget(self.mm_candidate_table)
+
+        self.mm_pw_canvas = FigureCanvas(Figure(figsize=(8, 3.2)))
+        layout.addWidget(NavigationToolbar(self.mm_pw_canvas, tab))
+        layout.addWidget(self.mm_pw_canvas)
+
         self.mm_canvas = FigureCanvas(Figure(figsize=(8, 6)))
         layout.addWidget(NavigationToolbar(self.mm_canvas, tab))
         layout.addWidget(self.mm_canvas, 1)
@@ -1417,6 +1466,7 @@ class VariableStarToolWindow(QWidget):
 
     def _clear_multimode_result(self, clear_inputs: bool = False):
         self.multimode_result = None
+        self.mm_candidate_scan = None
         if clear_inputs and hasattr(self, "mm_periods_edit"):
             self.mm_periods_edit.clear()
         if hasattr(self, "mm_status"):
@@ -1434,6 +1484,14 @@ class VariableStarToolWindow(QWidget):
             self.phase_mode_combo.addItem("Manual / custom period", "manual")
             self.phase_mode_combo.setEnabled(False)
             self.phase_mode_combo.blockSignals(False)
+        if hasattr(self, "mm_candidate_status"):
+            self.mm_candidate_status.setText("Candidate detection not run yet.")
+        if hasattr(self, "mm_candidate_table"):
+            self.mm_candidate_table.setRowCount(0)
+        if hasattr(self, "mm_pw_canvas"):
+            fig = self.mm_pw_canvas.figure
+            fig.clear()
+            self.mm_pw_canvas.draw_idle()
         if hasattr(self, "mm_canvas"):
             fig = self.mm_canvas.figure
             fig.clear()
@@ -1539,6 +1597,242 @@ class VariableStarToolWindow(QWidget):
             "period": periods[idx],
             "iso_mag": iso_mag,
         }
+
+    def _append_periods_to_multimode(self, periods_to_add: list[float]) -> None:
+        current = _parse_period_list(self.mm_periods_edit.text())
+        changed = False
+        for period in periods_to_add:
+            try:
+                value = float(period)
+            except Exception:
+                continue
+            if not np.isfinite(value) or value <= 0:
+                continue
+            if any(abs(value - prev) / max(abs(prev), 1e-12) < 1e-5 for prev in current):
+                continue
+            current.append(value)
+            changed = True
+        if changed:
+            self.mm_periods_edit.setText(_format_period_list(current))
+
+    def _build_multimode_scan_payload(self, periods: list[float] | None = None) -> dict | None:
+        if self.lc_data is None:
+            return None
+        adopted_periods = periods if periods is not None else _parse_period_list(self.mm_periods_edit.text())
+        time = np.asarray(self.lc_data["time"], dtype=float)
+        mag = np.asarray(self.lc_data["mag"], dtype=float)
+        mag_err = self.lc_data.get("mag_err")
+        err = np.asarray(mag_err, dtype=float) if mag_err is not None else None
+        mask = np.isfinite(time) & np.isfinite(mag)
+        if err is not None:
+            mask &= np.isfinite(err)
+        t = time[mask]
+        y = mag[mask]
+        dy = err[mask] if err is not None else None
+        if len(t) < 10:
+            return None
+
+        fit_result = None
+        signal = y.copy()
+        stage_label = "raw"
+        if adopted_periods:
+            fit_result = _fit_multimode_model(
+                t,
+                y,
+                dy,
+                periods=adopted_periods,
+                harmonics=int(self.mm_harm.value()),
+            )
+            signal = np.asarray(fit_result["residual"], dtype=float)
+            stage_label = "residual"
+
+        results = run_period_analysis(
+            time=t,
+            mag_raw=signal,
+            mag_corr=None,
+            mag_err=dy,
+            min_period=self.min_p.value(),
+            max_period=self.max_p.value(),
+            samples_per_peak=self.spp.value(),
+            methods=["ls"],
+            pdm_n_bins=self.pdm_bins.value(),
+        )
+        ls_result = results.get("raw_ls")
+        if not ls_result or "error" in ls_result:
+            return {
+                "stage": stage_label,
+                "periods": list(adopted_periods),
+                "fit_result": fit_result,
+                "time": t,
+                "signal": signal,
+                "ls_result": ls_result,
+                "candidates": [],
+            }
+
+        top_periods = [float(p) for p in ls_result.get("top_periods", []) if np.isfinite(p) and float(p) > 0]
+        top_powers = [float(v) for v in ls_result.get("top_powers", []) if np.isfinite(v)]
+        candidates = []
+        for idx, period in enumerate(top_periods[: max(3, int(self.mm_n_modes.value()) + 2)]):
+            power = top_powers[idx] if idx < len(top_powers) else np.nan
+            relation = _classify_candidate_period(period, adopted_periods)
+            note = ""
+            if relation == "alias":
+                note = "1-day alias of adopted mode"
+            elif relation == "harmonic":
+                note = "near harmonic of adopted mode"
+            elif relation == "duplicate":
+                note = "already adopted"
+            candidates.append(
+                {
+                    "rank": idx + 1,
+                    "period": period,
+                    "power": power,
+                    "relation": relation,
+                    "note": note,
+                }
+            )
+
+        return {
+            "stage": stage_label,
+            "periods": list(adopted_periods),
+            "fit_result": fit_result,
+            "time": t,
+            "signal": signal,
+            "ls_result": ls_result,
+            "candidates": candidates,
+        }
+
+    def _detect_multimode_candidates(self):
+        if self.lc_data is None:
+            QMessageBox.warning(self, "Multi-Mode", "Load a light curve first.")
+            return
+        self.workflow_step = "multi"
+        self._refresh_tool_workflow_ui()
+        try:
+            payload = self._build_multimode_scan_payload()
+        except Exception as e:
+            QMessageBox.warning(self, "Multi-Mode", str(e))
+            self.mm_candidate_status.setText(f"Candidate detection failed: {e}")
+            return
+        self.mm_candidate_scan = payload
+        self._update_multimode_candidate_views()
+
+    def _selected_candidate_periods(self) -> list[float]:
+        if not self.mm_candidate_scan:
+            return []
+        rows = sorted({idx.row() for idx in self.mm_candidate_table.selectedIndexes()})
+        candidates = self.mm_candidate_scan.get("candidates", [])
+        periods = []
+        for row in rows:
+            if 0 <= row < len(candidates):
+                periods.append(float(candidates[row]["period"]))
+        return periods
+
+    def _append_selected_candidate_to_multimode(self):
+        periods = self._selected_candidate_periods()
+        if not periods and self.mm_candidate_scan:
+            for item in self.mm_candidate_scan.get("candidates", []):
+                if item.get("relation") == "new":
+                    periods = [float(item["period"])]
+                    break
+        if not periods:
+            QMessageBox.information(self, "Multi-Mode", "Adopt할 candidate가 없습니다.")
+            return
+        self._append_periods_to_multimode(periods)
+        self.mm_status.setText(f"Added {len(periods)} candidate period(s). Re-run Detect/Fit.")
+
+    def _adopt_all_new_candidates(self):
+        if not self.mm_candidate_scan:
+            QMessageBox.information(self, "Multi-Mode", "먼저 residual candidate detection을 실행하세요.")
+            return
+        periods = [float(item["period"]) for item in self.mm_candidate_scan.get("candidates", []) if item.get("relation") == "new"]
+        if not periods:
+            QMessageBox.information(self, "Multi-Mode", "추가할 new candidate가 없습니다.")
+            return
+        self._append_periods_to_multimode(periods)
+        self.mm_status.setText(f"Added {len(periods)} new candidate period(s). Re-run Fit Multi-Mode.")
+
+    def _update_multimode_candidate_views(self):
+        if not hasattr(self, "mm_candidate_table") or not hasattr(self, "mm_pw_canvas"):
+            return
+
+        payload = self.mm_candidate_scan or {}
+        candidates = payload.get("candidates", [])
+        adopted_periods = [float(p) for p in payload.get("periods", [])]
+        stage = str(payload.get("stage", "raw"))
+        ls_result = payload.get("ls_result")
+
+        self.mm_candidate_table.setRowCount(0)
+        for row_idx, item in enumerate(candidates):
+            self.mm_candidate_table.insertRow(row_idx)
+            values = [
+                str(item.get("rank", row_idx + 1)),
+                f"{float(item.get('period', np.nan)):.8f}",
+                f"{float(item.get('power', np.nan)):.4f}" if np.isfinite(item.get("power", np.nan)) else "—",
+                str(item.get("relation", "")),
+                str(item.get("note", "")),
+            ]
+            for col_idx, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                relation = str(item.get("relation", ""))
+                if relation == "new":
+                    cell.setBackground(QColor("#E8F5E9"))
+                elif relation in {"alias", "harmonic"}:
+                    cell.setBackground(QColor("#FFF8E1"))
+                elif relation == "duplicate":
+                    cell.setBackground(QColor("#ECEFF1"))
+                self.mm_candidate_table.setItem(row_idx, col_idx, cell)
+
+        if hasattr(self, "mm_candidate_status"):
+            if not ls_result or "error" in ls_result:
+                self.mm_candidate_status.setText("Candidate detection failed or no LS result available.")
+            else:
+                best_period = float(ls_result.get("best_period", np.nan))
+                best_power = float(ls_result.get("best_power", np.nan))
+                self.mm_candidate_status.setText(
+                    f"{stage.title()} scan: best residual peak {best_period:.8f} d  "
+                    f"(power={best_power:.4f}), adopted={len(adopted_periods)}"
+                )
+
+        fig = self.mm_pw_canvas.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        if not ls_result or "error" in ls_result:
+            ax.text(0.5, 0.5, "No candidate scan available", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            fig.tight_layout()
+            self.mm_pw_canvas.draw_idle()
+            return
+
+        periods = 1.0 / np.asarray(ls_result["frequency"], dtype=float)
+        power = np.asarray(ls_result["power"], dtype=float)
+        ax.plot(periods, power, color="#455A64", lw=0.9, alpha=0.95)
+        ax.set_xscale("log")
+        ax.set_xlabel("Period (days)")
+        ax.set_ylabel("LS Power")
+        ax.set_title(f"Multi-path candidate scan ({stage})")
+        ax.grid(True, alpha=0.3)
+
+        best_period = float(ls_result.get("best_period", np.nan))
+        best_power = float(ls_result.get("best_power", np.nan))
+        if np.isfinite(best_period):
+            ax.axvline(best_period, color="#D32F2F", ls="--", lw=1.3, alpha=0.85, label=f"best {best_period:.6f} d")
+            if np.isfinite(best_power):
+                ax.scatter([best_period], [best_power], color="#D32F2F", s=36, zorder=5)
+
+        for idx, period in enumerate(adopted_periods):
+            ax.axvline(float(period), color="#1565C0", ls=":", lw=1.0, alpha=0.7,
+                       label="adopted" if idx == 0 else None)
+        for idx, item in enumerate(candidates[:4]):
+            if item.get("relation") != "new":
+                continue
+            ax.axvline(float(item["period"]), color="#FB8C00", ls="-.", lw=1.0, alpha=0.7,
+                       label="new candidate" if idx == 0 else None)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        self.mm_pw_canvas.draw_idle()
 
     def _append_current_period_to_multimode(self):
         current = np.nan
@@ -1653,6 +1947,11 @@ class VariableStarToolWindow(QWidget):
                 self.mm_status.text() + " Warning: fit may be underconstrained/overfit for this baseline."
             )
         self._draw_multimode()
+        try:
+            self.mm_candidate_scan = self._build_multimode_scan_payload(periods=list(result["periods"]))
+        except Exception:
+            self.mm_candidate_scan = None
+        self._update_multimode_candidate_views()
         if self.mm_overlay_chk.isChecked():
             self._update_phase_plot()
         self.log(
