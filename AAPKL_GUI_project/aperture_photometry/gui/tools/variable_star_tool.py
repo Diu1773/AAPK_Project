@@ -1063,6 +1063,9 @@ class VariableStarToolWindow(QWidget):
         btn_mm_peaks = QPushButton("Top Peaks")
         btn_mm_peaks.clicked.connect(self._set_multimode_periods_from_scan)
         btn_mm_row.addWidget(btn_mm_peaks)
+        btn_mm_remove = QPushButton("- Remove")
+        btn_mm_remove.clicked.connect(self._remove_selected_mode_from_multimode)
+        btn_mm_row.addWidget(btn_mm_remove)
         mm_form.addRow(btn_mm_row)
         self.mm_harm = QSpinBox()
         self.mm_harm.setRange(1, 4); self.mm_harm.setValue(1)
@@ -1556,6 +1559,12 @@ class VariableStarToolWindow(QWidget):
         layout.addWidget(self.mm_mode_table)
 
         history_ctrl = QHBoxLayout()
+        self.btn_mm_restore_history = QPushButton("Restore Selected Step")
+        self.btn_mm_restore_history.clicked.connect(self._restore_selected_history_periods)
+        history_ctrl.addWidget(self.btn_mm_restore_history)
+        self.btn_mm_undo = QPushButton("Undo Last Change")
+        self.btn_mm_undo.clicked.connect(self._rollback_last_multimode_step)
+        history_ctrl.addWidget(self.btn_mm_undo)
         self.btn_mm_export_report = QPushButton("Export Report")
         self.btn_mm_export_report.clicked.connect(self._export_multimode_report)
         history_ctrl.addWidget(self.btn_mm_export_report)
@@ -1577,6 +1586,7 @@ class VariableStarToolWindow(QWidget):
         self.mm_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.mm_history_table.horizontalHeader().setStretchLastSection(True)
         self.mm_history_table.setMaximumHeight(180)
+        self.mm_history_table.itemDoubleClicked.connect(lambda *_args: self._restore_selected_history_periods())
         layout.addWidget(self.mm_history_table)
 
         self.mm_pw_canvas = FigureCanvas(Figure(figsize=(8, 3.2)))
@@ -1635,6 +1645,144 @@ class VariableStarToolWindow(QWidget):
             fig = self.mm_canvas.figure
             fig.clear()
             self.mm_canvas.draw_idle()
+
+    def _invalidate_multimode_runtime(self, status: str = "") -> None:
+        self.multimode_result = None
+        self.mm_candidate_scan = None
+        self.mm_mode_rows = []
+        if hasattr(self, "mm_focus_combo"):
+            self.mm_focus_combo.blockSignals(True)
+            self.mm_focus_combo.clear()
+            self.mm_focus_combo.setEnabled(False)
+            self.mm_focus_combo.blockSignals(False)
+        if hasattr(self, "mm_summary_label"):
+            self.mm_summary_label.setText("Period list changed. Re-run Detect/Fit for an updated multi-mode result.")
+        if hasattr(self, "phase_mode_combo"):
+            self.phase_mode_combo.blockSignals(True)
+            self.phase_mode_combo.clear()
+            self.phase_mode_combo.addItem("Manual / custom period", "manual")
+            self.phase_mode_combo.setEnabled(False)
+            self.phase_mode_combo.blockSignals(False)
+        if hasattr(self, "mm_candidate_status"):
+            self.mm_candidate_status.setText("Candidate detection needs to be re-run for the current period list.")
+        if hasattr(self, "mm_candidate_table"):
+            self.mm_candidate_table.setRowCount(0)
+        if hasattr(self, "mm_mode_status"):
+            self.mm_mode_status.setText("No joint-fit mode classification for the current period list yet.")
+        if hasattr(self, "mm_mode_table"):
+            self.mm_mode_table.setRowCount(0)
+        for canvas_name in ("mm_pw_canvas", "mm_canvas"):
+            canvas = getattr(self, canvas_name, None)
+            if canvas is None:
+                continue
+            fig = getattr(canvas, "figure", None)
+            if fig is None:
+                continue
+            fig.clear()
+            canvas.draw_idle()
+        if hasattr(self, "mm_status"):
+            self.mm_status.setText(status or "Period list changed. Re-run Detect/Fit.")
+        self._update_phase_plot()
+
+    def _selected_history_entry(self) -> tuple[int, dict] | None:
+        if not self.mm_history:
+            return None
+        rows = sorted({idx.row() for idx in self.mm_history_table.selectedIndexes()}) if hasattr(self, "mm_history_table") else []
+        if not rows:
+            return None
+        row = rows[0]
+        if 0 <= row < len(self.mm_history):
+            return row, self.mm_history[row]
+        return None
+
+    def _restore_selected_history_periods(self) -> None:
+        selected = self._selected_history_entry()
+        if selected is None:
+            QMessageBox.information(self, "Multi-Mode", "복원할 history step을 먼저 선택하세요.")
+            return
+        row_idx, entry = selected
+        periods = _parse_period_list(str(entry.get("periods", "")))
+        self.mm_periods_edit.setText(_format_period_list(periods))
+        self._invalidate_multimode_runtime(
+            f"Restored period list from history step {int(entry.get('step', row_idx + 1))}. Re-run Detect/Fit."
+        )
+        self._record_multimode_history(
+            "restore_history",
+            stage="history",
+            periods=periods,
+            best_period=periods[0] if periods else np.nan,
+            note=f"restored period list from step {int(entry.get('step', row_idx + 1))}",
+        )
+        self.log(
+            f"[MULTI] Restored history step {int(entry.get('step', row_idx + 1))}: "
+            f"{_format_period_list(periods) or '<empty>'}"
+        )
+
+    def _rollback_last_multimode_step(self) -> None:
+        current_periods = _parse_period_list(self.mm_periods_edit.text())
+        current_text = _format_period_list(current_periods)
+        for entry in reversed(self.mm_history[:-1]):
+            prev_periods = _parse_period_list(str(entry.get("periods", "")))
+            if _format_period_list(prev_periods) == current_text:
+                continue
+            self.mm_periods_edit.setText(_format_period_list(prev_periods))
+            self._invalidate_multimode_runtime("Rolled back to the previous period list. Re-run Detect/Fit.")
+            self._record_multimode_history(
+                "rollback",
+                stage="history",
+                periods=prev_periods,
+                best_period=prev_periods[0] if prev_periods else np.nan,
+                note=f"rolled back using step {int(entry.get('step', 0))}",
+            )
+            self.log(
+                f"[MULTI] Rolled back using step {int(entry.get('step', 0))}: "
+                f"{_format_period_list(prev_periods) or '<empty>'}"
+            )
+            return
+        if current_periods:
+            self.mm_periods_edit.clear()
+            self._invalidate_multimode_runtime("Rolled back to an empty period list.")
+            self._record_multimode_history(
+                "rollback",
+                stage="history",
+                periods=[],
+                note="rolled back to empty period list",
+            )
+            self.log("[MULTI] Rolled back to empty period list")
+            return
+        QMessageBox.information(self, "Multi-Mode", "되돌릴 이전 period list가 없습니다.")
+
+    def _selected_mode_table_index(self) -> int | None:
+        if not hasattr(self, "mm_mode_table"):
+            return None
+        rows = sorted({idx.row() for idx in self.mm_mode_table.selectedIndexes()})
+        if not rows:
+            return None
+        return rows[0]
+
+    def _remove_selected_mode_from_multimode(self) -> None:
+        periods = _parse_period_list(self.mm_periods_edit.text())
+        if not periods:
+            QMessageBox.information(self, "Multi-Mode", "제거할 period가 없습니다.")
+            return
+        remove_idx = self._selected_mode_table_index()
+        if remove_idx is None and self.multimode_result:
+            remove_idx = self._selected_multimode_focus_index()
+        if remove_idx is None or not (0 <= int(remove_idx) < len(periods)):
+            remove_idx = len(periods) - 1
+        removed_period = float(periods.pop(int(remove_idx)))
+        self.mm_periods_edit.setText(_format_period_list(periods))
+        self._invalidate_multimode_runtime(
+            f"Removed period {removed_period:.8f} d from the list. Re-run Detect/Fit."
+        )
+        self._record_multimode_history(
+            "remove_mode",
+            stage="manual",
+            periods=periods,
+            best_period=removed_period,
+            note=f"removed period at index {int(remove_idx) + 1}",
+        )
+        self.log(f"[MULTI] Removed period {removed_period:.8f} d from the multi-mode list")
 
     def _record_multimode_history(
         self,
@@ -2129,7 +2277,7 @@ class VariableStarToolWindow(QWidget):
         if not added:
             QMessageBox.information(self, "Multi-Mode", "선택한 candidate는 이미 period list에 있습니다.")
             return
-        self.mm_status.setText(f"Added {len(added)} candidate period(s). Re-run Detect/Fit.")
+        self._invalidate_multimode_runtime(f"Added {len(added)} candidate period(s). Re-run Detect/Fit.")
         merged_periods = _parse_period_list(self.mm_periods_edit.text())
         self._record_multimode_history(
             "adopt_selected",
@@ -2151,7 +2299,7 @@ class VariableStarToolWindow(QWidget):
         if not added:
             QMessageBox.information(self, "Multi-Mode", "추가할 new candidate가 이미 모두 들어 있습니다.")
             return
-        self.mm_status.setText(f"Added {len(added)} new candidate period(s). Re-run Fit Multi-Mode.")
+        self._invalidate_multimode_runtime(f"Added {len(added)} new candidate period(s). Re-run Fit Multi-Mode.")
         merged_periods = _parse_period_list(self.mm_periods_edit.text())
         self._record_multimode_history(
             "adopt_all_new",
@@ -2263,6 +2411,7 @@ class VariableStarToolWindow(QWidget):
         if not added:
             self.mm_status.setText("Current dominant period is already in the multi-mode list.")
             return
+        self._invalidate_multimode_runtime("Added current dominant period. Re-run Detect/Fit.")
         self._record_multimode_history(
             "add_best",
             stage="manual",
@@ -2277,7 +2426,7 @@ class VariableStarToolWindow(QWidget):
             QMessageBox.information(self, "Multi-Mode", "먼저 period scan을 실행하세요.")
             return
         self.mm_periods_edit.setText(_format_period_list(periods))
-        self.mm_status.setText(f"Loaded {len(periods)} peak period(s) from scan.")
+        self._invalidate_multimode_runtime(f"Loaded {len(periods)} peak period(s) from scan.")
         self._record_multimode_history(
             "seed_from_scan",
             stage="scan",
